@@ -46,6 +46,7 @@ dependencies = [
  "crossterm",
  "io-uring",
  "libc",
+ "memchr",
  "memmap2",
  "ratatui",
  "rayon",

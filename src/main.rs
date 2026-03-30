@@ -1,5 +1,5 @@
 use crate::ecs::{NodeId, SemanticKind, UastRegistry, Viewport};
-use crate::io::{SvpResolver, ingest_svp_file};
+use crate::io::{RequestPriority, SvpResolver, ingest_svp_file};
 use crossterm::{
 	event::{self, Event, KeyCode, KeyEventKind},
 	execute,
@@ -38,6 +38,7 @@ pub enum EditorCommand {
 	Backspace,
 	Scroll(i32),
 	MoveCursor(MoveDirection),
+	GotoLine(u32),
 	LoadFile(String),
 	InternalRefresh,
 	Quit,
@@ -114,6 +115,21 @@ fn main() -> Result<(), std_io::Error> {
 						needs_render = true;
 					}
 				}
+				EditorCommand::GotoLine(target) => {
+					if let Some(rid) = root_id {
+						let total = registry_engine.get_total_newlines(rid);
+						cursor_abs_line = target.min(total);
+						cursor_abs_col = 0;
+						let (node, offset) = registry_engine.find_node_at_line_col(
+							rid,
+							cursor_abs_line,
+							cursor_abs_col,
+						);
+						cursor_node = node;
+						cursor_offset = offset;
+						needs_render = true;
+					}
+				}
 				EditorCommand::InsertChar(c) => {
 					if let Some(_rid) = root_id {
 						let mut buf = [0; 4];
@@ -144,9 +160,8 @@ fn main() -> Result<(), std_io::Error> {
 					if let Ok(metadata) = std::fs::metadata(&path) {
 						let file_size = metadata.len();
 						let device_id = 0x42;
-						resolver_engine.register_device(device_id, &path);
 
-						let rid = ingest_svp_file(&registry_engine, file_size, device_id);
+						let rid = ingest_svp_file(&resolver_engine, &registry_engine, file_size, device_id, path);
 						root_id = Some(rid);
 						cursor_node = registry_engine
 							.get_first_child(rid)
@@ -172,13 +187,13 @@ fn main() -> Result<(), std_io::Error> {
 						viewport_lines,
 					);
 
-					// TRIGGER DMA
+					// TRIGGER DMA (High Priority)
 					for token in &tokens {
 						if !token.is_virtual && token.text.is_empty() {
 							let idx = token.node_id.index();
 							if !registry_engine.dma_in_flight[idx].swap(true, Ordering::Relaxed) {
 								if let Some(svp) = unsafe { *registry_engine.spans[idx].get() } {
-									resolver_engine.request_dma(token.node_id, svp);
+									resolver_engine.request_dma(token.node_id, svp, RequestPriority::High);
 								}
 							}
 						}
@@ -187,6 +202,7 @@ fn main() -> Result<(), std_io::Error> {
 					let _ = tx_view_engine.send(Viewport {
 						tokens,
 						cursor_abs_pos: (cursor_abs_line, cursor_abs_col),
+						total_lines: registry_engine.get_total_newlines(rid),
 					});
 				}
 			}
@@ -217,90 +233,117 @@ fn main() -> Result<(), std_io::Error> {
 		}
 
 		if got_new_view || current_mode == EditorMode::Command {
-			terminal.draw(|f| {
-				let mut cursor_to_set = None;
-				let buf = f.buffer_mut();
-				let max_width = buf.area.width;
-				let max_height = buf.area.height;
+			terminal
+				.draw(|f| {
+					let mut cursor_to_set = None;
+					let buf = f.buffer_mut();
+					let max_width = buf.area.width;
+					let max_height = buf.area.height;
 
-				const GUTTER_WIDTH: u16 = 6;
-				let gutter_style = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::Indexed(242));
-
-				if let Some(view) = &current_viewport {
-					let scroll_y = view.cursor_abs_pos.0.saturating_sub(20);
-					
-					// --- GUTTER RENDERING ---
-					for gy in 0..(max_height - 1) {
-						// Fill background
-						for gx in 0..GUTTER_WIDTH {
-							if let Some(cell) = buf.cell_mut((gx, gy)) {
-								cell.set_char(' ').set_style(gutter_style);
-							}
-						}
-						
-						// Render line number (1-indexed)
-						let line_num = scroll_y + gy as u32 + 1;
-						let line_str = line_num.to_string();
-						if line_str.len() < GUTTER_WIDTH as usize {
-							let start_x = (GUTTER_WIDTH - 1).saturating_sub(line_str.len() as u16);
-							for (i, c) in line_str.chars().enumerate() {
-								if let Some(cell) = buf.cell_mut((start_x + i as u16, gy)) {
-									cell.set_char(c);
+					if let Some(view) = &current_viewport {
+						let gutter_width: u16 = (view.total_lines.to_string().len() as u16).max(4) + 2;
+						let gutter_style = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::Indexed(242));
+						let scroll_y = view.cursor_abs_pos.0.saturating_sub(20);
+						// --- GUTTER RENDERING ---
+						for gy in 0..(max_height - 1) {
+							// Fill background
+							for gx in 0..gutter_width {
+								if let Some(cell) = buf.cell_mut((gx, gy)) {
+									cell.set_char(' ').set_style(gutter_style);
 								}
 							}
-						}
-					}
 
-					// --- VIEWPORT RENDERING ---
-					let mut x = GUTTER_WIDTH;
-					let mut y = 0;
-
-					for token in &view.tokens {
-						let mut style = match token.kind {
-							SemanticKind::Token => Style::default().fg(Color::LightGreen),
-							_ => Style::default().fg(Color::White),
-						};
-
-						if token.is_virtual {
-							style = style.add_modifier(Modifier::ITALIC).fg(Color::Yellow);
-						}
-
-						let text = if token.text.is_empty() { "[DMA PENDING...]" } else { &token.text };
-
-						for c in text.chars() {
-							if y >= max_height - 1 { break; }
-							if c == '\n' {
-								y += 1;
-								x = GUTTER_WIDTH;
-							} else {
-								if x < max_width {
-									if let Some(cell) = buf.cell_mut((x, y)) {
-										cell.set_char(c).set_style(style);
+							// Render line number (1-indexed)
+							let line_num = scroll_y + gy as u32 + 1;
+							// Files end with a newline usually, but if not, Neovim/Baryon show the current line.
+							// We clamp strictly to total_lines + 1 (the 'empty' line at end).
+							if line_num <= view.total_lines + 1 {
+								let line_str = line_num.to_string();
+								if line_str.len() < gutter_width as usize {
+									let start_x = (gutter_width - 1).saturating_sub(line_str.len() as u16);
+									for (i, c) in line_str.chars().enumerate() {
+										if let Some(cell) = buf.cell_mut((start_x + i as u16, gy)) {
+											cell.set_char(c);
+										}
 									}
 								}
-								x += 1;
+							}						}
+
+						// --- VIEWPORT RENDERING ---
+						let mut x: usize = gutter_width as usize;
+						let mut y: usize = 0;
+						let render_height = (max_height as usize).saturating_sub(1);
+
+						for token in &view.tokens {
+							let mut style = match token.kind {
+								SemanticKind::Token => Style::default().fg(Color::LightGreen),
+								_ => Style::default().fg(Color::White),
+							};
+
+							if token.is_virtual {
+								style = style.add_modifier(Modifier::ITALIC).fg(Color::Yellow);
+							}
+
+							let text = if token.text.is_empty() {
+								"[DMA PENDING...]"
+							} else {
+								&token.text
+							};
+
+							for c in text.chars() {
+								if y >= render_height {
+									break;
+								}
+								if c == '\n' {
+									y += 1;
+									x = gutter_width as usize;
+								} else if c == '\t' {
+									let tab_size = 4;
+									let spaces =
+										tab_size - (x - gutter_width as usize) % tab_size;
+									for _ in 0..spaces {
+										if x < max_width as usize {
+											if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+												cell.set_char(' ').set_style(style);
+											}
+										}
+										x += 1;
+									}
+								} else {
+									if x < max_width as usize {
+										if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+											cell.set_char(c).set_style(style);
+										}
+									}
+									x += 1;
+								}
+							}
+							if y >= render_height {
+								break;
 							}
 						}
-						if y >= max_height - 1 { break; }
+
+						// --- HARDWARE CURSOR ---
+						let visual_cursor_y = view.cursor_abs_pos.0.saturating_sub(scroll_y) as u16;
+						let visual_cursor_x = (view.cursor_abs_pos.1 as u16)
+							.checked_add(gutter_width)
+							.unwrap_or(max_width);
+						if visual_cursor_y < max_height - 1 && visual_cursor_x < max_width {
+							cursor_to_set = Some((visual_cursor_x, visual_cursor_y));
+						}
 					}
 
-					// --- HARDWARE CURSOR ---
-					let visual_cursor_y = view.cursor_abs_pos.0.saturating_sub(scroll_y) as u16;
-					let visual_cursor_x = (view.cursor_abs_pos.1 as u16).checked_add(GUTTER_WIDTH).unwrap_or(max_width);
-					if visual_cursor_y < max_height - 1 && visual_cursor_x < max_width {
-						cursor_to_set = Some((visual_cursor_x, visual_cursor_y));
-					}
-				}
+					// --- STATUS BAR RENDERING ---
+					let status_bar_y = max_height.saturating_sub(1);
+					let status_bar_style = Style::default()
+					.bg(Color::Rgb(18, 18, 18))
+					.fg(Color::White);
 
-				// --- STATUS BAR RENDERING ---
-				let status_bar_y = max_height - 1;
-				let status_bar_style = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::White);
-
-				for sx in 0..max_width {
+					for sx in 0..max_width {
 					if let Some(cell) = buf.cell_mut((sx, status_bar_y)) {
 						cell.set_char(' ').set_style(status_bar_style);
 					}
-				}
+					}
 
 				let status_text = match current_mode {
 					EditorMode::Normal => if g_prefix { "-- NORMAL (g pending) --" } else { "-- NORMAL --" }.to_string(),
@@ -366,6 +409,8 @@ fn main() -> Result<(), std_io::Error> {
 									if command_buffer.starts_with("e ") {
 										let path = command_buffer[2..].trim().to_string();
 										let _ = tx_cmd.send(EditorCommand::LoadFile(path));
+									} else if let Ok(line_num) = command_buffer.parse::<u32>() {
+										let _ = tx_cmd.send(EditorCommand::GotoLine(line_num.saturating_sub(1)));
 									} else if command_buffer == "q" {
 										let _ = tx_cmd.send(EditorCommand::Quit);
 										should_quit = true;

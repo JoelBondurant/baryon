@@ -17,7 +17,7 @@ impl NodeId {
 	}
 
 	pub fn from_index(idx: usize) -> Self {
-		Self(NonZeroU32::new(idx as u32 + 1).unwrap())
+		Self(std::num::NonZeroU32::new(idx as u32 + 1).unwrap())
 	}
 }
 
@@ -87,6 +87,7 @@ pub struct RenderToken {
 pub struct Viewport {
 	pub tokens: Vec<RenderToken>,
 	pub cursor_abs_pos: (u32, u32),
+	pub total_lines: u32,
 }
 
 /// ==========================================
@@ -116,6 +117,9 @@ pub struct UastRegistry {
 
 	/// Tracks nodes currently being resolved by the I/O thread.
 	pub dma_in_flight: Box<[AtomicBool]>,
+
+	/// Ensures physical nodes are only inflated once.
+	pub metrics_inflated: Box<[AtomicBool]>,
 }
 
 // SAFETY: The atomic `next_id` guarantees that no two threads will ever receive
@@ -156,6 +160,10 @@ impl UastRegistry {
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
 			dma_in_flight: (0..cap)
+				.map(|_| AtomicBool::new(false))
+				.collect::<Vec<_>>()
+				.into_boxed_slice(),
+			metrics_inflated: (0..cap)
 				.map(|_| AtomicBool::new(false))
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
@@ -216,22 +224,62 @@ impl UastRegistry {
 
 		while let Some(node) = visit {
 			let idx = node.index();
+			let m = unsafe { &*self.metrics[idx].get() };
 			let text = self.resolve_physical_bytes(node);
 
 			let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
 			let kind = unsafe { *self.kinds[idx].get() };
 
+			// SKIPPING LOGIC: Use metrics to decide if we need to skip text within this node
+			let mut display_text = text.clone();
+			if line_accumulator < target_line {
+				if line_accumulator + m.newlines < target_line {
+					// Entire node is before target_line
+					line_accumulator += m.newlines;
+					visit = self.get_next_node_in_walk(node);
+					continue;
+				}
+
+				// The target line starts inside this node
+				if !text.is_empty() {
+					let to_skip = target_line - line_accumulator;
+					let mut skipped = 0;
+					let mut byte_offset = 0;
+					for (i, b) in text.as_bytes().iter().enumerate() {
+						if skipped == to_skip {
+							byte_offset = i;
+							break;
+						}
+						if *b == b'\n' {
+							skipped += 1;
+						}
+					}
+					display_text = text[byte_offset..].to_string();
+				}
+				line_accumulator = target_line;
+			}
+
 			tokens.push(RenderToken {
 				node_id: node,
 				kind,
-				text: text.clone(),
+				text: display_text,
 				absolute_start_line: line_accumulator,
 				is_virtual,
 			});
 
-			let lines_in_token = text.chars().filter(|&c| c == '\n').count() as u32;
-			line_accumulator += lines_in_token;
-			collected_lines += lines_in_token;
+			// Update accumulator for next tokens
+			if text.is_empty() {
+				// Pending DMA: use metrics to keep line count synced
+				line_accumulator += m.newlines;
+				collected_lines += m.newlines;
+			} else {
+				let lines_in_token = text.chars().filter(|&c| c == '\n').count() as u32;
+				// If we skipped lines, we already set line_accumulator to target_line
+				// We only add the lines that are actually in the remaining text
+				let lines_shown = tokens.last().unwrap().text.chars().filter(|&c| c == '\n').count() as u32;
+				line_accumulator += lines_shown;
+				collected_lines += lines_shown;
+			}
 
 			if collected_lines >= line_count {
 				break;
