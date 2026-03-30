@@ -84,6 +84,11 @@ pub struct RenderToken {
 	pub is_virtual: bool,
 }
 
+pub struct Viewport {
+	pub tokens: Vec<RenderToken>,
+	pub cursor_abs_pos: (u32, u32),
+}
+
 /// ==========================================
 /// THE CONCURRENT ECS REGISTRY (WORLD)
 /// ==========================================
@@ -405,6 +410,62 @@ impl UastRegistry {
 
 	pub fn get_first_child(&self, node: NodeId) -> Option<NodeId> {
 		unsafe { (*self.edges[node.index()].get()).first_child }
+	}
+
+	pub fn get_total_newlines(&self, node: NodeId) -> u32 {
+		unsafe { (*self.metrics[node.index()].get()).newlines }
+	}
+
+	pub fn find_node_at_line_col(
+		&self,
+		root: NodeId,
+		target_line: u32,
+		target_col: u32,
+	) -> (NodeId, u32) {
+		let mut curr = Some(root);
+		let mut line_accumulator = 0;
+
+		// 1. Descend to the right leaf
+		while let Some(node) = curr {
+			let idx = node.index();
+			let m = unsafe { &*self.metrics[idx].get() };
+
+			if line_accumulator + m.newlines >= target_line {
+				// Potential match in this subtree
+				if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
+					curr = Some(child);
+					continue;
+				} else {
+					// Found leaf
+					let text = self.resolve_physical_bytes(node);
+					let mut current_line_in_node = 0;
+
+					// Find the start of the target line within this node
+					for (i, b) in text.as_bytes().iter().enumerate() {
+						if line_accumulator + current_line_in_node == target_line {
+							// We are on the target line! Now find the column.
+							let col_offset = target_col as usize;
+							// Find the end of this line to clamp column
+							let line_end = text.as_bytes()[i..]
+								.iter()
+								.position(|&x| x == b'\n')
+								.unwrap_or(text.len() - i);
+							let actual_col = col_offset.min(line_end);
+							return (node, (i + actual_col) as u32);
+						}
+						if *b == b'\n' {
+							current_line_in_node += 1;
+						}
+					}
+					return (node, text.len() as u32);
+				}
+			} else {
+				line_accumulator += m.newlines;
+				curr = unsafe { (*self.edges[idx].get()).next_sibling };
+			}
+		}
+
+		(root, 0)
 	}
 
 	pub fn get_prev_sibling(&self, node: NodeId) -> Option<NodeId> {
