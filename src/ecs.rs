@@ -8,12 +8,16 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// The Entity ID. A lightweight 32-bit integer.
 /// We use NonZeroU32 to allow `Option<NodeId>` to fit cleanly into 4 bytes (Null-pointer optimization).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeId(NonZeroU32);
+pub struct NodeId(pub NonZeroU32);
 
 impl NodeId {
 	#[inline(always)]
 	pub fn index(self) -> usize {
 		self.0.get() as usize - 1
+	}
+
+	pub fn from_index(idx: usize) -> Self {
+		Self(NonZeroU32::new(idx as u32 + 1).unwrap())
 	}
 }
 
@@ -23,11 +27,13 @@ impl NodeId {
 /// Sparse Virtualized Projection Pointer.
 /// Bypasses the OS kernel. No memmap2, no owned Strings.
 /// References physical storage blocks directly via SPDK/NVMe-Direct.
-/// For Phase 1, stores an offset into a memmap2 mapping.
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct SvpPointer {
-	pub offset: u32,
-	pub length: u32,
+	pub lba: u64,
+	pub byte_length: u32,
+	pub device_id: u16,
+	pub head_trim: u16,
 }
 
 /// ==========================================
@@ -37,6 +43,7 @@ pub struct SvpPointer {
 /// fast rope-like traversal, line/column resolution, and bounding-box queries.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpanMetrics {
+	#[allow(dead_code)]
 	pub byte_length: u32,
 	pub newlines: u32,
 }
@@ -57,6 +64,7 @@ pub struct TreeEdges {
 /// ==========================================
 /// The logical meaning of the node. Unifies Relational (CSV) and Logical (Rust/SQL).
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum SemanticKind {
 	RelationalTable,
 	RelationalRow,
@@ -70,38 +78,35 @@ pub enum SemanticKind {
 pub struct RenderToken {
 	pub kind: SemanticKind,
 	pub text: String,
+	#[allow(dead_code)]
 	pub absolute_start_line: u32,
 	pub is_virtual: bool,
 }
-
-/// ==========================================
-/// CONSTANTS
-/// ==========================================
-pub const MAX_CHUNK_SIZE: u32 = 10; // Tiny for smoke testing
 
 /// ==========================================
 /// THE CONCURRENT ECS REGISTRY (WORLD)
 /// ==========================================
 /// Structure of Arrays (SoA) layout.
 pub struct UastRegistry {
-	capacity: u32,
-	next_id: AtomicU32,
+	pub capacity: u32,
+	pub next_id: AtomicU32,
 
 	// Boxed slices of UnsafeCells.
 	// This allows concurrent mutable writes to disjoint indices without locks.
-	kinds: Box<[UnsafeCell<SemanticKind>]>,
-	spans: Box<[UnsafeCell<Option<SvpPointer>>]>,
-	metrics: Box<[UnsafeCell<SpanMetrics>]>,
-	edges: Box<[UnsafeCell<TreeEdges>]>,
+	pub kinds: Box<[UnsafeCell<SemanticKind>]>,
+	pub spans: Box<[UnsafeCell<Option<SvpPointer>>]>,
+	pub metrics: Box<[UnsafeCell<SpanMetrics>]>,
+	pub edges: Box<[UnsafeCell<TreeEdges>]>,
 
 	// MUTATION STATE: Tracks the last child of a node.
 	// Separated from `edges` to keep `edges` densely packed for read-only traversal.
 	// Cost: Exactly 4 bytes per node via Option<NonZeroU32> optimization.
+	#[allow(dead_code)]
 	child_tails: Box<[UnsafeCell<Option<NodeId>>]>,
 
 	// VIRTUAL DATA: Stores uncommitted text for virtual nodes.
 	// In a production system, this would be a more sophisticated buffer pool.
-	virtual_data: Box<[UnsafeCell<Option<Vec<u8>>>]>,
+	pub virtual_data: Box<[UnsafeCell<Option<Vec<u8>>>]>,
 }
 
 // SAFETY: The atomic `next_id` guarantees that no two threads will ever receive
@@ -152,10 +157,10 @@ impl UastRegistry {
 				return String::from_utf8_lossy(v_data).to_string();
 			}
 			if let Some(svp) = *self.spans[idx].get() {
-				// Mock physical resolution. In reality, this reads from memmap.
+				// Mock physical resolution. In reality, this reads from hardware.
 				let mock_data = "LINE1: START\nLINE2: MIDDLE\nLINE3: END";
-				let start = (svp.offset as usize).min(mock_data.len());
-				let end = (start + svp.length as usize).min(mock_data.len());
+				let start = (svp.head_trim as usize).min(mock_data.len());
+				let end = (start + svp.byte_length as usize).min(mock_data.len());
 				return mock_data[start..end].to_string();
 			}
 		}
@@ -264,7 +269,7 @@ impl UastRegistry {
 	}
 
 	/// THE UPWARD BUBBLE: Propagates metric deltas to all ancestors in O(Depth).
-	pub fn apply_edit(&mut self, target: NodeId, added_bytes: i32, added_newlines: i32) {
+	pub fn apply_edit(&self, target: NodeId, added_bytes: i32, added_newlines: i32) {
 		let mut curr = Some(target);
 		while let Some(node) = curr {
 			let idx = node.index();
@@ -280,7 +285,7 @@ impl UastRegistry {
 
 	/// THE P-V-P SPLIT TRIGGER: Inserts text and ruptures the node if it exceeds MAX_CHUNK_SIZE.
 	pub fn insert_text(
-		&mut self,
+		&self,
 		target: NodeId,
 		offset_in_node: u32,
 		new_text: &[u8],
@@ -313,7 +318,7 @@ impl UastRegistry {
 
 	/// RUPTURE: Splits a Physical node into [Physical, Virtual, Physical] siblings.
 	/// Reuses `target` as the first Physical node (P1) to maintain topology efficiently.
-	fn split_node_pvp(&mut self, target: NodeId, offset: u32, new_text: &[u8]) -> NodeId {
+	fn split_node_pvp(&self, target: NodeId, offset: u32, new_text: &[u8]) -> NodeId {
 		let target_idx = target.index();
 
 		// 1. Extract context
@@ -336,7 +341,7 @@ impl UastRegistry {
 		let p1_len = offset;
 		unsafe {
 			let s = &mut *self.spans[target_idx].get();
-			s.as_mut().unwrap().length = p1_len;
+			s.as_mut().unwrap().byte_length = p1_len;
 
 			let m = &mut *self.metrics[target_idx].get();
 			m.byte_length = p1_len;
@@ -364,12 +369,15 @@ impl UastRegistry {
 		}
 
 		// 5. Configure P2 (Physical Node)
-		let p2_len = old_svp.length.saturating_sub(offset);
+		let p2_len = old_svp.byte_length.saturating_sub(offset);
+		let total_offset = old_svp.head_trim as u32 + offset;
 		unsafe {
 			*self.kinds[p2_idx].get() = SemanticKind::Token;
 			*self.spans[p2_idx].get() = Some(SvpPointer {
-				offset: old_svp.offset + offset,
-				length: p2_len,
+				lba: old_svp.lba + (total_offset / 4096) as u64,
+				byte_length: p2_len,
+				device_id: old_svp.device_id,
+				head_trim: (total_offset % 4096) as u16,
 			});
 
 			let m = &mut *self.metrics[p2_idx].get();
@@ -394,6 +402,10 @@ impl UastRegistry {
 		v_id
 	}
 
+	pub fn get_first_child(&self, node: NodeId) -> Option<NodeId> {
+		unsafe { (*self.edges[node.index()].get()).first_child }
+	}
+
 	pub fn get_prev_sibling(&self, node: NodeId) -> Option<NodeId> {
 		let parent = unsafe { (*self.edges[node.index()].get()).parent }?;
 		let first_child = unsafe { (*self.edges[parent.index()].get()).first_child }?;
@@ -410,7 +422,7 @@ impl UastRegistry {
 		}
 	}
 
-	pub fn delete_backwards(&mut self, target: NodeId, offset_in_node: u32) -> (NodeId, u32) {
+	pub fn delete_backwards(&self, target: NodeId, offset_in_node: u32) -> (NodeId, u32) {
 		if offset_in_node == 0 {
 			if let Some(prev) = self.get_prev_sibling(target) {
 				let prev_idx = prev.index();
@@ -446,7 +458,7 @@ impl UastRegistry {
 		}
 	}
 
-	fn split_node_pvp_delete(&mut self, target: NodeId, offset: u32, delete_len: u32) -> NodeId {
+	fn split_node_pvp_delete(&self, target: NodeId, offset: u32, delete_len: u32) -> NodeId {
 		let target_idx = target.index();
 
 		let (parent, old_next_sibling, old_svp) = unsafe {
@@ -463,7 +475,7 @@ impl UastRegistry {
 
 		unsafe {
 			let s = &mut *self.spans[target_idx].get();
-			s.as_mut().unwrap().length = offset;
+			s.as_mut().unwrap().byte_length = offset;
 			let m = &mut *self.metrics[target_idx].get();
 			m.byte_length = offset;
 			let e = &mut *self.edges[target_idx].get();
@@ -482,12 +494,15 @@ impl UastRegistry {
 			e.next_sibling = Some(p2_id);
 		}
 
-		let p2_len = old_svp.length.saturating_sub(offset + delete_len);
+		let p2_len = old_svp.byte_length.saturating_sub(offset + delete_len);
+		let total_offset = old_svp.head_trim as u32 + offset + delete_len;
 		unsafe {
 			*self.kinds[p2_idx].get() = SemanticKind::Token;
 			*self.spans[p2_idx].get() = Some(SvpPointer {
-				offset: old_svp.offset + offset + delete_len,
-				length: p2_len,
+				lba: old_svp.lba + (total_offset / 4096) as u64,
+				byte_length: p2_len,
+				device_id: old_svp.device_id,
+				head_trim: (total_offset % 4096) as u16,
 			});
 			let m = &mut *self.metrics[p2_idx].get();
 			m.byte_length = p2_len;
@@ -507,6 +522,15 @@ impl UastRegistry {
 		self.apply_edit(parent, -(delete_len as i32), 0);
 
 		v_id
+	}
+
+
+	/// ATOMIC HOT-SWAP: Allows the I/O thread to populate virtual_data once DMA completes.
+	pub fn hot_swap_virtual_data(&self, node: NodeId, data: Vec<u8>) {
+		let idx = node.index();
+		unsafe {
+			*self.virtual_data[idx].get() = Some(data);
+		}
 	}
 
 	/// Atomically reserves a chunk of `NodeId`s for a single thread.
