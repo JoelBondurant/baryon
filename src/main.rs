@@ -254,7 +254,7 @@ fn main() -> Result<(), std_io::Error> {
 					if key.kind == KeyEventKind::Press {
 						match current_mode {
 							EditorMode::Normal => match key.code {
-								KeyCode::Esc => {
+								KeyCode::Char('z') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
 									let _ = tx_cmd.send(EditorCommand::Quit);
 									should_quit = true;
 									break;
@@ -278,6 +278,11 @@ fn main() -> Result<(), std_io::Error> {
 								_ => {}
 							},
 							EditorMode::Command => match key.code {
+								KeyCode::Char('z') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+									let _ = tx_cmd.send(EditorCommand::Quit);
+									should_quit = true;
+									break;
+								}
 								KeyCode::Enter => {
 									if command_buffer.starts_with("e ") {
 										let path = command_buffer[2..].trim().to_string();
