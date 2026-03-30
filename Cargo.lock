@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "baryon_gemini"
+name = "baryon"
 version = "0.1.0"
 dependencies = [
  "memmap2",

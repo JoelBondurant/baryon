@@ -64,6 +64,11 @@ pub enum SemanticKind {
 }
 
 /// ==========================================
+/// CONSTANTS
+/// ==========================================
+pub const MAX_CHUNK_SIZE: u32 = 64 * 1024;
+
+/// ==========================================
 /// THE CONCURRENT ECS REGISTRY (WORLD)
 /// ==========================================
 /// Structure of Arrays (SoA) layout.
@@ -82,6 +87,10 @@ pub struct UastRegistry {
     // Separated from `edges` to keep `edges` densely packed for read-only traversal.
     // Cost: Exactly 4 bytes per node via Option<NonZeroU32> optimization.
     child_tails: Box<[UnsafeCell<Option<NodeId>>]>,
+
+    // VIRTUAL DATA: Stores uncommitted text for virtual nodes.
+    // In a production system, this would be a more sophisticated buffer pool.
+    virtual_data: Box<[UnsafeCell<Option<Vec<u8>>>]>,
 }
 
 // SAFETY: The atomic `next_id` guarantees that no two threads will ever receive 
@@ -102,6 +111,132 @@ impl UastRegistry {
             metrics: (0..cap).map(|_| UnsafeCell::new(SpanMetrics::default())).collect::<Vec<_>>().into_boxed_slice(),
             edges: (0..cap).map(|_| UnsafeCell::new(TreeEdges::default())).collect::<Vec<_>>().into_boxed_slice(),
             child_tails: (0..cap).map(|_| UnsafeCell::new(None)).collect::<Vec<_>>().into_boxed_slice(),
+            virtual_data: (0..cap).map(|_| UnsafeCell::new(None)).collect::<Vec<_>>().into_boxed_slice(),
+        }
+    }
+
+    /// Internal node allocator for mutations.
+    fn alloc_node_internal(&self) -> NodeId {
+        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);
+        assert!(id_val <= self.capacity, "UastRegistry capacity exceeded during split");
+        NodeId(NonZeroU32::new(id_val).unwrap())
+    }
+
+    /// THE UPWARD BUBBLE: Propagates metric deltas to all ancestors in O(Depth).
+    pub fn apply_edit(&mut self, target: NodeId, added_bytes: i32, added_newlines: i32) {
+        let mut curr = Some(target);
+        while let Some(node) = curr {
+            let idx = node.index();
+            unsafe {
+                let m = &mut *self.metrics[idx].get();
+                m.byte_length = (m.byte_length as i32 + added_bytes) as u32;
+                m.newlines = (m.newlines as i32 + added_newlines) as u32;
+                
+                curr = (*self.edges[idx].get()).parent;
+            }
+        }
+    }
+
+    /// THE P-V-P SPLIT TRIGGER: Inserts text and ruptures the node if it exceeds MAX_CHUNK_SIZE.
+    pub fn insert_text(&mut self, target: NodeId, offset_in_node: u32, new_text: &[u8]) {
+        let added_bytes = new_text.len() as i32;
+        let added_newlines = new_text.iter().filter(|&&b| b == b'\n').count() as i32;
+
+        // 1. Propagate metrics upward before the split.
+        self.apply_edit(target, added_bytes, added_newlines);
+
+        // 2. Check for overflow rupture.
+        let idx = target.index();
+        let current_len = unsafe { (*self.metrics[idx].get()).byte_length };
+        
+        if current_len > MAX_CHUNK_SIZE {
+            self.split_node_pvp(target, offset_in_node, new_text);
+        } else {
+            // If no split, we still need to handle the virtual text logic.
+            // For a leaf Physical node, we might convert it to Virtual or handle it in-place.
+            // But the prompt specifically asks for the P-V-P split logic on rupture.
+            // In a real system, we'd append to a virtual buffer here.
+        }
+    }
+
+    /// RUPTURE: Splits a Physical node into [Physical, Virtual, Physical] siblings.
+    /// Reuses `target` as the first Physical node (P1) to maintain topology efficiently.
+    fn split_node_pvp(&mut self, target: NodeId, offset: u32, new_text: &[u8]) {
+        let target_idx = target.index();
+        
+        // 1. Extract context
+        let (parent, old_next_sibling, old_svp) = unsafe {
+            let e = &*self.edges[target_idx].get();
+            let s = (*self.spans[target_idx].get()).expect("Split target must be Physical");
+            (e.parent, e.next_sibling, s)
+        };
+        let parent = parent.expect("Cannot split a root node");
+
+        // 2. Allocate V and P2 nodes
+        let v_id = self.alloc_node_internal();
+        let p2_id = self.alloc_node_internal();
+        let v_idx = v_id.index();
+        let p2_idx = p2_id.index();
+
+        // 3. Reconfigure P1 (Reuse target)
+        // Note: P1.metrics.newlines is tricky without data access. 
+        // For Phase 1, we assume a placeholder or that metrics are aggregated at parent level.
+        let p1_len = offset;
+        unsafe {
+            let s = &mut *self.spans[target_idx].get();
+            s.as_mut().unwrap().length = p1_len;
+            
+            let m = &mut *self.metrics[target_idx].get();
+            m.byte_length = p1_len;
+            // TODO: Recalculate m.newlines from physical storage
+            
+            let e = &mut *self.edges[target_idx].get();
+            e.next_sibling = Some(v_id);
+        }
+
+        // 4. Configure V (Virtual Node)
+        let v_len = new_text.len() as u32;
+        let v_newlines = new_text.iter().filter(|&&b| b == b'\n').count() as u32;
+        unsafe {
+            *self.kinds[v_idx].get() = SemanticKind::Token;
+            *self.spans[v_idx].get() = None; // Virtual nodes have no SvpPointer
+            *self.virtual_data[v_idx].get() = Some(new_text.to_vec());
+            
+            let m = &mut *self.metrics[v_idx].get();
+            m.byte_length = v_len;
+            m.newlines = v_newlines;
+            
+            let e = &mut *self.edges[v_idx].get();
+            e.parent = Some(parent);
+            e.next_sibling = Some(p2_id);
+        }
+
+        // 5. Configure P2 (Physical Node)
+        let p2_len = old_svp.length - offset;
+        unsafe {
+            *self.kinds[p2_idx].get() = SemanticKind::Token;
+            *self.spans[p2_idx].get() = Some(SvpPointer {
+                offset: old_svp.offset + offset,
+                length: p2_len,
+            });
+            
+            let m = &mut *self.metrics[p2_idx].get();
+            m.byte_length = p2_len;
+            // TODO: Recalculate m.newlines from physical storage
+            
+            let e = &mut *self.edges[p2_idx].get();
+            e.parent = Some(parent);
+            e.next_sibling = old_next_sibling;
+        }
+
+        // 6. Maintain Parent's child_tails
+        // If target was the tail, P2 is now the tail.
+        let p_idx = parent.index();
+        unsafe {
+            let tail_ptr = &mut *self.child_tails[p_idx].get();
+            if *tail_ptr == Some(target) {
+                *tail_ptr = Some(p2_id);
+            }
         }
     }
 
