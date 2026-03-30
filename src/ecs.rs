@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// ==========================================
 /// CORE ENTITY
@@ -76,6 +76,7 @@ pub enum SemanticKind {
 /// ==========================================
 #[derive(Debug)]
 pub struct RenderToken {
+	pub node_id: NodeId,
 	pub kind: SemanticKind,
 	pub text: String,
 	#[allow(dead_code)]
@@ -107,6 +108,9 @@ pub struct UastRegistry {
 	// VIRTUAL DATA: Stores uncommitted text for virtual nodes.
 	// In a production system, this would be a more sophisticated buffer pool.
 	pub virtual_data: Box<[UnsafeCell<Option<Vec<u8>>>]>,
+
+	/// Tracks nodes currently being resolved by the I/O thread.
+	pub dma_in_flight: Box<[AtomicBool]>,
 }
 
 // SAFETY: The atomic `next_id` guarantees that no two threads will ever receive
@@ -146,6 +150,10 @@ impl UastRegistry {
 				.map(|_| UnsafeCell::new(None))
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
+			dma_in_flight: (0..cap)
+				.map(|_| AtomicBool::new(false))
+				.collect::<Vec<_>>()
+				.into_boxed_slice(),
 		}
 	}
 
@@ -156,13 +164,7 @@ impl UastRegistry {
 			if let Some(v_data) = &*self.virtual_data[idx].get() {
 				return String::from_utf8_lossy(v_data).to_string();
 			}
-			if let Some(svp) = *self.spans[idx].get() {
-				// Mock physical resolution. In reality, this reads from hardware.
-				let mock_data = "LINE1: START\nLINE2: MIDDLE\nLINE3: END";
-				let start = (svp.head_trim as usize).min(mock_data.len());
-				let end = (start + svp.byte_length as usize).min(mock_data.len());
-				return mock_data[start..end].to_string();
-			}
+			// Physical nodes return empty strings until the resolver hot-swaps them.
 		}
 		String::new()
 	}
@@ -211,24 +213,23 @@ impl UastRegistry {
 			let idx = node.index();
 			let text = self.resolve_physical_bytes(node);
 
-			if !text.is_empty() {
-				let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
-				let kind = unsafe { *self.kinds[idx].get() };
+			let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
+			let kind = unsafe { *self.kinds[idx].get() };
 
-				tokens.push(RenderToken {
-					kind,
-					text: text.clone(),
-					absolute_start_line: line_accumulator,
-					is_virtual,
-				});
+			tokens.push(RenderToken {
+				node_id: node,
+				kind,
+				text: text.clone(),
+				absolute_start_line: line_accumulator,
+				is_virtual,
+			});
 
-				let lines_in_token = text.chars().filter(|&c| c == '\n').count() as u32;
-				line_accumulator += lines_in_token;
-				collected_lines += lines_in_token;
+			let lines_in_token = text.chars().filter(|&c| c == '\n').count() as u32;
+			line_accumulator += lines_in_token;
+			collected_lines += lines_in_token;
 
-				if collected_lines >= line_count {
-					break;
-				}
+			if collected_lines >= line_count {
+				break;
 			}
 
 			// Move to next node in tree

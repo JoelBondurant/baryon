@@ -1,4 +1,4 @@
-use crate::ecs::{RenderToken, SemanticKind, UastRegistry};
+use crate::ecs::{NodeId, RenderToken, SemanticKind, UastRegistry};
 use crate::io::{SvpResolver, ingest_svp_file};
 use crossterm::{
 	event::{self, Event, KeyCode, KeyEventKind},
@@ -10,7 +10,7 @@ use ratatui::{
 	style::{Color, Modifier, Style},
 	Terminal,
 };
-use std::{io as std_io, sync::mpsc, thread, time::Duration, sync::Arc};
+use std::{io as std_io, sync::atomic::Ordering, sync::mpsc, thread, time::Duration, sync::Arc};
 
 mod ecs;
 mod io;
@@ -29,62 +29,69 @@ pub enum EditorCommand {
 	Backspace,
 	Scroll(i32),
 	LoadFile(String),
+	InternalRefresh,
 	Quit,
 }
 
 fn main() -> Result<(), std_io::Error> {
 	// 1. Setup Channels & Registry
-	let registry = Arc::new(UastRegistry::new(1_000_000)); // Larger capacity for 10GB test
-	let resolver = Arc::new(SvpResolver::new(registry.clone()));
-
 	let (tx_cmd, rx_cmd) = mpsc::channel::<EditorCommand>();
 	let (tx_view, rx_view) = mpsc::channel::<Vec<RenderToken>>();
+	let (tx_io_notify, rx_io_notify) = mpsc::channel::<()>();
 
-	// 2. MOCK INGESTION: 10GB File
-	println!("Ingesting 10GB mock file...");
-	let root_id = ingest_svp_file(&registry, 10 * 1024 * 1024 * 1024, 0x42);
+	let registry = Arc::new(UastRegistry::new(1_000_000)); // Larger capacity for 10GB test
+	let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
 
-	// Initial cursor is at the first leaf of the root
-	let first_leaf = registry
-		.get_first_child(root_id)
-		.expect("No leaves spawned");
+	// Bridge IO notifications to the Engine command loop
+	let tx_cmd_bridge = tx_cmd.clone();
+	thread::spawn(move || {
+		while let Ok(_) = rx_io_notify.recv() {
+			let _ = tx_cmd_bridge.send(EditorCommand::InternalRefresh);
+		}
+	});
+
+	// 2. Initial State (Empty or Mock)
+	let _current_root_id = registry.capacity; // Placeholder
+	let cursor_node = NodeId(std::num::NonZeroU32::new(1).unwrap());
+	let cursor_offset = 0;
 
 	// 3. Spawn Engine Thread
 	let registry_engine = registry.clone();
-	let _resolver_engine = resolver.clone();
+	let resolver_engine = resolver.clone();
+	let tx_view_engine = tx_view.clone();
+
 	thread::spawn(move || {
 		let mut cursor_absolute_line = 0;
 		let viewport_lines = 50;
+		let mut root_id = None;
 
-		let mut cursor_node = first_leaf;
-		let mut cursor_offset = 0;
-		let mut current_root_id = root_id;
-
-		// Initial render
-		let tokens =
-			registry_engine.query_viewport(current_root_id, cursor_absolute_line, viewport_lines);
-		let _ = tx_view.send(tokens);
+		let mut cursor_node = cursor_node;
+		let mut cursor_offset = cursor_offset;
 
 		// Engine Loop
 		while let Ok(cmd) = rx_cmd.recv() {
-			let needs_render: bool;
+			let mut needs_render = false;
 
 			match cmd {
 				EditorCommand::InsertChar(c) => {
-					let mut buf = [0; 4];
-					let s = c.encode_utf8(&mut buf);
-					let (new_node, new_offset) =
-						registry_engine.insert_text(cursor_node, cursor_offset, s.as_bytes());
-					cursor_node = new_node;
-					cursor_offset = new_offset;
-					needs_render = true;
+					if let Some(_rid) = root_id {
+						let mut buf = [0; 4];
+						let s = c.encode_utf8(&mut buf);
+						let (new_node, new_offset) =
+							registry_engine.insert_text(cursor_node, cursor_offset, s.as_bytes());
+						cursor_node = new_node;
+						cursor_offset = new_offset;
+						needs_render = true;
+					}
 				}
 				EditorCommand::Backspace => {
-					let (new_node, new_offset) =
-						registry_engine.delete_backwards(cursor_node, cursor_offset);
-					cursor_node = new_node;
-					cursor_offset = new_offset;
-					needs_render = true;
+					if let Some(_rid) = root_id {
+						let (new_node, new_offset) =
+							registry_engine.delete_backwards(cursor_node, cursor_offset);
+						cursor_node = new_node;
+						cursor_offset = new_offset;
+						needs_render = true;
+					}
 				}
 				EditorCommand::Scroll(delta) => {
 					cursor_absolute_line = (cursor_absolute_line as i32 + delta).max(0) as u32;
@@ -93,27 +100,50 @@ fn main() -> Result<(), std_io::Error> {
 				EditorCommand::LoadFile(path) => {
 					if let Ok(metadata) = std::fs::metadata(&path) {
 						let file_size = metadata.len();
-						current_root_id = ingest_svp_file(&registry_engine, file_size, 0x42);
+						let device_id = 0x42; // For prototype, use same ID
+						resolver_engine.register_device(device_id, &path);
+
+						let rid = ingest_svp_file(&registry_engine, file_size, device_id);
+						root_id = Some(rid);
 						cursor_node = registry_engine
-							.get_first_child(current_root_id)
+							.get_first_child(rid)
 							.expect("Failed to load new file root");
 						cursor_offset = 0;
 						cursor_absolute_line = 0;
 						needs_render = true;
-					} else {
-						needs_render = false;
 					}
+				}
+				EditorCommand::InternalRefresh => {
+					needs_render = true;
 				}
 				EditorCommand::Quit => break,
 			}
 
 			if needs_render {
-				let tokens = registry_engine.query_viewport(
-					current_root_id,
-					cursor_absolute_line,
-					viewport_lines,
-				);
-				let _ = tx_view.send(tokens);
+				if let Some(rid) = root_id {
+					let tokens = registry_engine.query_viewport(
+						rid,
+						cursor_absolute_line,
+						viewport_lines,
+					);
+
+					// TRIGGER DMA for physical nodes
+					for token in &tokens {
+						if !token.is_virtual && token.text.is_empty() {
+							let idx = token.node_id.index();
+							// Only request if not already in flight (atomic check-and-set)
+							if !registry_engine.dma_in_flight[idx].swap(true, Ordering::Relaxed) {
+								if let Some(svp) =
+									unsafe { *registry_engine.spans[idx].get() }
+								{
+									resolver_engine.request_dma(token.node_id, svp);
+								}
+							}
+						}
+					}
+
+					let _ = tx_view_engine.send(tokens);
+				}
 			}
 		}
 	});
