@@ -223,11 +223,36 @@ fn main() -> Result<(), std_io::Error> {
 				let max_width = buf.area.width;
 				let max_height = buf.area.height;
 
+				const GUTTER_WIDTH: u16 = 6;
+				let gutter_style = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::Indexed(242));
+
 				if let Some(view) = &current_viewport {
 					let scroll_y = view.cursor_abs_pos.0.saturating_sub(20);
 					
+					// --- GUTTER RENDERING ---
+					for gy in 0..(max_height - 1) {
+						// Fill background
+						for gx in 0..GUTTER_WIDTH {
+							if let Some(cell) = buf.cell_mut((gx, gy)) {
+								cell.set_char(' ').set_style(gutter_style);
+							}
+						}
+						
+						// Render line number (1-indexed)
+						let line_num = scroll_y + gy as u32 + 1;
+						let line_str = line_num.to_string();
+						if line_str.len() < GUTTER_WIDTH as usize {
+							let start_x = (GUTTER_WIDTH - 1).saturating_sub(line_str.len() as u16);
+							for (i, c) in line_str.chars().enumerate() {
+								if let Some(cell) = buf.cell_mut((start_x + i as u16, gy)) {
+									cell.set_char(c);
+								}
+							}
+						}
+					}
+
 					// --- VIEWPORT RENDERING ---
-					let mut x = 0;
+					let mut x = GUTTER_WIDTH;
 					let mut y = 0;
 
 					for token in &view.tokens {
@@ -246,7 +271,7 @@ fn main() -> Result<(), std_io::Error> {
 							if y >= max_height - 1 { break; }
 							if c == '\n' {
 								y += 1;
-								x = 0;
+								x = GUTTER_WIDTH;
 							} else {
 								if x < max_width {
 									if let Some(cell) = buf.cell_mut((x, y)) {
@@ -261,7 +286,7 @@ fn main() -> Result<(), std_io::Error> {
 
 					// --- HARDWARE CURSOR ---
 					let visual_cursor_y = view.cursor_abs_pos.0.saturating_sub(scroll_y) as u16;
-					let visual_cursor_x = view.cursor_abs_pos.1 as u16;
+					let visual_cursor_x = (view.cursor_abs_pos.1 as u16).checked_add(GUTTER_WIDTH).unwrap_or(max_width);
 					if visual_cursor_y < max_height - 1 && visual_cursor_x < max_width {
 						cursor_to_set = Some((visual_cursor_x, visual_cursor_y));
 					}
