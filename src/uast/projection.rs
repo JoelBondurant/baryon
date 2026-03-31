@@ -21,6 +21,7 @@ pub struct Viewport {
 	pub file_size: u64,
 	pub is_dirty: bool,
 	pub search_pattern: Option<String>,
+	pub search_case_insensitive: bool,
 	pub confirm_prompt: Option<String>,
 	pub mode_override: Option<crate::engine::EditorMode>,
 }

@@ -30,6 +30,21 @@ pub enum MoveDirection {
 	Bottom,
 }
 
+#[derive(Debug, Clone)]
+pub enum SubstituteRange {
+	WholeFile,
+	CurrentLine,
+	SingleLine(u32),
+	LineRange(u32, u32),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SubstituteFlags {
+	pub global: bool,
+	pub confirm: bool,
+	pub case_insensitive: bool,
+}
+
 pub enum EditorCommand {
 	InsertChar(char),
 	Backspace,
@@ -44,8 +59,8 @@ pub enum EditorCommand {
 	SearchStart(String),
 	SearchNext,
 	SearchPrev,
-	SubstituteAll { pattern: String, replacement: String },
-	SubstituteConfirm { pattern: String, replacement: String },
+	SubstituteAll { pattern: String, replacement: String, range: SubstituteRange, flags: SubstituteFlags },
+	SubstituteConfirm { pattern: String, replacement: String, range: SubstituteRange, flags: SubstituteFlags },
 	ConfirmResponse(ConfirmAction),
 	InternalRefresh,
 	Quit,
@@ -55,6 +70,8 @@ struct ConfirmState {
 	replacement: String,
 	replacements_done: u32,
 	total_matches: u32,
+	flags: SubstituteFlags,
+	range: SubstituteRange,
 }
 
 fn advance_col(b: u8, line: &mut u32, col: &mut u32) {
@@ -63,28 +80,90 @@ fn advance_col(b: u8, line: &mut u32, col: &mut u32) {
 	else { *col += 1; }
 }
 
-fn find_all_matches(doc_bytes: &[u8], pattern: &[u8]) -> Vec<(u32, u32)> {
+fn line_byte_range(doc: &[u8], start_line: u32, end_line: u32) -> (usize, usize) {
+	let mut current_line = 0u32;
+	let mut byte_start = 0usize;
+	let mut found_start = start_line == 0;
+
+	for (i, &b) in doc.iter().enumerate() {
+		if b == b'\n' {
+			current_line += 1;
+			if !found_start && current_line == start_line {
+				byte_start = i + 1;
+				found_start = true;
+			}
+			if current_line > end_line {
+				return (byte_start, i + 1);
+			}
+		}
+	}
+	if !found_start { byte_start = doc.len(); }
+	(byte_start, doc.len())
+}
+
+fn resolve_byte_range(range: &SubstituteRange, doc: &[u8], cursor_line: u32) -> Option<(usize, usize)> {
+	match range {
+		SubstituteRange::WholeFile => None,
+		SubstituteRange::CurrentLine => Some(line_byte_range(doc, cursor_line, cursor_line)),
+		SubstituteRange::SingleLine(n) => Some(line_byte_range(doc, *n, *n)),
+		SubstituteRange::LineRange(a, b) => Some(line_byte_range(doc, *a, *b)),
+	}
+}
+
+fn bytes_match(a: &[u8], b: &[u8], case_insensitive: bool) -> bool {
+	a.len() == b.len() && if case_insensitive {
+		a.iter().zip(b.iter()).all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+	} else {
+		a == b
+	}
+}
+
+fn find_all_matches(doc_bytes: &[u8], pattern: &[u8], case_insensitive: bool) -> Vec<(u32, u32)> {
 	let mut matches = Vec::new();
 	if pattern.is_empty() { return matches; }
-	let mut line: u32 = 0;
-	let mut col: u32 = 0;
-	let mut i = 0;
-	while i + pattern.len() <= doc_bytes.len() {
-		if &doc_bytes[i..i + pattern.len()] == pattern {
-			matches.push((line, col));
-			for &b in &doc_bytes[i..i + pattern.len()] {
+
+	if !case_insensitive {
+		// Fast path: use memchr memmem
+		let finder = memchr::memmem::find_iter(doc_bytes, pattern);
+		let mut line = 0u32;
+		let mut col = 0u32;
+		let mut prev_pos = 0usize;
+		for pos in finder {
+			for &b in &doc_bytes[prev_pos..pos] {
 				advance_col(b, &mut line, &mut col);
 			}
-			i += pattern.len();
-		} else {
-			advance_col(doc_bytes[i], &mut line, &mut col);
-			i += 1;
+			matches.push((line, col));
+			for &b in &doc_bytes[pos..pos + pattern.len()] {
+				advance_col(b, &mut line, &mut col);
+			}
+			prev_pos = pos + pattern.len();
+		}
+	} else {
+		// Case-insensitive: byte-by-byte with ASCII folding
+		let pat_lower: Vec<u8> = pattern.iter().map(|b| b.to_ascii_lowercase()).collect();
+		let mut line = 0u32;
+		let mut col = 0u32;
+		let mut i = 0;
+		while i + pattern.len() <= doc_bytes.len() {
+			if doc_bytes[i..i + pattern.len()].iter()
+				.zip(pat_lower.iter())
+				.all(|(a, b)| a.to_ascii_lowercase() == *b)
+			{
+				matches.push((line, col));
+				for &b in &doc_bytes[i..i + pattern.len()] {
+					advance_col(b, &mut line, &mut col);
+				}
+				i += pattern.len();
+			} else {
+				advance_col(doc_bytes[i], &mut line, &mut col);
+				i += 1;
+			}
 		}
 	}
 	matches
 }
 
-fn rebuild_document_from_bytes(registry: &UastRegistry, bytes: &[u8]) -> (NodeId, NodeId) {
+fn create_document_from_bytes(registry: &UastRegistry, bytes: &[u8]) -> (NodeId, NodeId) {
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
 	let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
@@ -105,20 +184,27 @@ fn rebuild_document_from_bytes(registry: &UastRegistry, bytes: &[u8]) -> (NodeId
 	(root, leaf)
 }
 
-fn substitute_bytes(doc: &[u8], pattern: &[u8], replacement: &[u8]) -> (Vec<u8>, u32) {
+fn substitute_bytes(doc: &[u8], pattern: &[u8], replacement: &[u8], case_insensitive: bool, byte_range: Option<(usize, usize)>) -> (Vec<u8>, u32) {
+	let (start, end) = byte_range.unwrap_or((0, doc.len()));
 	let mut result = Vec::with_capacity(doc.len());
 	let mut count = 0u32;
+
+	result.extend_from_slice(&doc[..start]);
+
+	let region = &doc[start..end];
 	let mut i = 0;
-	while i < doc.len() {
-		if i + pattern.len() <= doc.len() && &doc[i..i + pattern.len()] == pattern {
+	while i < region.len() {
+		if i + pattern.len() <= region.len() && bytes_match(&region[i..i + pattern.len()], pattern, case_insensitive) {
 			result.extend_from_slice(replacement);
 			count += 1;
 			i += pattern.len();
 		} else {
-			result.push(doc[i]);
+			result.push(region[i]);
 			i += 1;
 		}
 	}
+
+	result.extend_from_slice(&doc[end..]);
 	(result, count)
 }
 
@@ -163,6 +249,7 @@ impl Engine {
 
 		// Search state
 		let mut search_pattern: Option<String> = None;
+		let mut search_case_insensitive = false;
 		let mut search_matches: Vec<(u32, u32)> = Vec::new(); // (line, col) pairs
 		let mut search_match_index: Option<usize> = None;
 
@@ -391,10 +478,11 @@ impl Engine {
 					if let Some(rid) = root_id {
 						match registry.collect_document_bytes(rid) {
 							Ok(bytes) => {
-								let matches = find_all_matches(&bytes, pattern.as_bytes());
+								let matches = find_all_matches(&bytes, pattern.as_bytes(), false);
 								if matches.is_empty() {
 									status_message = Some("Pattern not found".to_string());
 									search_pattern = Some(pattern);
+									search_case_insensitive = false;
 									search_matches.clear();
 									search_match_index = None;
 								} else {
@@ -466,20 +554,18 @@ impl Engine {
 					}
 					needs_render = true;
 				}
-				EditorCommand::SubstituteAll { pattern, replacement } => {
+				EditorCommand::SubstituteAll { pattern, replacement, range, flags } => {
 					if let Some(rid) = root_id {
 						match registry.collect_document_bytes(rid) {
 							Ok(bytes) => {
-								let (new_bytes, count) = substitute_bytes(&bytes, pattern.as_bytes(), replacement.as_bytes());
+								let byte_range = resolve_byte_range(&range, &bytes, cursor_abs_line);
+								let (new_bytes, count) = substitute_bytes(&bytes, pattern.as_bytes(), replacement.as_bytes(), flags.case_insensitive, byte_range);
 								if count == 0 {
 									status_message = Some("Pattern not found".to_string());
 								} else {
-									let (new_root, new_leaf) = rebuild_document_from_bytes(&registry, &new_bytes);
+									let (new_root, _) = create_document_from_bytes(&registry, &new_bytes);
 									root_id = Some(new_root);
-									cursor_node = new_leaf;
-									cursor_offset = 0;
 									cursor_abs_line = cursor_abs_line.min(new_bytes.iter().filter(|&&b| b == b'\n').count() as u32);
-									cursor_abs_col = 0;
 									let (node, offset, clamped_col) = registry.find_node_at_line_col(new_root, cursor_abs_line, 0);
 									cursor_node = node;
 									cursor_offset = offset;
@@ -496,22 +582,31 @@ impl Engine {
 					}
 					needs_render = true;
 				}
-				EditorCommand::SubstituteConfirm { pattern, replacement } => {
+				EditorCommand::SubstituteConfirm { pattern, replacement, range, flags } => {
 					if let Some(rid) = root_id {
 						match registry.collect_document_bytes(rid) {
 							Ok(bytes) => {
-								let matches = find_all_matches(&bytes, pattern.as_bytes());
+								let all_matches = find_all_matches(&bytes, pattern.as_bytes(), flags.case_insensitive);
+								let matches: Vec<(u32, u32)> = match &range {
+									SubstituteRange::WholeFile => all_matches,
+									SubstituteRange::CurrentLine => all_matches.into_iter().filter(|&(l, _)| l == cursor_abs_line).collect(),
+									SubstituteRange::SingleLine(n) => { let n = *n; all_matches.into_iter().filter(move |&(l, _)| l == n).collect() },
+									SubstituteRange::LineRange(a, b) => { let (a, b) = (*a, *b); all_matches.into_iter().filter(move |&(l, _)| l >= a && l <= b).collect() },
+								};
 								if matches.is_empty() {
 									status_message = Some("Pattern not found".to_string());
 								} else {
 									let total = matches.len() as u32;
 									search_pattern = Some(pattern);
+									search_case_insensitive = flags.case_insensitive;
 									search_matches = matches;
 									search_match_index = Some(0);
 									confirm_state = Some(ConfirmState {
 										replacement,
 										replacements_done: 0,
 										total_matches: total,
+										flags,
+										range,
 									});
 									let (ml, mc) = search_matches[0];
 									cursor_abs_line = ml;
@@ -553,12 +648,18 @@ impl Engine {
 									new_bytes.extend_from_slice(&bytes[byte_off + pat.len()..]);
 									cs.replacements_done += 1;
 
-									let (new_root, _) = rebuild_document_from_bytes(&registry, &new_bytes);
+									let (new_root, _) = create_document_from_bytes(&registry, &new_bytes);
 									root_id = Some(new_root);
 									let new_rid = new_root;
 
-									// Re-scan for remaining matches after replacement point
-									let new_matches = find_all_matches(&new_bytes, pat.as_bytes());
+									// Re-scan for remaining matches after replacement point, filtered by range
+									let all_new = find_all_matches(&new_bytes, pat.as_bytes(), cs.flags.case_insensitive);
+									let new_matches: Vec<(u32, u32)> = match &cs.range {
+										SubstituteRange::WholeFile => all_new,
+										SubstituteRange::CurrentLine => all_new.into_iter().filter(|&(l, _)| l == ml).collect(),
+										SubstituteRange::SingleLine(n) => { let n = *n; all_new.into_iter().filter(move |&(l, _)| l == n).collect() },
+										SubstituteRange::LineRange(a, b) => { let (a, b) = (*a, *b); all_new.into_iter().filter(move |&(l, _)| l >= a && l <= b).collect() },
+									};
 									// Find next match at or after the replacement point
 									let rep_end_line;
 									let rep_end_col;
@@ -628,13 +729,13 @@ impl Engine {
 										byte_off += 1;
 									}
 									let remaining = &bytes[byte_off..];
-									let (replaced, count) = substitute_bytes(remaining, pat.as_bytes(), cs.replacement.as_bytes());
+									let (replaced, count) = substitute_bytes(remaining, pat.as_bytes(), cs.replacement.as_bytes(), cs.flags.case_insensitive, None);
 									let mut new_bytes = Vec::with_capacity(bytes.len());
 									new_bytes.extend_from_slice(&bytes[..byte_off]);
 									new_bytes.extend_from_slice(&replaced);
 									cs.replacements_done += count;
 
-									let (new_root, _new_leaf) = rebuild_document_from_bytes(&registry, &new_bytes);
+									let (new_root, _new_leaf) = create_document_from_bytes(&registry, &new_bytes);
 									root_id = Some(new_root);
 									file_size = new_bytes.len() as u64;
 									is_dirty = true;
@@ -703,6 +804,7 @@ impl Engine {
 					file_size,
 					is_dirty,
 					search_pattern: search_pattern.clone(),
+					search_case_insensitive,
 					confirm_prompt,
 					mode_override: mode_override.take(),
 				});

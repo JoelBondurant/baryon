@@ -1,6 +1,6 @@
 use crate::uast::kind::SemanticKind;
 use crate::uast::projection::Viewport;
-use crate::engine::{EditorMode, EditorCommand, MoveDirection, ConfirmAction};
+use crate::engine::{EditorMode, EditorCommand, MoveDirection, ConfirmAction, SubstituteRange, SubstituteFlags};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -187,17 +187,34 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 					// Precompute highlight byte ranges for search matches in this token
 					let highlight_style = Style::default().bg(Color::Rgb(180, 140, 50)).fg(Color::Black);
+					let search_ci = view.search_case_insensitive;
 					let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
 					if !search_pat.is_empty() && !token.text.is_empty() {
 						let pat = search_pat.as_bytes();
 						let tbytes = text.as_bytes();
-						let mut si = 0;
-						while si + pat.len() <= tbytes.len() {
-							if &tbytes[si..si + pat.len()] == pat {
-								highlight_ranges.push((si, si + pat.len()));
-								si += pat.len();
-							} else {
-								si += 1;
+						if search_ci {
+							let pat_lower: Vec<u8> = pat.iter().map(|b| b.to_ascii_lowercase()).collect();
+							let mut si = 0;
+							while si + pat.len() <= tbytes.len() {
+								if tbytes[si..si + pat.len()].iter()
+									.zip(pat_lower.iter())
+									.all(|(a, b)| a.to_ascii_lowercase() == *b)
+								{
+									highlight_ranges.push((si, si + pat.len()));
+									si += pat.len();
+								} else {
+									si += 1;
+								}
+							}
+						} else {
+							let mut si = 0;
+							while si + pat.len() <= tbytes.len() {
+								if &tbytes[si..si + pat.len()] == pat {
+									highlight_ranges.push((si, si + pat.len()));
+									si += pat.len();
+								} else {
+									si += 1;
+								}
 							}
 						}
 					}
@@ -466,12 +483,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let _ = self.tx_cmd.send(EditorCommand::Quit);
 					*should_quit = true;
 					return true;
-				} else if self.command_buffer.starts_with("%s/") {
-					if let Some((pattern, replacement, flags)) = parse_substitute(&self.command_buffer) {
-						if flags.contains('c') {
-							let _ = self.tx_cmd.send(EditorCommand::SubstituteConfirm { pattern, replacement });
+				} else if self.command_buffer.contains("s/") {
+					let cursor_line = self.current_viewport.as_ref().map(|v| v.cursor_abs_pos.0).unwrap_or(0);
+					if let Some((pattern, replacement, flags, range)) = parse_substitute(&self.command_buffer, cursor_line) {
+						if flags.confirm {
+							let _ = self.tx_cmd.send(EditorCommand::SubstituteConfirm { pattern, replacement, range, flags });
 						} else {
-							let _ = self.tx_cmd.send(EditorCommand::SubstituteAll { pattern, replacement });
+							let _ = self.tx_cmd.send(EditorCommand::SubstituteAll { pattern, replacement, range, flags });
 						}
 					} else {
 						self.status_message = Some("Invalid substitution syntax".to_string());
@@ -572,15 +590,50 @@ impl<B: Backend + io::Write> Frontend<B> {
 	}
 }
 
-fn parse_substitute(cmd: &str) -> Option<(String, String, String)> {
-	let rest = cmd.strip_prefix("%s/")?;
+fn parse_substitute(cmd: &str, cursor_line: u32) -> Option<(String, String, SubstituteFlags, SubstituteRange)> {
+	// Find "s/" to split range from pattern
+	let s_pos = cmd.find("s/")?;
+	let range_str = &cmd[..s_pos];
+	let rest = &cmd[s_pos + 2..]; // after "s/"
+
+	// Parse range
+	let range = if range_str == "%" {
+		SubstituteRange::WholeFile
+	} else if range_str.is_empty() || range_str == "." {
+		SubstituteRange::CurrentLine
+	} else if let Some(offset_str) = range_str.strip_prefix(".,+") {
+		let n: u32 = offset_str.parse().ok()?;
+		SubstituteRange::LineRange(cursor_line, cursor_line + n)
+	} else if let Some((a_str, b_str)) = range_str.split_once(',') {
+		let a: u32 = a_str.parse::<u32>().ok()?.saturating_sub(1);
+		let b: u32 = b_str.parse::<u32>().ok()?.saturating_sub(1);
+		SubstituteRange::LineRange(a, b)
+	} else if let Ok(n) = range_str.parse::<u32>() {
+		SubstituteRange::SingleLine(n.saturating_sub(1))
+	} else {
+		return None;
+	};
+
+	// Parse pattern/replacement/flags
 	let parts: Vec<&str> = rest.splitn(3, '/').collect();
 	if parts.len() < 2 { return None; }
 	let pattern = parts[0].to_string();
 	let replacement = parts[1].to_string();
-	let flags = parts.get(2).unwrap_or(&"").to_string();
+	let flags_str = parts.get(2).unwrap_or(&"");
 	if pattern.is_empty() { return None; }
-	Some((pattern, replacement, flags))
+
+	let mut flags = SubstituteFlags::default();
+	for c in flags_str.chars() {
+		match c {
+			'g' => flags.global = true,
+			'c' => flags.confirm = true,
+			'i' => flags.case_insensitive = true,
+			'I' => flags.case_insensitive = false,
+			_ => {}
+		}
+	}
+
+	Some((pattern, replacement, flags, range))
 }
 
 fn format_file_size(bytes: u64) -> String {
