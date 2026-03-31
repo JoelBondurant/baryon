@@ -22,6 +22,7 @@ pub struct Frontend<B: Backend + io::Write> {
 	command_buffer: String,
 	g_prefix: bool,
 	status_message: Option<String>,
+	needs_redraw: bool,
 }
 
 impl<B: Backend + io::Write> Frontend<B> {
@@ -39,6 +40,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			command_buffer: String::new(),
 			g_prefix: false,
 			status_message: None,
+			needs_redraw: false,
 		}
 	}
 
@@ -61,7 +63,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 				got_new_view = true;
 			}
 
-			if got_new_view || self.current_mode == EditorMode::Command || self.current_mode == EditorMode::Insert {
+			if got_new_view || self.needs_redraw || self.current_mode == EditorMode::Command || self.current_mode == EditorMode::Insert {
+				self.needs_redraw = false;
 				self.draw().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 			}
 			if event::poll(Duration::from_millis(16))? {
@@ -69,6 +72,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 					if let Event::Key(key) = event::read()? {
 						if key.kind == KeyEventKind::Press {
 							self.status_message = None;
+							self.needs_redraw = true;
 							match self.current_mode {
 								EditorMode::Normal => {
 									if self.handle_normal_key(key.code, key.modifiers, &mut should_quit) {
@@ -388,11 +392,19 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let _ = self.tx_cmd.send(EditorCommand::Quit);
 					*should_quit = true;
 					return true;
+				} else if !self.command_buffer.is_empty() {
+					self.status_message = Some(format!("Unknown command: {}", self.command_buffer));
 				}
 				self.current_mode = EditorMode::Normal;
 			}
 			KeyCode::Esc => { self.current_mode = EditorMode::Normal; }
-			KeyCode::Backspace => { self.command_buffer.pop(); }
+			KeyCode::Backspace => {
+				if self.command_buffer.is_empty() {
+					self.current_mode = EditorMode::Normal;
+				} else {
+					self.command_buffer.pop();
+				}
+			}
 			KeyCode::Char(c) => { self.command_buffer.push(c); }
 			_ => {}
 		}
