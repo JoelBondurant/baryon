@@ -1,4 +1,7 @@
-use crate::ecs::{NodeId, SemanticKind, SpanMetrics, SvpPointer, UastRegistry};
+use crate::ecs::id::NodeId;
+use crate::ecs::registry::UastRegistry;
+use crate::svp::pointer::SvpPointer;
+use crate::uast::mutation::UastMutation;
 use crossbeam_queue::ArrayQueue;
 use io_uring::{opcode, types, IoUring};
 use std::collections::HashMap;
@@ -30,7 +33,7 @@ pub struct SvpRequest {
 #[allow(dead_code)]
 pub struct SvpResolver {
 	_registry: Arc<UastRegistry>,
-	request_queue: Arc<ArrayQueue<SvpRequest>>,
+	pub(crate) request_queue: Arc<ArrayQueue<SvpRequest>>,
 	fds: Arc<Mutex<HashMap<u16, File>>>,
 }
 
@@ -185,58 +188,4 @@ impl SvpResolver {
 			}
 		}
 	}
-}
-
-pub fn ingest_svp_file(resolver: &SvpResolver, registry: &Arc<UastRegistry>, file_size: u64, device_id: u16, path: String) -> NodeId {
-	let chunk_count = (file_size + DMA_CHUNK_SIZE as u64 - 1) / DMA_CHUNK_SIZE as u64;
-	let mut chunk = registry.reserve_chunk(chunk_count as u32 + 1).expect("OOM");
-
-	let root_id = chunk.spawn_node(
-		SemanticKind::RelationalTable,
-		None,
-		SpanMetrics { byte_length: file_size as u32, newlines: 0 },
-	);
-
-	let mut first_leaf_id = None;
-	let mut last_leaf_id = None;
-
-	for i in 0..chunk_count {
-		let byte_offset = i * DMA_CHUNK_SIZE as u64;
-		let byte_length = if i == chunk_count - 1 {
-			(file_size % DMA_CHUNK_SIZE as u64) as u32
-		} else {
-			DMA_CHUNK_SIZE as u32
-		};
-
-		let leaf_id = chunk.spawn_node(
-			SemanticKind::Token,
-			Some(SvpPointer {
-				lba: byte_offset / 512,
-				byte_length,
-				device_id,
-				head_trim: (byte_offset % 512) as u16,
-			}),
-			SpanMetrics { byte_length, newlines: 0 },
-		);
-
-		if first_leaf_id.is_none() { first_leaf_id = Some(leaf_id); }
-		last_leaf_id = Some(leaf_id);
-
-		chunk.append_local_child(root_id, leaf_id);
-	}
-
-	resolver.register_device(device_id, &path);
-
-	if let (Some(first), Some(last)) = (first_leaf_id, last_leaf_id) {
-		if let Some(svp) = unsafe { *registry.spans[first.index()].get() } {
-			let _ = resolver.request_queue.push(SvpRequest {
-				node_id: first,
-				pointer: svp,
-				priority: RequestPriority::Low,
-				last_node_id: Some(last),
-			});
-		}
-	}
-
-	root_id
 }

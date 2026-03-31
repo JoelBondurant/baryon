@@ -1,0 +1,227 @@
+use crate::ecs::{NodeId, UastRegistry};
+use crate::uast::kind::SemanticKind;
+use crate::svp::pointer::SvpPointer;
+
+pub trait UastMutation {
+	fn apply_edit(&self, target: NodeId, added_bytes: i32, added_newlines: i32);
+	fn insert_text(&self, target: NodeId, offset_in_node: u32, new_text: &[u8]) -> (NodeId, u32);
+	fn delete_backwards(&self, target: NodeId, offset_in_node: u32) -> (NodeId, u32);
+	fn split_node_pvp(&self, target: NodeId, offset: u32, new_text: &[u8]) -> NodeId;
+	fn split_node_pvp_delete(&self, target: NodeId, offset: u32, delete_len: u32) -> NodeId;
+}
+
+impl UastMutation for UastRegistry {
+	fn apply_edit(&self, target: NodeId, added_bytes: i32, added_newlines: i32) {
+		let mut curr = Some(target);
+		while let Some(node) = curr {
+			let idx = node.index();
+			unsafe {
+				let m = &mut *self.metrics[idx].get();
+				m.byte_length = (m.byte_length as i32 + added_bytes) as u32;
+				m.newlines = (m.newlines as i32 + added_newlines) as u32;
+
+				curr = (*self.edges[idx].get()).parent;
+			}
+		}
+	}
+
+	fn insert_text(&self, target: NodeId, offset_in_node: u32, new_text: &[u8]) -> (NodeId, u32) {
+		let added_bytes = new_text.len() as i32;
+		let added_newlines = new_text.iter().filter(|&&b| b == b'\n').count() as i32;
+
+		self.apply_edit(target, added_bytes, added_newlines);
+
+		let idx = target.index();
+		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
+
+		if is_virtual {
+			unsafe {
+				if let Some(v_data) = &mut *self.virtual_data[idx].get() {
+					v_data.splice(
+						(offset_in_node as usize)..(offset_in_node as usize),
+						new_text.iter().copied(),
+					);
+				}
+			}
+			(target, offset_in_node + new_text.len() as u32)
+		} else {
+			let v_id = self.split_node_pvp(target, offset_in_node, new_text);
+			(v_id, new_text.len() as u32)
+		}
+	}
+
+	fn split_node_pvp(&self, target: NodeId, offset: u32, new_text: &[u8]) -> NodeId {
+		let target_idx = target.index();
+
+		let (parent, old_next_sibling, old_svp) = unsafe {
+			let e = &*self.edges[target_idx].get();
+			let s = (*self.spans[target_idx].get()).expect("Split target must be Physical");
+			(e.parent, e.next_sibling, s)
+		};
+		let parent = parent.expect("Cannot split a root node");
+
+		let v_id = self.alloc_node_internal();
+		let p2_id = self.alloc_node_internal();
+		let v_idx = v_id.index();
+		let p2_idx = p2_id.index();
+
+		let p1_len = offset;
+		unsafe {
+			let s = &mut *self.spans[target_idx].get();
+			s.as_mut().unwrap().byte_length = p1_len;
+
+			let m = &mut *self.metrics[target_idx].get();
+			m.byte_length = p1_len;
+
+			let e = &mut *self.edges[target_idx].get();
+			e.next_sibling = Some(v_id);
+		}
+
+		let v_len = new_text.len() as u32;
+		let v_newlines = new_text.iter().filter(|&&b| b == b'\n').count() as u32;
+		unsafe {
+			*self.kinds[v_idx].get() = SemanticKind::Token;
+			*self.spans[v_idx].get() = None;
+			*self.virtual_data[v_idx].get() = Some(new_text.to_vec());
+
+			let m = &mut *self.metrics[v_idx].get();
+			m.byte_length = v_len;
+			m.newlines = v_newlines;
+
+			let e = &mut *self.edges[v_idx].get();
+			e.parent = Some(parent);
+			e.next_sibling = Some(p2_id);
+		}
+
+		let p2_len = old_svp.byte_length.saturating_sub(offset);
+		let total_offset = old_svp.head_trim as u32 + offset;
+		unsafe {
+			*self.kinds[p2_idx].get() = SemanticKind::Token;
+			*self.spans[p2_idx].get() = Some(SvpPointer {
+				lba: old_svp.lba + (total_offset / 4096) as u64,
+				byte_length: p2_len,
+				device_id: old_svp.device_id,
+				head_trim: (total_offset % 4096) as u16,
+			});
+
+			let m = &mut *self.metrics[p2_idx].get();
+			m.byte_length = p2_len;
+
+			let e = &mut *self.edges[p2_idx].get();
+			e.parent = Some(parent);
+			e.next_sibling = old_next_sibling;
+		}
+
+		let p_idx = parent.index();
+		unsafe {
+			let tail_ptr = &mut *self.child_tails[p_idx].get();
+			if *tail_ptr == Some(target) {
+				*tail_ptr = Some(p2_id);
+			}
+		}
+
+		v_id
+	}
+
+	fn delete_backwards(&self, target: NodeId, offset_in_node: u32) -> (NodeId, u32) {
+		if offset_in_node == 0 {
+			if let Some(prev) = self.get_prev_sibling(target) {
+				let prev_idx = prev.index();
+				let prev_len = unsafe { (*self.metrics[prev_idx].get()).byte_length };
+				return self.delete_backwards(prev, prev_len);
+			} else {
+				return (target, 0);
+			}
+		}
+
+		let idx = target.index();
+		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
+
+		if is_virtual {
+			let mut bytes_to_remove = 1;
+			unsafe {
+				if let Some(v_data) = &mut *self.virtual_data[idx].get() {
+					let mut start = offset_in_node as usize - 1;
+					while start > 0 && !v_data[start].is_ascii() && (v_data[start] & 0xC0) == 0x80 {
+						start -= 1;
+					}
+					bytes_to_remove = offset_in_node as usize - start;
+					v_data.drain(start..offset_in_node as usize);
+				}
+			}
+			self.apply_edit(target, -(bytes_to_remove as i32), 0);
+			(target, offset_in_node - bytes_to_remove as u32)
+		} else {
+			let bytes_to_remove = 1;
+			let split_offset = offset_in_node.saturating_sub(bytes_to_remove);
+			let v_id = self.split_node_pvp_delete(target, split_offset, bytes_to_remove);
+			(v_id, 0)
+		}
+	}
+
+	fn split_node_pvp_delete(&self, target: NodeId, offset: u32, delete_len: u32) -> NodeId {
+		let target_idx = target.index();
+
+		let (parent, old_next_sibling, old_svp) = unsafe {
+			let e = &*self.edges[target_idx].get();
+			let s = (*self.spans[target_idx].get()).expect("Split target must be Physical");
+			(e.parent, e.next_sibling, s)
+		};
+		let parent = parent.expect("Cannot split a root node");
+
+		let v_id = self.alloc_node_internal();
+		let p2_id = self.alloc_node_internal();
+		let v_idx = v_id.index();
+		let p2_idx = p2_id.index();
+
+		unsafe {
+			let s = &mut *self.spans[target_idx].get();
+			s.as_mut().unwrap().byte_length = offset;
+			let m = &mut *self.metrics[target_idx].get();
+			m.byte_length = offset;
+			let e = &mut *self.edges[target_idx].get();
+			e.next_sibling = Some(v_id);
+		}
+
+		unsafe {
+			*self.kinds[v_idx].get() = SemanticKind::Token;
+			*self.spans[v_idx].get() = None;
+			*self.virtual_data[v_idx].get() = Some(Vec::new());
+			let m = &mut *self.metrics[v_idx].get();
+			m.byte_length = 0;
+			m.newlines = 0;
+			let e = &mut *self.edges[v_idx].get();
+			e.parent = Some(parent);
+			e.next_sibling = Some(p2_id);
+		}
+
+		let p2_len = old_svp.byte_length.saturating_sub(offset + delete_len);
+		let total_offset = old_svp.head_trim as u32 + offset + delete_len;
+		unsafe {
+			*self.kinds[p2_idx].get() = SemanticKind::Token;
+			*self.spans[p2_idx].get() = Some(SvpPointer {
+				lba: old_svp.lba + (total_offset / 4096) as u64,
+				byte_length: p2_len,
+				device_id: old_svp.device_id,
+				head_trim: (total_offset % 4096) as u16,
+			});
+			let m = &mut *self.metrics[p2_idx].get();
+			m.byte_length = p2_len;
+			let e = &mut *self.edges[p2_idx].get();
+			e.parent = Some(parent);
+			e.next_sibling = old_next_sibling;
+		}
+
+		let p_idx = parent.index();
+		unsafe {
+			let tail_ptr = &mut *self.child_tails[p_idx].get();
+			if *tail_ptr == Some(target) {
+				*tail_ptr = Some(p2_id);
+			}
+		}
+
+		self.apply_edit(parent, -(delete_len as i32), 0);
+
+		v_id
+	}
+}
