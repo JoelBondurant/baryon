@@ -22,6 +22,7 @@ pub struct Viewport {
 	pub is_dirty: bool,
 	pub search_pattern: Option<String>,
 	pub search_case_insensitive: bool,
+	pub search_match_info: Option<String>,
 	pub confirm_prompt: Option<String>,
 	pub mode_override: Option<crate::engine::EditorMode>,
 }

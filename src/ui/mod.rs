@@ -369,22 +369,34 @@ impl<B: Backend + io::Write> Frontend<B> {
 					}
 				}
 
-				// Right-aligned segments: filesize | encoding | line:col
+				// Right-aligned segments: [search] | filesize | encoding | line:col
 				let (cursor_line, cursor_col) = current_viewport.as_ref()
 					.map(|v| (v.cursor_abs_pos.0 + 1, v.cursor_abs_pos.1 + 1))
 					.unwrap_or((1, 1));
 
+				let search_info = current_viewport.as_ref().and_then(|v| v.search_match_info.as_deref());
 				let size_str = format_file_size(file_sz);
-				let right_text = format!("{} | UTF-8 | {}:{} ", size_str, cursor_line, cursor_col);
+				let right_text = match search_info {
+					Some(info) => format!("{} | {} | UTF-8 | {}:{} ", info, size_str, cursor_line, cursor_col),
+					None => format!("{} | UTF-8 | {}:{} ", size_str, cursor_line, cursor_col),
+				};
 
 				let right_start = w.saturating_sub(right_text.len());
 				if right_start > x {
 					let dim_style = bar_bg.fg(Color::Indexed(242));
+					let search_style = bar_bg.fg(Color::Rgb(200, 160, 255));
 					for (i, c) in right_text.chars().enumerate() {
 						let rx = right_start + i;
 						if rx >= w { break; }
+						let style = if c == '|' {
+							dim_style
+						} else if search_info.is_some() && rx < right_start + search_info.unwrap().len() {
+							search_style
+						} else {
+							bar_bg
+						};
 						if let Some(cell) = buf.cell_mut((rx as u16, bar_y)) {
-							cell.set_char(c).set_style(if c == '|' { dim_style } else { bar_bg });
+							cell.set_char(c).set_style(style);
 						}
 					}
 				}

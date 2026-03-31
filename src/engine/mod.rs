@@ -226,6 +226,7 @@ impl Engine {
 		let mut search_case_insensitive = false;
 		let mut search_matches: Vec<(u32, u32, usize)> = Vec::new(); // (line, col, match_byte_len)
 		let mut search_match_index: Option<usize> = None;
+		let mut search_match_info: Option<String> = None;
 
 		// Interactive replace state
 		let mut confirm_state: Option<ConfirmState> = None;
@@ -460,6 +461,7 @@ impl Engine {
 										search_case_insensitive = false;
 										search_matches.clear();
 										search_match_index = None;
+										search_match_info = None;
 									} else {
 										let count = matches.len();
 										let idx = matches.iter()
@@ -475,7 +477,7 @@ impl Engine {
 										search_pattern = Some(pattern);
 										search_case_insensitive = false;
 										search_matches = matches;
-										status_message = Some(format!("[{}/{}]", idx + 1, count));
+										search_match_info = Some(format!("[{}/{}]", idx + 1, count));
 									}
 								}
 								Err(msg) => { status_message = Some(msg.to_string()); }
@@ -502,8 +504,8 @@ impl Engine {
 							cursor_node = node;
 							cursor_offset = offset;
 							cursor_abs_col = mc;
-							let msg = format!("[{}/{}]", idx + 1, search_matches.len());
-							status_message = Some(if wrapped { format!("{} (wrapped)", msg) } else { msg });
+							let info = format!("[{}/{}]", idx + 1, search_matches.len());
+							search_match_info = Some(if wrapped { format!("{} (wrapped)", info) } else { info });
 						}
 					}
 					needs_render = true;
@@ -525,8 +527,8 @@ impl Engine {
 							cursor_node = node;
 							cursor_offset = offset;
 							cursor_abs_col = mc;
-							let msg = format!("[{}/{}]", idx + 1, search_matches.len());
-							status_message = Some(if wrapped { format!("{} (wrapped)", msg) } else { msg });
+							let info = format!("[{}/{}]", idx + 1, search_matches.len());
+							search_match_info = Some(if wrapped { format!("{} (wrapped)", info) } else { info });
 						}
 					}
 					needs_render = true;
@@ -552,6 +554,7 @@ impl Engine {
 									is_dirty = true;
 									search_matches.clear();
 									search_match_index = None;
+									search_match_info = None;
 									status_message = Some(format!("{} substitution(s)", count));
 								}
 							}
@@ -734,6 +737,7 @@ impl Engine {
 								mode_override = Some(EditorMode::Normal);
 								search_matches.clear();
 								search_match_index = None;
+								search_match_info = None;
 								confirm_state = None;
 							}
 							ConfirmAction::Quit => {
@@ -743,6 +747,7 @@ impl Engine {
 								confirm_state = None;
 								search_matches.clear();
 								search_match_index = None;
+								search_match_info = None;
 							}
 						}
 					}
@@ -791,6 +796,7 @@ impl Engine {
 					is_dirty,
 					search_pattern: search_pattern.clone(),
 					search_case_insensitive,
+					search_match_info: search_match_info.clone(),
 					confirm_prompt,
 					mode_override: mode_override.take(),
 				});
