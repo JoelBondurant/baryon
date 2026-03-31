@@ -15,12 +15,15 @@ pub struct Viewport {
 	pub tokens: Vec<RenderToken>,
 	pub cursor_abs_pos: (u32, u32),
 	pub total_lines: u32,
+	pub status_message: Option<String>,
+	pub should_quit: bool,
 }
 
 pub trait UastProjection {
 	fn query_viewport(&self, root: NodeId, target_line: u32, line_count: u32) -> Vec<RenderToken>;
 	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId>;
 	fn find_node_at_line_col(&self, root: NodeId, target_line: u32, target_col: u32) -> (NodeId, u32, u32);
+	fn collect_document_bytes(&self, root: NodeId) -> Result<Vec<u8>, &'static str>;
 }
 
 impl UastProjection for UastRegistry {
@@ -183,5 +186,32 @@ impl UastProjection for UastRegistry {
 		}
 
 		(root, 0, 0)
+	}
+
+	fn collect_document_bytes(&self, root: NodeId) -> Result<Vec<u8>, &'static str> {
+		let mut result = Vec::new();
+		let mut visit = self.get_first_child(root);
+
+		while let Some(node) = visit {
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+
+			if has_children {
+				visit = self.get_first_child(node);
+				continue;
+			}
+
+			unsafe {
+				if let Some(v_data) = &*self.virtual_data[idx].get() {
+					result.extend_from_slice(v_data);
+				} else if (*self.spans[idx].get()).is_some() {
+					return Err("File still loading, cannot write yet");
+				}
+			}
+
+			visit = self.get_next_node_in_walk(node);
+		}
+
+		Ok(result)
 	}
 }

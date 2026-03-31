@@ -21,6 +21,7 @@ pub struct Frontend<B: Backend + io::Write> {
 	current_mode: EditorMode,
 	command_buffer: String,
 	g_prefix: bool,
+	status_message: Option<String>,
 }
 
 impl<B: Backend + io::Write> Frontend<B> {
@@ -37,6 +38,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			current_mode: EditorMode::Normal,
 			command_buffer: String::new(),
 			g_prefix: false,
+			status_message: None,
 		}
 	}
 
@@ -46,8 +48,15 @@ impl<B: Backend + io::Write> Frontend<B> {
 		loop {
 			let mut got_new_view = initial_draw;
 			initial_draw = false;
+			let mut should_quit = false;
 
 			while let Ok(view) = self.rx_view.try_recv() {
+				if view.should_quit {
+					should_quit = true;
+				}
+				if let Some(msg) = view.status_message.clone() {
+					self.status_message = Some(msg);
+				}
 				self.current_viewport = Some(view);
 				got_new_view = true;
 			}
@@ -55,12 +64,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 			if got_new_view || self.current_mode == EditorMode::Command || self.current_mode == EditorMode::Insert {
 				self.draw().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 			}
-
-			let mut should_quit = false;
 			if event::poll(Duration::from_millis(16))? {
 				loop {
 					if let Event::Key(key) = event::read()? {
 						if key.kind == KeyEventKind::Press {
+							self.status_message = None;
 							match self.current_mode {
 								EditorMode::Normal => {
 									if self.handle_normal_key(key.code, key.modifiers, &mut should_quit) {
@@ -96,6 +104,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 	fn draw(&mut self) -> Result<(), B::Error> {
 		let current_viewport = &self.current_viewport;
 		let current_mode = &self.current_mode;
+		let status_message = &self.status_message;
 		let command_buffer = &self.command_buffer;
 		let g_prefix = self.g_prefix;
 
@@ -197,10 +206,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 			}
 
-			let status_text = match current_mode {
-				EditorMode::Normal => if g_prefix { "-- NORMAL (g pending) --" } else { "-- NORMAL --" }.to_string(),
-				EditorMode::Insert => "-- INSERT --".to_string(),
-				EditorMode::Command => format!(":{}", command_buffer),
+			let status_text = if let Some(msg) = status_message {
+				msg.clone()
+			} else {
+				match current_mode {
+					EditorMode::Normal => if g_prefix { "-- NORMAL (g pending) --" } else { "-- NORMAL --" }.to_string(),
+					EditorMode::Insert => "-- INSERT --".to_string(),
+					EditorMode::Command => format!(":{}", command_buffer),
+				}
 			};
 
 			for (i, c) in status_text.chars().enumerate() {
@@ -263,7 +276,15 @@ impl<B: Backend + io::Write> Frontend<B> {
 				return true;
 			}
 			KeyCode::Enter => {
-				if self.command_buffer.starts_with("e ") {
+				if self.command_buffer == "w" {
+					let _ = self.tx_cmd.send(EditorCommand::WriteFile);
+				} else if self.command_buffer.starts_with("w ") {
+					let path = self.command_buffer[2..].trim();
+					let expanded = crate::core::path::expand_path(path);
+					let _ = self.tx_cmd.send(EditorCommand::WriteFileAs(expanded.to_string_lossy().to_string()));
+				} else if self.command_buffer == "x" || self.command_buffer == "wq" {
+					let _ = self.tx_cmd.send(EditorCommand::WriteAndQuit);
+				} else if self.command_buffer.starts_with("e ") {
 					let path = self.command_buffer[2..].trim();
 					let expanded = crate::core::path::expand_path(path);
 					let _ = self.tx_cmd.send(EditorCommand::LoadFile(expanded.to_string_lossy().to_string()));

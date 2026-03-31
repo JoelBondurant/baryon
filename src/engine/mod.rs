@@ -29,6 +29,9 @@ pub enum EditorCommand {
 	MoveCursor(MoveDirection),
 	GotoLine(u32),
 	LoadFile(String),
+	WriteFile,
+	WriteFileAs(String),
+	WriteAndQuit,
 	InternalRefresh,
 	Quit,
 }
@@ -65,6 +68,9 @@ impl Engine {
 		let mut cursor_abs_col: u32 = 0;
 		let viewport_lines = 50;
 		let mut root_id: Option<NodeId> = None;
+		let mut file_path: Option<String> = None;
+		let mut status_message: Option<String> = None;
+		let mut pending_quit = false;
 
 		let mut cursor_node = NodeId(std::num::NonZeroU32::new(1).unwrap());
 		let mut cursor_offset = 0;
@@ -166,8 +172,9 @@ impl Engine {
 							&registry,
 							file_size,
 							device_id,
-							path,
+							path.clone(),
 						);
+						file_path = Some(path);
 						root_id = Some(rid);
 						cursor_node = registry
 							.get_first_child(rid)
@@ -176,7 +183,95 @@ impl Engine {
 						cursor_abs_line = 0;
 						cursor_abs_col = 0;
 						needs_render = true;
+					} else {
+						// New file — create empty document
+						use crate::uast::kind::SemanticKind;
+						use crate::uast::metrics::SpanMetrics;
+						let mut chunk = registry.reserve_chunk(2).expect("OOM");
+						let rid = chunk.spawn_node(
+							SemanticKind::RelationalTable,
+							None,
+							SpanMetrics { byte_length: 0, newlines: 0 },
+						);
+						let leaf = chunk.spawn_node(
+							SemanticKind::Token,
+							None,
+							SpanMetrics { byte_length: 0, newlines: 0 },
+						);
+						chunk.append_local_child(rid, leaf);
+						unsafe {
+							*registry.virtual_data[leaf.index()].get() = Some(Vec::new());
+						}
+						file_path = Some(path);
+						root_id = Some(rid);
+						cursor_node = leaf;
+						cursor_offset = 0;
+						cursor_abs_line = 0;
+						cursor_abs_col = 0;
+						needs_render = true;
 					}
+				}
+				EditorCommand::WriteFile => {
+					if let Some(rid) = root_id {
+						if let Some(ref path) = file_path {
+							match registry.collect_document_bytes(rid) {
+								Ok(bytes) => {
+									match std::fs::write(path, &bytes) {
+										Ok(_) => status_message = Some(format!("\"{}\" {}B written", path, bytes.len())),
+										Err(e) => status_message = Some(format!("Write error: {}", e)),
+									}
+								}
+								Err(msg) => status_message = Some(msg.to_string()),
+							}
+						} else {
+							status_message = Some("No file name".to_string());
+						}
+					} else {
+						status_message = Some("No file to write".to_string());
+					}
+					needs_render = true;
+				}
+				EditorCommand::WriteFileAs(path) => {
+					if let Some(rid) = root_id {
+						match registry.collect_document_bytes(rid) {
+							Ok(bytes) => {
+								match std::fs::write(&path, &bytes) {
+									Ok(_) => {
+										status_message = Some(format!("\"{}\" {}B written", path, bytes.len()));
+										file_path = Some(path);
+									}
+									Err(e) => status_message = Some(format!("Write error: {}", e)),
+								}
+							}
+							Err(msg) => status_message = Some(msg.to_string()),
+						}
+					} else {
+						status_message = Some("No file to write".to_string());
+					}
+					needs_render = true;
+				}
+				EditorCommand::WriteAndQuit => {
+					if let Some(rid) = root_id {
+						if let Some(ref path) = file_path {
+							match registry.collect_document_bytes(rid) {
+								Ok(bytes) => {
+									match std::fs::write(path, &bytes) {
+										Ok(_) => {
+											status_message = Some(format!("\"{}\" {}B written", path, bytes.len()));
+											pending_quit = true;
+										}
+										Err(e) => status_message = Some(format!("Write error: {}", e)),
+									}
+								}
+								Err(msg) => status_message = Some(msg.to_string()),
+							}
+						} else {
+							status_message = Some("No file name".to_string());
+						}
+					} else {
+						status_message = Some("No file to write".to_string());
+					}
+					needs_render = true;
 				}
 				EditorCommand::InternalRefresh => {
 					needs_render = true;
@@ -185,7 +280,7 @@ impl Engine {
 			}
 
 			if needs_render {
-				if let Some(rid) = root_id {
+				let (tokens, total_lines) = if let Some(rid) = root_id {
 					let scroll_y = cursor_abs_line.saturating_sub(20);
 					let tokens = registry.query_viewport(rid, scroll_y, viewport_lines);
 
@@ -204,11 +299,21 @@ impl Engine {
 						}
 					}
 
-					let _ = tx_view.send(Viewport {
-						tokens,
-						cursor_abs_pos: (cursor_abs_line, cursor_abs_col),
-						total_lines: registry.get_total_newlines(rid),
-					});
+					(tokens, registry.get_total_newlines(rid))
+				} else {
+					(Vec::new(), 0)
+				};
+
+				let _ = tx_view.send(Viewport {
+					tokens,
+					cursor_abs_pos: (cursor_abs_line, cursor_abs_col),
+					total_lines,
+					status_message: status_message.take(),
+					should_quit: pending_quit,
+				});
+
+				if pending_quit {
+					break;
 				}
 			}
 		}
