@@ -1,6 +1,8 @@
 use crate::ecs::{NodeId, UastRegistry};
 use crate::uast::{Viewport, UastProjection, UastMutation};
 use crate::svp::{SvpResolver, RequestPriority, ingest_svp_file};
+use regex_automata::meta::Regex;
+use regex_automata::util::syntax;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::sync::atomic::Ordering;
@@ -110,57 +112,53 @@ fn resolve_byte_range(range: &SubstituteRange, doc: &[u8], cursor_line: u32) -> 
 	}
 }
 
-fn bytes_match(a: &[u8], b: &[u8], case_insensitive: bool) -> bool {
-	a.len() == b.len() && if case_insensitive {
-		a.iter().zip(b.iter()).all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
-	} else {
-		a == b
-	}
+fn build_regex(pattern: &str, case_insensitive: bool) -> Result<Regex, String> {
+	Regex::builder()
+		.syntax(syntax::Config::new().case_insensitive(case_insensitive))
+		.build(pattern)
+		.map_err(|e| format!("Invalid regex: {}", e))
 }
 
-fn find_all_matches(doc_bytes: &[u8], pattern: &[u8], case_insensitive: bool) -> Vec<(u32, u32)> {
+/// Returns Vec of (line, col, match_byte_len) for each match.
+fn find_all_matches(doc_bytes: &[u8], re: &Regex) -> Vec<(u32, u32, usize)> {
 	let mut matches = Vec::new();
-	if pattern.is_empty() { return matches; }
+	let mut line = 0u32;
+	let mut col = 0u32;
+	let mut prev_pos = 0usize;
 
-	if !case_insensitive {
-		// Fast path: use memchr memmem
-		let finder = memchr::memmem::find_iter(doc_bytes, pattern);
-		let mut line = 0u32;
-		let mut col = 0u32;
-		let mut prev_pos = 0usize;
-		for pos in finder {
-			for &b in &doc_bytes[prev_pos..pos] {
-				advance_col(b, &mut line, &mut col);
-			}
-			matches.push((line, col));
-			for &b in &doc_bytes[pos..pos + pattern.len()] {
-				advance_col(b, &mut line, &mut col);
-			}
-			prev_pos = pos + pattern.len();
+	for m in re.find_iter(doc_bytes) {
+		for &b in &doc_bytes[prev_pos..m.start()] {
+			advance_col(b, &mut line, &mut col);
 		}
-	} else {
-		// Case-insensitive: byte-by-byte with ASCII folding
-		let pat_lower: Vec<u8> = pattern.iter().map(|b| b.to_ascii_lowercase()).collect();
-		let mut line = 0u32;
-		let mut col = 0u32;
-		let mut i = 0;
-		while i + pattern.len() <= doc_bytes.len() {
-			if doc_bytes[i..i + pattern.len()].iter()
-				.zip(pat_lower.iter())
-				.all(|(a, b)| a.to_ascii_lowercase() == *b)
-			{
-				matches.push((line, col));
-				for &b in &doc_bytes[i..i + pattern.len()] {
-					advance_col(b, &mut line, &mut col);
-				}
-				i += pattern.len();
-			} else {
-				advance_col(doc_bytes[i], &mut line, &mut col);
-				i += 1;
-			}
+		let match_len = m.end() - m.start();
+		matches.push((line, col, match_len));
+		for &b in &doc_bytes[m.start()..m.end()] {
+			advance_col(b, &mut line, &mut col);
 		}
+		prev_pos = m.end();
 	}
 	matches
+}
+
+fn substitute_bytes(doc: &[u8], re: &Regex, replacement: &[u8], byte_range: Option<(usize, usize)>) -> (Vec<u8>, u32) {
+	let (start, end) = byte_range.unwrap_or((0, doc.len()));
+	let mut result = Vec::with_capacity(doc.len());
+	let mut count = 0u32;
+
+	result.extend_from_slice(&doc[..start]);
+
+	let region = &doc[start..end];
+	let mut last = 0usize;
+	for m in re.find_iter(region) {
+		result.extend_from_slice(&region[last..m.start()]);
+		result.extend_from_slice(replacement);
+		count += 1;
+		last = m.end();
+	}
+	result.extend_from_slice(&region[last..]);
+
+	result.extend_from_slice(&doc[end..]);
+	(result, count)
 }
 
 fn create_document_from_bytes(registry: &UastRegistry, bytes: &[u8]) -> (NodeId, NodeId) {
@@ -182,30 +180,6 @@ fn create_document_from_bytes(registry: &UastRegistry, bytes: &[u8]) -> (NodeId,
 	chunk.append_local_child(root, leaf);
 	unsafe { *registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec()); }
 	(root, leaf)
-}
-
-fn substitute_bytes(doc: &[u8], pattern: &[u8], replacement: &[u8], case_insensitive: bool, byte_range: Option<(usize, usize)>) -> (Vec<u8>, u32) {
-	let (start, end) = byte_range.unwrap_or((0, doc.len()));
-	let mut result = Vec::with_capacity(doc.len());
-	let mut count = 0u32;
-
-	result.extend_from_slice(&doc[..start]);
-
-	let region = &doc[start..end];
-	let mut i = 0;
-	while i < region.len() {
-		if i + pattern.len() <= region.len() && bytes_match(&region[i..i + pattern.len()], pattern, case_insensitive) {
-			result.extend_from_slice(replacement);
-			count += 1;
-			i += pattern.len();
-		} else {
-			result.push(region[i]);
-			i += 1;
-		}
-	}
-
-	result.extend_from_slice(&doc[end..]);
-	(result, count)
 }
 
 pub struct Engine {
@@ -250,7 +224,7 @@ impl Engine {
 		// Search state
 		let mut search_pattern: Option<String> = None;
 		let mut search_case_insensitive = false;
-		let mut search_matches: Vec<(u32, u32)> = Vec::new(); // (line, col) pairs
+		let mut search_matches: Vec<(u32, u32, usize)> = Vec::new(); // (line, col, match_byte_len)
 		let mut search_match_index: Option<usize> = None;
 
 		// Interactive replace state
@@ -476,34 +450,37 @@ impl Engine {
 				}
 				EditorCommand::SearchStart(pattern) => {
 					if let Some(rid) = root_id {
-						match registry.collect_document_bytes(rid) {
-							Ok(bytes) => {
-								let matches = find_all_matches(&bytes, pattern.as_bytes(), false);
-								if matches.is_empty() {
-									status_message = Some("Pattern not found".to_string());
-									search_pattern = Some(pattern);
-									search_case_insensitive = false;
-									search_matches.clear();
-									search_match_index = None;
-								} else {
-									let count = matches.len();
-									// Find first match at or after cursor
-									let idx = matches.iter()
-										.position(|&(l, c)| l > cursor_abs_line || (l == cursor_abs_line && c >= cursor_abs_col))
-										.unwrap_or(0);
-									search_match_index = Some(idx);
-									let (ml, mc) = matches[idx];
-									cursor_abs_line = ml;
-									let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
-									cursor_node = node;
-									cursor_offset = offset;
-									cursor_abs_col = mc;
-									search_pattern = Some(pattern);
-									search_matches = matches;
-									status_message = Some(format!("[{}/{}]", idx + 1, count));
+						match build_regex(&pattern, false) {
+							Ok(re) => match registry.collect_document_bytes(rid) {
+								Ok(bytes) => {
+									let matches = find_all_matches(&bytes, &re);
+									if matches.is_empty() {
+										status_message = Some("Pattern not found".to_string());
+										search_pattern = Some(pattern);
+										search_case_insensitive = false;
+										search_matches.clear();
+										search_match_index = None;
+									} else {
+										let count = matches.len();
+										let idx = matches.iter()
+											.position(|&(l, c, _)| l > cursor_abs_line || (l == cursor_abs_line && c >= cursor_abs_col))
+											.unwrap_or(0);
+										search_match_index = Some(idx);
+										let (ml, mc, _) = matches[idx];
+										cursor_abs_line = ml;
+										let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
+										cursor_node = node;
+										cursor_offset = offset;
+										cursor_abs_col = mc;
+										search_pattern = Some(pattern);
+										search_case_insensitive = false;
+										search_matches = matches;
+										status_message = Some(format!("[{}/{}]", idx + 1, count));
+									}
 								}
+								Err(msg) => { status_message = Some(msg.to_string()); }
 							}
-							Err(msg) => { status_message = Some(msg.to_string()); }
+							Err(msg) => { status_message = Some(msg); }
 						}
 					}
 					needs_render = true;
@@ -519,7 +496,7 @@ impl Engine {
 							};
 							let wrapped = search_match_index.is_some_and(|i| i + 1 >= search_matches.len());
 							search_match_index = Some(idx);
-							let (ml, mc) = search_matches[idx];
+							let (ml, mc, _) = search_matches[idx];
 							cursor_abs_line = ml;
 							let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
 							cursor_node = node;
@@ -542,7 +519,7 @@ impl Engine {
 							};
 							let wrapped = search_match_index.is_some_and(|i| i == 0);
 							search_match_index = Some(idx);
-							let (ml, mc) = search_matches[idx];
+							let (ml, mc, _) = search_matches[idx];
 							cursor_abs_line = ml;
 							let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
 							cursor_node = node;
@@ -556,10 +533,11 @@ impl Engine {
 				}
 				EditorCommand::SubstituteAll { pattern, replacement, range, flags } => {
 					if let Some(rid) = root_id {
-						match registry.collect_document_bytes(rid) {
-							Ok(bytes) => {
-								let byte_range = resolve_byte_range(&range, &bytes, cursor_abs_line);
-								let (new_bytes, count) = substitute_bytes(&bytes, pattern.as_bytes(), replacement.as_bytes(), flags.case_insensitive, byte_range);
+						match build_regex(&pattern, flags.case_insensitive) {
+							Ok(re) => match registry.collect_document_bytes(rid) {
+								Ok(bytes) => {
+									let byte_range = resolve_byte_range(&range, &bytes, cursor_abs_line);
+									let (new_bytes, count) = substitute_bytes(&bytes, &re, replacement.as_bytes(), byte_range);
 								if count == 0 {
 									status_message = Some("Pattern not found".to_string());
 								} else {
@@ -579,46 +557,51 @@ impl Engine {
 							}
 							Err(msg) => { status_message = Some(msg.to_string()); }
 						}
+						Err(msg) => { status_message = Some(msg); }
+					}
 					}
 					needs_render = true;
 				}
 				EditorCommand::SubstituteConfirm { pattern, replacement, range, flags } => {
 					if let Some(rid) = root_id {
-						match registry.collect_document_bytes(rid) {
-							Ok(bytes) => {
-								let all_matches = find_all_matches(&bytes, pattern.as_bytes(), flags.case_insensitive);
-								let matches: Vec<(u32, u32)> = match &range {
-									SubstituteRange::WholeFile => all_matches,
-									SubstituteRange::CurrentLine => all_matches.into_iter().filter(|&(l, _)| l == cursor_abs_line).collect(),
-									SubstituteRange::SingleLine(n) => { let n = *n; all_matches.into_iter().filter(move |&(l, _)| l == n).collect() },
-									SubstituteRange::LineRange(a, b) => { let (a, b) = (*a, *b); all_matches.into_iter().filter(move |&(l, _)| l >= a && l <= b).collect() },
-								};
-								if matches.is_empty() {
-									status_message = Some("Pattern not found".to_string());
-								} else {
-									let total = matches.len() as u32;
-									search_pattern = Some(pattern);
-									search_case_insensitive = flags.case_insensitive;
-									search_matches = matches;
-									search_match_index = Some(0);
-									confirm_state = Some(ConfirmState {
-										replacement,
-										replacements_done: 0,
-										total_matches: total,
-										flags,
-										range,
-									});
-									let (ml, mc) = search_matches[0];
-									cursor_abs_line = ml;
-									let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
-									cursor_node = node;
-									cursor_offset = offset;
-									cursor_abs_col = mc;
-									mode_override = Some(EditorMode::Confirm);
-									status_message = Some(format!("Replace? [y/n/a/q] (1/{})", total));
+						match build_regex(&pattern, flags.case_insensitive) {
+							Ok(re) => match registry.collect_document_bytes(rid) {
+								Ok(bytes) => {
+									let all_matches = find_all_matches(&bytes, &re);
+									let matches: Vec<(u32, u32, usize)> = match &range {
+										SubstituteRange::WholeFile => all_matches,
+										SubstituteRange::CurrentLine => all_matches.into_iter().filter(|&(l, _, _)| l == cursor_abs_line).collect(),
+										SubstituteRange::SingleLine(n) => { let n = *n; all_matches.into_iter().filter(move |&(l, _, _)| l == n).collect() },
+										SubstituteRange::LineRange(a, b) => { let (a, b) = (*a, *b); all_matches.into_iter().filter(move |&(l, _, _)| l >= a && l <= b).collect() },
+									};
+									if matches.is_empty() {
+										status_message = Some("Pattern not found".to_string());
+									} else {
+										let total = matches.len() as u32;
+										search_pattern = Some(pattern);
+										search_case_insensitive = flags.case_insensitive;
+										search_matches = matches;
+										search_match_index = Some(0);
+										confirm_state = Some(ConfirmState {
+											replacement,
+											replacements_done: 0,
+											total_matches: total,
+											flags,
+											range,
+										});
+										let (ml, mc, _) = search_matches[0];
+										cursor_abs_line = ml;
+										let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
+										cursor_node = node;
+										cursor_offset = offset;
+										cursor_abs_col = mc;
+										mode_override = Some(EditorMode::Confirm);
+										status_message = Some(format!("Replace? [y/n/a/q] (1/{})", total));
+									}
 								}
+								Err(msg) => { status_message = Some(msg.to_string()); }
 							}
-							Err(msg) => { status_message = Some(msg.to_string()); }
+							Err(msg) => { status_message = Some(msg); }
 						}
 					}
 					needs_render = true;
@@ -631,7 +614,7 @@ impl Engine {
 								// Replace current match, rebuild doc, re-scan from next position
 								if let Ok(bytes) = registry.collect_document_bytes(rid) {
 									let idx = search_match_index.unwrap_or(0);
-									let (ml, mc) = search_matches[idx];
+									let (ml, mc, _) = search_matches[idx];
 									// Find byte offset of this match (mc is visual column)
 									let mut byte_off = 0usize;
 									let mut line = 0u32;
@@ -645,7 +628,8 @@ impl Engine {
 									let mut new_bytes = Vec::with_capacity(bytes.len());
 									new_bytes.extend_from_slice(&bytes[..byte_off]);
 									new_bytes.extend_from_slice(rep);
-									new_bytes.extend_from_slice(&bytes[byte_off + pat.len()..]);
+									let (_, _, match_len) = search_matches[idx];
+									new_bytes.extend_from_slice(&bytes[byte_off + match_len..]);
 									cs.replacements_done += 1;
 
 									let (new_root, _) = create_document_from_bytes(&registry, &new_bytes);
@@ -653,12 +637,13 @@ impl Engine {
 									let new_rid = new_root;
 
 									// Re-scan for remaining matches after replacement point, filtered by range
-									let all_new = find_all_matches(&new_bytes, pat.as_bytes(), cs.flags.case_insensitive);
-									let new_matches: Vec<(u32, u32)> = match &cs.range {
+									let re = build_regex(&pat, cs.flags.case_insensitive).unwrap();
+									let all_new = find_all_matches(&new_bytes, &re);
+									let new_matches: Vec<(u32, u32, usize)> = match &cs.range {
 										SubstituteRange::WholeFile => all_new,
-										SubstituteRange::CurrentLine => all_new.into_iter().filter(|&(l, _)| l == ml).collect(),
-										SubstituteRange::SingleLine(n) => { let n = *n; all_new.into_iter().filter(move |&(l, _)| l == n).collect() },
-										SubstituteRange::LineRange(a, b) => { let (a, b) = (*a, *b); all_new.into_iter().filter(move |&(l, _)| l >= a && l <= b).collect() },
+										SubstituteRange::CurrentLine => all_new.into_iter().filter(|&(l, _, _)| l == ml).collect(),
+										SubstituteRange::SingleLine(n) => { let n = *n; all_new.into_iter().filter(move |&(l, _, _)| l == n).collect() },
+										SubstituteRange::LineRange(a, b) => { let (a, b) = (*a, *b); all_new.into_iter().filter(move |&(l, _, _)| l >= a && l <= b).collect() },
 									};
 									// Find next match at or after the replacement point
 									let rep_end_line;
@@ -673,7 +658,7 @@ impl Engine {
 										rep_end_col = c;
 									}
 									let next_idx = new_matches.iter()
-										.position(|&(l, c)| l > rep_end_line || (l == rep_end_line && c >= rep_end_col));
+										.position(|&(l, c, _)| l > rep_end_line || (l == rep_end_line && c >= rep_end_col));
 
 									search_matches = new_matches;
 									is_dirty = true;
@@ -681,7 +666,7 @@ impl Engine {
 
 									if let Some(ni) = next_idx {
 										search_match_index = Some(ni);
-										let (ml2, mc2) = search_matches[ni];
+										let (ml2, mc2, _) = search_matches[ni];
 										cursor_abs_line = ml2;
 										let (node, offset, _) = registry.find_node_at_line_col(new_rid, ml2, mc2);
 										cursor_node = node;
@@ -702,7 +687,7 @@ impl Engine {
 								let idx = search_match_index.unwrap_or(0);
 								if idx + 1 < search_matches.len() {
 									search_match_index = Some(idx + 1);
-									let (ml, mc) = search_matches[idx + 1];
+									let (ml, mc, _) = search_matches[idx + 1];
 									cursor_abs_line = ml;
 									let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
 									cursor_node = node;
@@ -719,7 +704,7 @@ impl Engine {
 								if let Ok(bytes) = registry.collect_document_bytes(rid) {
 									// Replace all remaining from current position
 									let idx = search_match_index.unwrap_or(0);
-									let (ml, mc) = search_matches[idx];
+									let (ml, mc, _) = search_matches[idx];
 									let mut byte_off = 0usize;
 									let mut line = 0u32;
 									let mut col = 0u32;
@@ -729,7 +714,8 @@ impl Engine {
 										byte_off += 1;
 									}
 									let remaining = &bytes[byte_off..];
-									let (replaced, count) = substitute_bytes(remaining, pat.as_bytes(), cs.replacement.as_bytes(), cs.flags.case_insensitive, None);
+									let re = build_regex(&pat, cs.flags.case_insensitive).unwrap();
+									let (replaced, count) = substitute_bytes(remaining, &re, cs.replacement.as_bytes(), None);
 									let mut new_bytes = Vec::with_capacity(bytes.len());
 									new_bytes.extend_from_slice(&bytes[..byte_off]);
 									new_bytes.extend_from_slice(&replaced);

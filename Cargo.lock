@@ -49,6 +49,7 @@ dependencies = [
  "memchr",
  "ratatui",
  "rayon",
+ "regex-automata",
 ]
 
 [[package]]

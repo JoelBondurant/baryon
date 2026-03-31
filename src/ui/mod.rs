@@ -1,6 +1,8 @@
 use crate::uast::kind::SemanticKind;
 use crate::uast::projection::Viewport;
 use crate::engine::{EditorMode, EditorCommand, MoveDirection, ConfirmAction, SubstituteRange, SubstituteFlags};
+use regex_automata::meta::Regex;
+use regex_automata::util::syntax;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -190,31 +192,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let search_ci = view.search_case_insensitive;
 					let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
 					if !search_pat.is_empty() && !token.text.is_empty() {
-						let pat = search_pat.as_bytes();
 						let tbytes = text.as_bytes();
-						if search_ci {
-							let pat_lower: Vec<u8> = pat.iter().map(|b| b.to_ascii_lowercase()).collect();
-							let mut si = 0;
-							while si + pat.len() <= tbytes.len() {
-								if tbytes[si..si + pat.len()].iter()
-									.zip(pat_lower.iter())
-									.all(|(a, b)| a.to_ascii_lowercase() == *b)
-								{
-									highlight_ranges.push((si, si + pat.len()));
-									si += pat.len();
-								} else {
-									si += 1;
-								}
-							}
-						} else {
-							let mut si = 0;
-							while si + pat.len() <= tbytes.len() {
-								if &tbytes[si..si + pat.len()] == pat {
-									highlight_ranges.push((si, si + pat.len()));
-									si += pat.len();
-								} else {
-									si += 1;
-								}
+						if let Ok(re) = Regex::builder()
+							.syntax(syntax::Config::new().case_insensitive(search_ci))
+							.build(search_pat)
+						{
+							for m in re.find_iter(tbytes) {
+								highlight_ranges.push((m.start(), m.end()));
 							}
 						}
 					}
