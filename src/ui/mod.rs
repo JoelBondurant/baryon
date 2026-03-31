@@ -1,6 +1,6 @@
 use crate::uast::kind::SemanticKind;
 use crate::uast::projection::Viewport;
-use crate::engine::{EditorMode, EditorCommand, MoveDirection};
+use crate::engine::{EditorMode, EditorCommand, MoveDirection, ConfirmAction};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -23,6 +23,7 @@ pub struct Frontend<B: Backend + io::Write> {
 	g_prefix: bool,
 	status_message: Option<String>,
 	needs_redraw: bool,
+	search_buffer: String,
 }
 
 impl<B: Backend + io::Write> Frontend<B> {
@@ -41,6 +42,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			g_prefix: false,
 			status_message: None,
 			needs_redraw: false,
+			search_buffer: String::new(),
 		}
 	}
 
@@ -59,11 +61,15 @@ impl<B: Backend + io::Write> Frontend<B> {
 				if let Some(msg) = view.status_message.clone() {
 					self.status_message = Some(msg);
 				}
+				if let Some(mode) = view.mode_override.clone() {
+					self.current_mode = mode;
+					self.apply_cursor_style();
+				}
 				self.current_viewport = Some(view);
 				got_new_view = true;
 			}
 
-			if got_new_view || self.needs_redraw || self.current_mode == EditorMode::Command || self.current_mode == EditorMode::Insert {
+			if got_new_view || self.needs_redraw || matches!(self.current_mode, EditorMode::Command | EditorMode::Insert | EditorMode::Search | EditorMode::Confirm) {
 				self.needs_redraw = false;
 				self.draw().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 			}
@@ -89,6 +95,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 										break;
 									}
 								}
+								EditorMode::Search => {
+									if self.handle_search_key(key.code, key.modifiers, &mut should_quit) {
+										break;
+									}
+								}
+								EditorMode::Confirm => {
+									if self.handle_confirm_key(key.code, key.modifiers, &mut should_quit) {
+										break;
+									}
+								}
 							}
 						}
 					}
@@ -110,6 +126,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 		let current_mode = &self.current_mode;
 		let status_message = &self.status_message;
 		let command_buffer = &self.command_buffer;
+		let search_buffer = &self.search_buffer;
 		let g_prefix = self.g_prefix;
 
 		self.terminal.draw(|f| {
@@ -152,19 +169,45 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let mut y: usize = 0;
 				let render_height = (max_height as usize).saturating_sub(1);
 
+				let search_pat = view.search_pattern.as_deref().unwrap_or("");
+
 				for token in &view.tokens {
-					let mut style = match token.kind {
+					let base_style = match token.kind {
 						SemanticKind::Token => Style::default().fg(Color::LightGreen),
 						_ => Style::default().fg(Color::White),
 					};
 
-					if token.is_virtual {
-						style = style.add_modifier(Modifier::ITALIC).fg(Color::Yellow);
-					}
+					let virtual_style = if token.is_virtual {
+						base_style.add_modifier(Modifier::ITALIC).fg(Color::Yellow)
+					} else {
+						base_style
+					};
 
 					let text = if token.text.is_empty() { "[DMA PENDING...]" } else { &token.text };
 
+					// Precompute highlight byte ranges for search matches in this token
+					let highlight_style = Style::default().bg(Color::Rgb(180, 140, 50)).fg(Color::Black);
+					let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
+					if !search_pat.is_empty() && !token.text.is_empty() {
+						let pat = search_pat.as_bytes();
+						let tbytes = text.as_bytes();
+						let mut si = 0;
+						while si + pat.len() <= tbytes.len() {
+							if &tbytes[si..si + pat.len()] == pat {
+								highlight_ranges.push((si, si + pat.len()));
+								si += pat.len();
+							} else {
+								si += 1;
+							}
+						}
+					}
+
+					let mut byte_idx = 0usize;
 					for c in text.chars() {
+						let in_highlight = highlight_ranges.iter().any(|&(s, e)| byte_idx >= s && byte_idx < e);
+						let style = if in_highlight { highlight_style } else { virtual_style };
+						byte_idx += c.len_utf8();
+
 						if y >= render_height { break; }
 						if c == '\n' {
 							y += 1;
@@ -226,11 +269,15 @@ impl<B: Backend + io::Write> Frontend<B> {
 					EditorMode::Normal => if g_prefix { "NOR g" } else { "NOR" },
 					EditorMode::Insert => "INS",
 					EditorMode::Command => "CMD",
+					EditorMode::Search => "FIND",
+					EditorMode::Confirm => "Y/N",
 				};
 				let mode_style = bar_bg.fg(Color::Rgb(0, 0, 0)).bg(match current_mode {
 					EditorMode::Normal => Color::Rgb(130, 170, 255),
 					EditorMode::Insert => Color::Rgb(180, 230, 130),
 					EditorMode::Command => Color::Rgb(255, 180, 100),
+					EditorMode::Search => Color::Rgb(200, 160, 255),
+					EditorMode::Confirm => Color::Rgb(255, 120, 120),
 				});
 
 				let mut x = 0usize;
@@ -261,6 +308,26 @@ impl<B: Backend + io::Write> Frontend<B> {
 				if *current_mode == EditorMode::Command {
 					let cmd_text = format!(":{}", command_buffer);
 					for c in cmd_text.chars() {
+						if x >= w { break; }
+						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
+							cell.set_char(c).set_style(bar_bg);
+						}
+						x += 1;
+					}
+				} else if *current_mode == EditorMode::Search {
+					let search_text = format!("/{}", search_buffer);
+					for c in search_text.chars() {
+						if x >= w { break; }
+						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
+							cell.set_char(c).set_style(bar_bg);
+						}
+						x += 1;
+					}
+				} else if *current_mode == EditorMode::Confirm {
+					let prompt = current_viewport.as_ref()
+						.and_then(|v| v.confirm_prompt.as_deref())
+						.unwrap_or("Replace? [y/n/a/q]");
+					for c in prompt.chars() {
 						if x >= w { break; }
 						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
 							cell.set_char(c).set_style(bar_bg);
@@ -359,6 +426,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 				self.g_prefix = false;
 				self.apply_cursor_style();
 			}
+			KeyCode::Char('/') => {
+				self.current_mode = EditorMode::Search;
+				self.search_buffer.clear();
+				self.g_prefix = false;
+			}
+			KeyCode::Char('n') => { let _ = self.tx_cmd.send(EditorCommand::SearchNext); self.g_prefix = false; }
+			KeyCode::Char('N') => { let _ = self.tx_cmd.send(EditorCommand::SearchPrev); self.g_prefix = false; }
 			KeyCode::Backspace | KeyCode::Delete => { let _ = self.tx_cmd.send(EditorCommand::Backspace); self.g_prefix = false; }
 			KeyCode::Esc => { self.g_prefix = false; }
 			_ => { self.g_prefix = false; }
@@ -392,6 +466,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let _ = self.tx_cmd.send(EditorCommand::Quit);
 					*should_quit = true;
 					return true;
+				} else if self.command_buffer.starts_with("%s/") {
+					if let Some((pattern, replacement, flags)) = parse_substitute(&self.command_buffer) {
+						if flags.contains('c') {
+							let _ = self.tx_cmd.send(EditorCommand::SubstituteConfirm { pattern, replacement });
+						} else {
+							let _ = self.tx_cmd.send(EditorCommand::SubstituteAll { pattern, replacement });
+						}
+					} else {
+						self.status_message = Some("Invalid substitution syntax".to_string());
+					}
 				} else if !self.command_buffer.is_empty() {
 					self.status_message = Some(format!("Unknown command: {}", self.command_buffer));
 				}
@@ -430,9 +514,54 @@ impl<B: Backend + io::Write> Frontend<B> {
 		false
 	}
 
+	fn handle_search_key(&mut self, code: KeyCode, modifiers: event::KeyModifiers, should_quit: &mut bool) -> bool {
+		match code {
+			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
+				let _ = self.tx_cmd.send(EditorCommand::Quit);
+				*should_quit = true;
+				return true;
+			}
+			KeyCode::Enter => {
+				if !self.search_buffer.is_empty() {
+					let _ = self.tx_cmd.send(EditorCommand::SearchStart(self.search_buffer.clone()));
+				}
+				self.current_mode = EditorMode::Normal;
+			}
+			KeyCode::Esc => { self.current_mode = EditorMode::Normal; }
+			KeyCode::Backspace => {
+				if self.search_buffer.is_empty() {
+					self.current_mode = EditorMode::Normal;
+				} else {
+					self.search_buffer.pop();
+				}
+			}
+			KeyCode::Char(c) => { self.search_buffer.push(c); }
+			_ => {}
+		}
+		false
+	}
+
+	fn handle_confirm_key(&mut self, code: KeyCode, modifiers: event::KeyModifiers, should_quit: &mut bool) -> bool {
+		match code {
+			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
+				let _ = self.tx_cmd.send(EditorCommand::Quit);
+				*should_quit = true;
+				return true;
+			}
+			KeyCode::Char('y') => { let _ = self.tx_cmd.send(EditorCommand::ConfirmResponse(ConfirmAction::Yes)); }
+			KeyCode::Char('n') => { let _ = self.tx_cmd.send(EditorCommand::ConfirmResponse(ConfirmAction::No)); }
+			KeyCode::Char('a') => { let _ = self.tx_cmd.send(EditorCommand::ConfirmResponse(ConfirmAction::All)); }
+			KeyCode::Char('q') | KeyCode::Esc => {
+				let _ = self.tx_cmd.send(EditorCommand::ConfirmResponse(ConfirmAction::Quit));
+			}
+			_ => {}
+		}
+		false
+	}
+
 	fn apply_cursor_style(&mut self) {
 		let style = match self.current_mode {
-			EditorMode::Normal | EditorMode::Command => SetCursorStyle::SteadyBlock,
+			EditorMode::Normal | EditorMode::Command | EditorMode::Search | EditorMode::Confirm => SetCursorStyle::SteadyBlock,
 			EditorMode::Insert => SetCursorStyle::SteadyBar,
 		};
 		let _ = execute!(self.terminal.backend_mut(), style);
@@ -441,6 +570,17 @@ impl<B: Backend + io::Write> Frontend<B> {
 	pub fn release_terminal(self) -> Terminal<B> {
 		self.terminal
 	}
+}
+
+fn parse_substitute(cmd: &str) -> Option<(String, String, String)> {
+	let rest = cmd.strip_prefix("%s/")?;
+	let parts: Vec<&str> = rest.splitn(3, '/').collect();
+	if parts.len() < 2 { return None; }
+	let pattern = parts[0].to_string();
+	let replacement = parts[1].to_string();
+	let flags = parts.get(2).unwrap_or(&"").to_string();
+	if pattern.is_empty() { return None; }
+	Some((pattern, replacement, flags))
 }
 
 fn format_file_size(bytes: u64) -> String {

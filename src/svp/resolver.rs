@@ -146,7 +146,7 @@ impl SvpResolver {
 					let res = cqe.result();
 					let ud = cqe.user_data();
 					let node_idx = (ud & 0xFFFFFFFF) as usize;
-					let was_viewport = (ud >> 32) & 1 == 1;
+					let _was_viewport = (ud >> 32) & 1 == 1;
 					let buf_idx = ((ud >> 33) & 0x7F) as usize;
 					let last_idx_plus_1 = (ud >> 40) as usize;
 					
@@ -161,10 +161,8 @@ impl SvpResolver {
 							registry.apply_edit(node_id, 0, newlines);
 						}
 
-						if was_viewport {
-							let data = buffers[buf_idx][..byte_count].to_vec();
-							registry.hot_swap_virtual_data(node_id, data);
-						}
+						let data = buffers[buf_idx][..byte_count].to_vec();
+						registry.hot_swap_virtual_data(node_id, data);
 
 						registry.dma_in_flight[node_idx].store(false, Ordering::Relaxed);
 

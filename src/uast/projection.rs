@@ -20,6 +20,9 @@ pub struct Viewport {
 	pub file_name: Option<String>,
 	pub file_size: u64,
 	pub is_dirty: bool,
+	pub search_pattern: Option<String>,
+	pub confirm_prompt: Option<String>,
+	pub mode_override: Option<crate::engine::EditorMode>,
 }
 
 pub trait UastProjection {
