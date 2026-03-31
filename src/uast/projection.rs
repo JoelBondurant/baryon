@@ -17,6 +17,9 @@ pub struct Viewport {
 	pub total_lines: u32,
 	pub status_message: Option<String>,
 	pub should_quit: bool,
+	pub file_name: Option<String>,
+	pub file_size: u64,
+	pub is_dirty: bool,
 }
 
 pub trait UastProjection {

@@ -69,6 +69,8 @@ impl Engine {
 		let viewport_lines = 50;
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
+		let mut file_size: u64 = 0;
+		let mut is_dirty = false;
 		let mut status_message: Option<String> = None;
 		let mut pending_quit = false;
 
@@ -145,6 +147,7 @@ impl Engine {
 						} else {
 							cursor_abs_col += 1;
 						}
+						is_dirty = true;
 						needs_render = true;
 					}
 				}
@@ -155,6 +158,7 @@ impl Engine {
 						cursor_node = new_node;
 						cursor_offset = new_offset;
 						cursor_abs_col = cursor_abs_col.saturating_sub(1);
+						is_dirty = true;
 						needs_render = true;
 					}
 				}
@@ -164,17 +168,19 @@ impl Engine {
 				}
 				EditorCommand::LoadFile(path) => {
 					if let Ok(metadata) = std::fs::metadata(&path) {
-						let file_size = metadata.len();
+						let fsize = metadata.len();
 						let device_id = 0x42;
 
 						let rid = ingest_svp_file(
 							&resolver,
 							&registry,
-							file_size,
+							fsize,
 							device_id,
 							path.clone(),
 						);
 						file_path = Some(path);
+						file_size = fsize;
+						is_dirty = false;
 						root_id = Some(rid);
 						cursor_node = registry
 							.get_first_child(rid)
@@ -203,6 +209,8 @@ impl Engine {
 							*registry.virtual_data[leaf.index()].get() = Some(Vec::new());
 						}
 						file_path = Some(path);
+						file_size = 0;
+						is_dirty = false;
 						root_id = Some(rid);
 						cursor_node = leaf;
 						cursor_offset = 0;
@@ -216,8 +224,13 @@ impl Engine {
 						if let Some(ref path) = file_path {
 							match registry.collect_document_bytes(rid) {
 								Ok(bytes) => {
+									let len = bytes.len();
 									match std::fs::write(path, &bytes) {
-										Ok(_) => status_message = Some(format!("\"{}\" {}B written", path, bytes.len())),
+										Ok(_) => {
+											file_size = len as u64;
+											is_dirty = false;
+											status_message = Some(format!("\"{}\" {}B written", path, len));
+										}
 										Err(e) => status_message = Some(format!("Write error: {}", e)),
 									}
 								}
@@ -235,9 +248,12 @@ impl Engine {
 					if let Some(rid) = root_id {
 						match registry.collect_document_bytes(rid) {
 							Ok(bytes) => {
+								let len = bytes.len();
 								match std::fs::write(&path, &bytes) {
 									Ok(_) => {
-										status_message = Some(format!("\"{}\" {}B written", path, bytes.len()));
+										file_size = len as u64;
+										is_dirty = false;
+										status_message = Some(format!("\"{}\" {}B written", path, len));
 										file_path = Some(path);
 									}
 									Err(e) => status_message = Some(format!("Write error: {}", e)),
@@ -255,9 +271,12 @@ impl Engine {
 						if let Some(ref path) = file_path {
 							match registry.collect_document_bytes(rid) {
 								Ok(bytes) => {
+									let len = bytes.len();
 									match std::fs::write(path, &bytes) {
 										Ok(_) => {
-											status_message = Some(format!("\"{}\" {}B written", path, bytes.len()));
+											file_size = len as u64;
+											is_dirty = false;
+											status_message = Some(format!("\"{}\" {}B written", path, len));
 											pending_quit = true;
 										}
 										Err(e) => status_message = Some(format!("Write error: {}", e)),
@@ -310,6 +329,9 @@ impl Engine {
 					total_lines,
 					status_message: status_message.take(),
 					should_quit: pending_quit,
+					file_name: file_path.clone(),
+					file_size,
+					is_dirty,
 				});
 
 				if pending_quit {

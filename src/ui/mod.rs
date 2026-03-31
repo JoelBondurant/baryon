@@ -196,30 +196,124 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 			}
 
-			// --- STATUS BAR RENDERING ---
-			let status_bar_y = max_height.saturating_sub(1);
-			let status_bar_style = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::White);
+			// --- UNIBAR RENDERING ---
+			let bar_y = max_height.saturating_sub(1);
+			let bar_bg = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::White);
+			let w = max_width as usize;
 
+			// Clear bar
 			for sx in 0..max_width {
-				if let Some(cell) = buf.cell_mut((sx, status_bar_y)) {
-					cell.set_char(' ').set_style(status_bar_style);
+				if let Some(cell) = buf.cell_mut((sx, bar_y)) {
+					cell.set_char(' ').set_style(bar_bg);
 				}
 			}
 
-			let status_text = if let Some(msg) = status_message {
-				msg.clone()
-			} else {
-				match current_mode {
-					EditorMode::Normal => if g_prefix { "-- NORMAL (g pending) --" } else { "-- NORMAL --" }.to_string(),
-					EditorMode::Insert => "-- INSERT --".to_string(),
-					EditorMode::Command => format!(":{}", command_buffer),
-				}
-			};
-
-			for (i, c) in status_text.chars().enumerate() {
-				if i < max_width as usize {
-					if let Some(cell) = buf.cell_mut((i as u16, status_bar_y)) {
+			if let Some(msg) = status_message {
+				// Overlay status message (write feedback, errors)
+				for (i, c) in msg.chars().enumerate() {
+					if i >= w { break; }
+					if let Some(cell) = buf.cell_mut((i as u16, bar_y)) {
 						cell.set_char(c);
+					}
+				}
+			} else {
+				// Mode label
+				let mode_str = match current_mode {
+					EditorMode::Normal => if g_prefix { "NOR g" } else { "NOR" },
+					EditorMode::Insert => "INS",
+					EditorMode::Command => "CMD",
+				};
+				let mode_style = bar_bg.fg(Color::Rgb(0, 0, 0)).bg(match current_mode {
+					EditorMode::Normal => Color::Rgb(130, 170, 255),
+					EditorMode::Insert => Color::Rgb(180, 230, 130),
+					EditorMode::Command => Color::Rgb(255, 180, 100),
+				});
+
+				let mut x = 0usize;
+
+				// [ MODE ]
+				let mode_text = format!(" {} ", mode_str);
+				for c in mode_text.chars() {
+					if x >= w { break; }
+					if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
+						cell.set_char(c).set_style(mode_style);
+					}
+					x += 1;
+				}
+
+				// Separator
+				if x < w {
+					if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
+						cell.set_char(' ').set_style(bar_bg);
+					}
+					x += 1;
+				}
+
+				// Middle section: command input OR filename
+				let (file_name, file_sz, dirty) = current_viewport.as_ref()
+					.map(|v| (v.file_name.as_deref(), v.file_size, v.is_dirty))
+					.unwrap_or((None, 0, false));
+
+				if *current_mode == EditorMode::Command {
+					let cmd_text = format!(":{}", command_buffer);
+					for c in cmd_text.chars() {
+						if x >= w { break; }
+						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
+							cell.set_char(c).set_style(bar_bg);
+						}
+						x += 1;
+					}
+				} else {
+					let display_name = file_name
+						.map(|p| std::path::Path::new(p).file_name()
+							.and_then(|n| n.to_str())
+							.unwrap_or(p))
+						.unwrap_or("[No File]");
+					let name_style = if dirty {
+						bar_bg.fg(Color::Rgb(255, 200, 120))
+					} else {
+						bar_bg
+					};
+					for c in display_name.chars() {
+						if x >= w { break; }
+						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
+							cell.set_char(c).set_style(name_style);
+						}
+						x += 1;
+					}
+					if dirty {
+						if x < w {
+							if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
+								cell.set_char(' ').set_style(bar_bg);
+							}
+							x += 1;
+						}
+						if x < w {
+							if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
+								cell.set_char('\u{25CF}').set_style(bar_bg.fg(Color::Rgb(255, 160, 80)));
+							}
+							x += 1;
+						}
+					}
+				}
+
+				// Right-aligned segments: filesize | encoding | line:col
+				let (cursor_line, cursor_col) = current_viewport.as_ref()
+					.map(|v| (v.cursor_abs_pos.0 + 1, v.cursor_abs_pos.1 + 1))
+					.unwrap_or((1, 1));
+
+				let size_str = format_file_size(file_sz);
+				let right_text = format!("{} | UTF-8 | {}:{} ", size_str, cursor_line, cursor_col);
+
+				let right_start = w.saturating_sub(right_text.len());
+				if right_start > x {
+					let dim_style = bar_bg.fg(Color::Indexed(242));
+					for (i, c) in right_text.chars().enumerate() {
+						let rx = right_start + i;
+						if rx >= w { break; }
+						if let Some(cell) = buf.cell_mut((rx as u16, bar_y)) {
+							cell.set_char(c).set_style(if c == '|' { dim_style } else { bar_bg });
+						}
 					}
 				}
 			}
@@ -334,5 +428,20 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 	pub fn release_terminal(self) -> Terminal<B> {
 		self.terminal
+	}
+}
+
+fn format_file_size(bytes: u64) -> String {
+	const KB: u64 = 1024;
+	const MB: u64 = 1024 * KB;
+	const GB: u64 = 1024 * MB;
+	if bytes >= GB {
+		format!("{:.1} GB", bytes as f64 / GB as f64)
+	} else if bytes >= MB {
+		format!("{:.1} MB", bytes as f64 / MB as f64)
+	} else if bytes >= KB {
+		format!("{:.1} KB", bytes as f64 / KB as f64)
+	} else {
+		format!("{} B", bytes)
 	}
 }
