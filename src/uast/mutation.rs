@@ -66,12 +66,20 @@ impl UastMutation for UastRegistry {
 		let p2_idx = p2_id.index();
 
 		let p1_len = offset;
+		// Split virtual_data if the node was already DMA-resolved
+		let resolved_data = unsafe { (*self.virtual_data[target_idx].get()).take() };
+
 		unsafe {
 			let s = &mut *self.spans[target_idx].get();
 			s.as_mut().unwrap().byte_length = p1_len;
 
 			let m = &mut *self.metrics[target_idx].get();
 			m.byte_length = p1_len;
+			if let Some(ref data) = resolved_data {
+				let p1_data = &data[..offset as usize];
+				m.newlines = p1_data.iter().filter(|&&b| b == b'\n').count() as u32;
+				*self.virtual_data[target_idx].get() = Some(p1_data.to_vec());
+			}
 
 			let e = &mut *self.edges[target_idx].get();
 			e.next_sibling = Some(v_id);
@@ -106,6 +114,12 @@ impl UastMutation for UastRegistry {
 
 			let m = &mut *self.metrics[p2_idx].get();
 			m.byte_length = p2_len;
+			if let Some(ref data) = resolved_data {
+				let p2_data = &data[offset as usize..];
+				m.newlines = p2_data.iter().filter(|&&b| b == b'\n').count() as u32;
+				*self.virtual_data[p2_idx].get() = Some(p2_data.to_vec());
+				self.metrics_inflated[p2_idx].store(true, std::sync::atomic::Ordering::Relaxed);
+			}
 
 			let e = &mut *self.edges[p2_idx].get();
 			e.parent = Some(parent);
@@ -174,11 +188,18 @@ impl UastMutation for UastRegistry {
 		let v_idx = v_id.index();
 		let p2_idx = p2_id.index();
 
+		let resolved_data = unsafe { (*self.virtual_data[target_idx].get()).take() };
+
 		unsafe {
 			let s = &mut *self.spans[target_idx].get();
 			s.as_mut().unwrap().byte_length = offset;
 			let m = &mut *self.metrics[target_idx].get();
 			m.byte_length = offset;
+			if let Some(ref data) = resolved_data {
+				let p1_data = &data[..offset as usize];
+				m.newlines = p1_data.iter().filter(|&&b| b == b'\n').count() as u32;
+				*self.virtual_data[target_idx].get() = Some(p1_data.to_vec());
+			}
 			let e = &mut *self.edges[target_idx].get();
 			e.next_sibling = Some(v_id);
 		}
@@ -207,6 +228,12 @@ impl UastMutation for UastRegistry {
 			});
 			let m = &mut *self.metrics[p2_idx].get();
 			m.byte_length = p2_len;
+			if let Some(ref data) = resolved_data {
+				let p2_data = &data[(offset + delete_len) as usize..];
+				m.newlines = p2_data.iter().filter(|&&b| b == b'\n').count() as u32;
+				*self.virtual_data[p2_idx].get() = Some(p2_data.to_vec());
+				self.metrics_inflated[p2_idx].store(true, std::sync::atomic::Ordering::Relaxed);
+			}
 			let e = &mut *self.edges[p2_idx].get();
 			e.parent = Some(parent);
 			e.next_sibling = old_next_sibling;

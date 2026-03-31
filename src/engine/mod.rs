@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorMode {
 	Normal,
+	Insert,
 	Command,
 }
 
@@ -97,13 +98,14 @@ impl Engine {
 								cursor_abs_col = 0;
 							}
 						}
-						let (node, offset) = registry.find_node_at_line_col(
+						let (node, offset, clamped_col) = registry.find_node_at_line_col(
 							rid,
 							cursor_abs_line,
 							cursor_abs_col,
 						);
 						cursor_node = node;
 						cursor_offset = offset;
+						cursor_abs_col = clamped_col;
 						needs_render = true;
 					}
 				}
@@ -112,13 +114,14 @@ impl Engine {
 						let total = registry.get_total_newlines(rid);
 						cursor_abs_line = target.min(total);
 						cursor_abs_col = 0;
-						let (node, offset) = registry.find_node_at_line_col(
+						let (node, offset, clamped_col) = registry.find_node_at_line_col(
 							rid,
 							cursor_abs_line,
 							cursor_abs_col,
 						);
 						cursor_node = node;
 						cursor_offset = offset;
+						cursor_abs_col = clamped_col;
 						needs_render = true;
 					}
 				}
@@ -130,7 +133,12 @@ impl Engine {
 							registry.insert_text(cursor_node, cursor_offset, s.as_bytes());
 						cursor_node = new_node;
 						cursor_offset = new_offset;
-						cursor_abs_col += 1;
+						if c == '\n' {
+							cursor_abs_line += 1;
+							cursor_abs_col = 0;
+						} else {
+							cursor_abs_col += 1;
+						}
 						needs_render = true;
 					}
 				}

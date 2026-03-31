@@ -20,7 +20,7 @@ pub struct Viewport {
 pub trait UastProjection {
 	fn query_viewport(&self, root: NodeId, target_line: u32, line_count: u32) -> Vec<RenderToken>;
 	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId>;
-	fn find_node_at_line_col(&self, root: NodeId, target_line: u32, target_col: u32) -> (NodeId, u32);
+	fn find_node_at_line_col(&self, root: NodeId, target_line: u32, target_col: u32) -> (NodeId, u32, u32);
 }
 
 impl UastProjection for UastRegistry {
@@ -56,6 +56,12 @@ impl UastProjection for UastRegistry {
 		while let Some(node) = visit {
 			let idx = node.index();
 			let m = unsafe { &*self.metrics[idx].get() };
+
+			if m.byte_length == 0 && m.newlines == 0 {
+				visit = self.get_next_node_in_walk(node);
+				continue;
+			}
+
 			let text = self.resolve_physical_bytes(node);
 
 			let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
@@ -138,7 +144,7 @@ impl UastProjection for UastRegistry {
 		}
 	}
 
-	fn find_node_at_line_col(&self, root: NodeId, target_line: u32, target_col: u32) -> (NodeId, u32) {
+	fn find_node_at_line_col(&self, root: NodeId, target_line: u32, target_col: u32) -> (NodeId, u32, u32) {
 		let mut curr = Some(root);
 		let mut line_accumulator = 0;
 
@@ -162,13 +168,13 @@ impl UastProjection for UastRegistry {
 								.position(|&x| x == b'\n')
 								.unwrap_or(text.len() - i);
 							let actual_col = col_offset.min(line_end);
-							return (node, (i + actual_col) as u32);
+							return (node, (i + actual_col) as u32, actual_col as u32);
 						}
 						if *b == b'\n' {
 							current_line_in_node += 1;
 						}
 					}
-					return (node, text.len() as u32);
+					return (node, text.len() as u32, target_col);
 				}
 			} else {
 				line_accumulator += m.newlines;
@@ -176,6 +182,6 @@ impl UastProjection for UastRegistry {
 			}
 		}
 
-		(root, 0)
+		(root, 0, 0)
 	}
 }

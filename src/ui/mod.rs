@@ -1,17 +1,19 @@
 use crate::uast::kind::SemanticKind;
 use crate::uast::projection::Viewport;
 use crate::engine::{EditorMode, EditorCommand, MoveDirection};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
 	backend::Backend,
 	style::{Color, Modifier, Style},
 	Terminal,
 };
+use crossterm::execute;
 use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
 
-pub struct Frontend<B: Backend> {
+pub struct Frontend<B: Backend + io::Write> {
 	terminal: Terminal<B>,
 	tx_cmd: mpsc::Sender<EditorCommand>,
 	rx_view: mpsc::Receiver<Viewport>,
@@ -21,7 +23,7 @@ pub struct Frontend<B: Backend> {
 	g_prefix: bool,
 }
 
-impl<B: Backend> Frontend<B> {
+impl<B: Backend + io::Write> Frontend<B> {
 	pub fn new(
 		terminal: Terminal<B>,
 		tx_cmd: mpsc::Sender<EditorCommand>,
@@ -39,6 +41,7 @@ impl<B: Backend> Frontend<B> {
 	}
 
 	pub fn run(&mut self) -> Result<(), io::Error> {
+		self.apply_cursor_style();
 		let mut initial_draw = true;
 		loop {
 			let mut got_new_view = initial_draw;
@@ -49,7 +52,7 @@ impl<B: Backend> Frontend<B> {
 				got_new_view = true;
 			}
 
-			if got_new_view || self.current_mode == EditorMode::Command {
+			if got_new_view || self.current_mode == EditorMode::Command || self.current_mode == EditorMode::Insert {
 				self.draw().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 			}
 
@@ -61,6 +64,11 @@ impl<B: Backend> Frontend<B> {
 							match self.current_mode {
 								EditorMode::Normal => {
 									if self.handle_normal_key(key.code, key.modifiers, &mut should_quit) {
+										break;
+									}
+								}
+								EditorMode::Insert => {
+									if self.handle_insert_key(key.code, key.modifiers, &mut should_quit) {
 										break;
 									}
 								}
@@ -191,6 +199,7 @@ impl<B: Backend> Frontend<B> {
 
 			let status_text = match current_mode {
 				EditorMode::Normal => if g_prefix { "-- NORMAL (g pending) --" } else { "-- NORMAL --" }.to_string(),
+				EditorMode::Insert => "-- INSERT --".to_string(),
 				EditorMode::Command => format!(":{}", command_buffer),
 			};
 
@@ -234,8 +243,12 @@ impl<B: Backend> Frontend<B> {
 				}
 			}
 			KeyCode::Char('G') => { let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Bottom)); self.g_prefix = false; }
+			KeyCode::Char('i') => {
+				self.current_mode = EditorMode::Insert;
+				self.g_prefix = false;
+				self.apply_cursor_style();
+			}
 			KeyCode::Backspace | KeyCode::Delete => { let _ = self.tx_cmd.send(EditorCommand::Backspace); self.g_prefix = false; }
-			KeyCode::Char(c) => { let _ = self.tx_cmd.send(EditorCommand::InsertChar(c)); self.g_prefix = false; }
 			KeyCode::Esc => { self.g_prefix = false; }
 			_ => { self.g_prefix = false; }
 		}
@@ -269,6 +282,33 @@ impl<B: Backend> Frontend<B> {
 			_ => {}
 		}
 		false
+	}
+
+	fn handle_insert_key(&mut self, code: KeyCode, modifiers: event::KeyModifiers, should_quit: &mut bool) -> bool {
+		match code {
+			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
+				let _ = self.tx_cmd.send(EditorCommand::Quit);
+				*should_quit = true;
+				return true;
+			}
+			KeyCode::Esc => {
+				self.current_mode = EditorMode::Normal;
+				self.apply_cursor_style();
+			}
+			KeyCode::Enter => { let _ = self.tx_cmd.send(EditorCommand::InsertChar('\n')); }
+			KeyCode::Backspace => { let _ = self.tx_cmd.send(EditorCommand::Backspace); }
+			KeyCode::Char(c) => { let _ = self.tx_cmd.send(EditorCommand::InsertChar(c)); }
+			_ => {}
+		}
+		false
+	}
+
+	fn apply_cursor_style(&mut self) {
+		let style = match self.current_mode {
+			EditorMode::Normal | EditorMode::Command => SetCursorStyle::SteadyBlock,
+			EditorMode::Insert => SetCursorStyle::SteadyBar,
+		};
+		let _ = execute!(self.terminal.backend_mut(), style);
 	}
 
 	pub fn release_terminal(self) -> Terminal<B> {

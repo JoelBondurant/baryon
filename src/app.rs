@@ -4,6 +4,7 @@ use crate::svp::resolver::SvpResolver;
 use crate::uast::projection::Viewport;
 use crate::ui::Frontend;
 use crossterm::{
+	cursor::SetCursorStyle,
 	execute,
 	terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -63,7 +64,7 @@ impl App {
 		// 4. Teardown
 		disable_raw_mode()?;
 		let mut term = frontend.release_terminal();
-		execute!(term.backend_mut(), LeaveAlternateScreen)?;
+		execute!(term.backend_mut(), SetCursorStyle::DefaultUserShape, LeaveAlternateScreen)?;
 		term.show_cursor()?;
 
 		result
