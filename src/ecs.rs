@@ -273,7 +273,6 @@ impl UastRegistry {
 				line_accumulator += m.newlines;
 				collected_lines += m.newlines;
 			} else {
-				let lines_in_token = text.chars().filter(|&c| c == '\n').count() as u32;
 				// If we skipped lines, we already set line_accumulator to target_line
 				// We only add the lines that are actually in the remaining text
 				let lines_shown = tokens.last().unwrap().text.chars().filter(|&c| c == '\n').count() as u32;
