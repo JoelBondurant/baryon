@@ -251,8 +251,9 @@ impl<B: Backend> Frontend<B> {
 			}
 			KeyCode::Enter => {
 				if self.command_buffer.starts_with("e ") {
-					let path = self.command_buffer[2..].trim().to_string();
-					let _ = self.tx_cmd.send(EditorCommand::LoadFile(path));
+					let path = self.command_buffer[2..].trim();
+					let expanded = crate::core::path::expand_path(path);
+					let _ = self.tx_cmd.send(EditorCommand::LoadFile(expanded.to_string_lossy().to_string()));
 				} else if let Ok(line_num) = self.command_buffer.parse::<u32>() {
 					let _ = self.tx_cmd.send(EditorCommand::GotoLine(line_num.saturating_sub(1)));
 				} else if self.command_buffer == "q" {

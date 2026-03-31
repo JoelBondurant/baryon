@@ -20,7 +20,7 @@ impl App {
 		Self
 	}
 
-	pub fn run(&self) -> Result<(), io::Error> {
+	pub fn run(&self, initial_file: Option<String>) -> Result<(), io::Error> {
 		// 1. Setup Channels & Registry
 		let (tx_cmd, rx_cmd) = mpsc::channel::<EditorCommand>();
 		let (tx_view, rx_view) = mpsc::channel::<Viewport>();
@@ -42,6 +42,12 @@ impl App {
 		thread::spawn(move || {
 			engine.run();
 		});
+
+		// --- INITIAL LOAD ---
+		if let Some(path) = initial_file {
+			let expanded = crate::core::path::expand_path(&path);
+			let _ = tx_cmd.send(EditorCommand::LoadFile(expanded.to_string_lossy().to_string()));
+		}
 
 		// 3. Setup Frontend
 		enable_raw_mode()?;
