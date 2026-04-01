@@ -31,6 +31,55 @@ pub struct Viewport {
 	pub yank_flash: Option<(u64, u64)>,
 }
 
+fn advance_visual_col(col: &mut u32, byte: u8) {
+	if byte == b'\t' {
+		*col += 4 - (*col % 4);
+	} else {
+		*col += 1;
+	}
+}
+
+fn line_start_offset(text: &[u8], target_line_in_node: u32) -> Option<usize> {
+	if target_line_in_node == 0 {
+		return Some(0);
+	}
+
+	let mut line = 0u32;
+	for (i, &b) in text.iter().enumerate() {
+		if b == b'\n' {
+			line += 1;
+			if line == target_line_in_node {
+				return Some(i + 1);
+			}
+		}
+	}
+
+	None
+}
+
+fn offset_for_visual_col(line_bytes: &[u8], target_col: u32) -> (u32, u32) {
+	let mut visual_col = 0u32;
+	let mut byte_offset = 0usize;
+
+	for (i, &b) in line_bytes.iter().enumerate() {
+		if b == b'\n' || visual_col >= target_col {
+			break;
+		}
+
+		byte_offset = i + 1;
+		let mut next_col = visual_col;
+		advance_visual_col(&mut next_col, b);
+
+		if target_col <= next_col {
+			return (byte_offset as u32, target_col);
+		}
+
+		visual_col = next_col;
+	}
+
+	(byte_offset as u32, visual_col)
+}
+
 pub trait UastProjection {
 	fn query_viewport(&self, root: NodeId, target_line: u32, line_count: u32) -> Vec<RenderToken>;
 	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId>;
@@ -188,39 +237,33 @@ impl UastProjection for UastRegistry {
 		let mut curr = Some(root);
 		let mut line_accumulator = 0;
 
-		while let Some(node) = curr {
-			let idx = node.index();
-			let m = unsafe { &*self.metrics[idx].get() };
+			while let Some(node) = curr {
+				let idx = node.index();
+				let m = unsafe { &*self.metrics[idx].get() };
 
-			if line_accumulator + m.newlines >= target_line {
-				if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
-					curr = Some(child);
-					continue;
-				} else {
-					let text = self.resolve_physical_bytes(node);
-					let mut current_line_in_node = 0;
+				if line_accumulator + m.newlines >= target_line {
+					if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
+						curr = Some(child);
+						continue;
+					} else {
+						let text = self.resolve_physical_bytes(node);
 
-					for (i, b) in text.as_bytes().iter().enumerate() {
-						if line_accumulator + current_line_in_node == target_line {
-							let col_offset = target_col as usize;
-							let line_end = text.as_bytes()[i..]
-								.iter()
-								.position(|&x| x == b'\n')
-								.unwrap_or(text.len() - i);
-							let actual_col = col_offset.min(line_end);
-							return (node, (i + actual_col) as u32, actual_col as u32);
+						let target_line_in_node = target_line.saturating_sub(line_accumulator);
+						if let Some(line_start) =
+							line_start_offset(text.as_bytes(), target_line_in_node)
+						{
+							let (line_offset, clamped_col) =
+								offset_for_visual_col(&text.as_bytes()[line_start..], target_col);
+							return (node, line_start as u32 + line_offset, clamped_col);
 						}
-						if *b == b'\n' {
-							current_line_in_node += 1;
-						}
+
+						return (node, text.len() as u32, 0);
 					}
-					return (node, text.len() as u32, target_col);
+				} else {
+					line_accumulator += m.newlines;
+					curr = unsafe { (*self.edges[idx].get()).next_sibling };
 				}
-			} else {
-				line_accumulator += m.newlines;
-				curr = unsafe { (*self.edges[idx].get()).next_sibling };
 			}
-		}
 
 		(root, 0, 0)
 	}
@@ -250,5 +293,58 @@ impl UastProjection for UastRegistry {
 		}
 
 		Ok(result)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::UastProjection;
+	use crate::ecs::UastRegistry;
+	use crate::uast::kind::SemanticKind;
+	use crate::uast::metrics::SpanMetrics;
+
+	fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let newlines = text.bytes().filter(|&b| b == b'\n').count() as u32;
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: text.len() as u32,
+				newlines,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: text.len() as u32,
+				newlines,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+		unsafe {
+			*registry.virtual_data[leaf.index()].get() = Some(text.as_bytes().to_vec());
+		}
+		(registry, root)
+	}
+
+	#[test]
+	fn find_node_at_line_col_clamps_to_visual_width_with_tabs() {
+		let (registry, root) = build_document("\t\tlet x = 1;\n");
+		let (_node, offset, col) = registry.find_node_at_line_col(root, 0, 30);
+
+		assert_eq!(offset, 12);
+		assert_eq!(col, 18);
+	}
+
+	#[test]
+	fn find_node_at_line_col_preserves_visual_positions_inside_tabs() {
+		let (registry, root) = build_document("\tfoo\n");
+		let (_node, offset, col) = registry.find_node_at_line_col(root, 0, 3);
+
+		assert_eq!(offset, 1);
+		assert_eq!(col, 3);
 	}
 }

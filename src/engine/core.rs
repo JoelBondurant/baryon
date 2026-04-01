@@ -1,6 +1,8 @@
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::clipboard::ClipboardHandle;
-use crate::engine::undo::{TextDelta, UndoLedger, byte_offset_from_line_col, line_col_from_byte_offset};
+use crate::engine::undo::{
+	TextDelta, UndoLedger, byte_offset_from_line_col, line_col_from_byte_offset,
+};
 use crate::svp::highlight::TokenCategory;
 use crate::svp::semantic::SemanticReactor;
 use crate::svp::{RequestPriority, SvpResolver, ingest_svp_file};
@@ -79,8 +81,12 @@ pub enum EditorCommand {
 		flags: SubstituteFlags,
 	},
 	ConfirmResponse(ConfirmAction),
-	YankLine { register: char },
-	Put { register: char },
+	YankLine {
+		register: char,
+	},
+	Put {
+		register: char,
+	},
 	Undo,
 	Redo,
 	ClearFlash,
@@ -226,6 +232,105 @@ fn create_document_from_bytes(registry: &UastRegistry, bytes: &[u8]) -> (NodeId,
 	(root, leaf)
 }
 
+fn common_char_prefix_len(left: &str, right: &str) -> usize {
+	let mut prefix = 0usize;
+	let mut left_chars = left.chars();
+	let mut right_chars = right.chars();
+
+	loop {
+		match (left_chars.next(), right_chars.next()) {
+			(Some(l), Some(r)) if l == r => prefix += l.len_utf8(),
+			_ => break,
+		}
+	}
+
+	prefix
+}
+
+fn common_char_suffix_len(left: &str, right: &str) -> usize {
+	let mut suffix = 0usize;
+	let mut left_chars = left.chars().rev();
+	let mut right_chars = right.chars().rev();
+
+	loop {
+		match (left_chars.next(), right_chars.next()) {
+			(Some(l), Some(r)) if l == r => suffix += l.len_utf8(),
+			_ => break,
+		}
+	}
+
+	suffix
+}
+
+fn document_rewrite_delta(before: &str, after: &str) -> Option<(u64, String, String)> {
+	if before == after {
+		return None;
+	}
+
+	let prefix = common_char_prefix_len(before, after);
+	let suffix = common_char_suffix_len(&before[prefix..], &after[prefix..]);
+	let delete_end = before.len().saturating_sub(suffix);
+	let insert_end = after.len().saturating_sub(suffix);
+
+	Some((
+		prefix as u64,
+		before[prefix..delete_end].to_string(),
+		after[prefix..insert_end].to_string(),
+	))
+}
+
+fn push_document_rewrite_delta(ledger: &mut UndoLedger, before: &[u8], after: &[u8]) {
+	if before == after {
+		return;
+	}
+
+	if let (Ok(before_text), Ok(after_text)) =
+		(std::str::from_utf8(before), std::str::from_utf8(after))
+	{
+		if let Some((global_byte_offset, deleted_text, inserted_text)) =
+			document_rewrite_delta(before_text, after_text)
+		{
+			ledger.push(TextDelta {
+				global_byte_offset,
+				deleted_text,
+				inserted_text,
+				state_before: 0,
+				state_after: 0,
+			});
+		}
+		return;
+	}
+
+	ledger.push(TextDelta {
+		global_byte_offset: 0,
+		deleted_text: String::from_utf8_lossy(before).into_owned(),
+		inserted_text: String::from_utf8_lossy(after).into_owned(),
+		state_before: 0,
+		state_after: 0,
+	});
+}
+
+fn linewise_put_insertion(doc: &[u8], cursor_line: u32, text: &str) -> (usize, String, u32) {
+	let global_offset = byte_offset_from_line_col(doc, cursor_line, 0);
+	let off = global_offset as usize;
+	let line_end = doc[off..]
+		.iter()
+		.position(|&b| b == b'\n')
+		.map(|p| off + p + 1)
+		.unwrap_or(doc.len());
+
+	let needs_line_break = line_end == doc.len() && !doc.is_empty() && !doc.ends_with(b"\n");
+	let mut inserted_text = String::with_capacity(text.len() + usize::from(needs_line_break));
+	if needs_line_break {
+		inserted_text.push('\n');
+	}
+	inserted_text.push_str(text);
+
+	let target_cursor_line = if doc.is_empty() { 0 } else { cursor_line + 1 };
+
+	(line_end, inserted_text, target_cursor_line)
+}
+
 pub struct Engine {
 	registry: Arc<UastRegistry>,
 	resolver: Arc<SvpResolver>,
@@ -264,6 +369,7 @@ impl Engine {
 		let mut semantic_highlights: Vec<(u64, u64, TokenCategory)> = Vec::new();
 		let mut last_semantic_state: u64 = u64::MAX;
 		let mut last_semantic_len: usize = usize::MAX;
+		let mut last_semantic_path: Option<String> = None;
 
 		let mut cursor_abs_line: u32 = 0;
 		let mut cursor_abs_col: u32 = 0;
@@ -353,7 +459,8 @@ impl Engine {
 				EditorCommand::InsertChar(c) => {
 					if let Some(rid) = root_id {
 						// Compute global byte offset at cursor for the delta.
-						let global_offset = if let Ok(bytes) = registry.collect_document_bytes(rid) {
+						let global_offset = if let Ok(bytes) = registry.collect_document_bytes(rid)
+						{
 							byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col)
 						} else {
 							0
@@ -385,7 +492,8 @@ impl Engine {
 				EditorCommand::Backspace => {
 					if let Some(rid) = root_id {
 						// Compute global byte offset and peek at the char to be deleted.
-						let global_offset = if let Ok(bytes) = registry.collect_document_bytes(rid) {
+						let global_offset = if let Ok(bytes) = registry.collect_document_bytes(rid)
+						{
 							byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col)
 						} else {
 							0
@@ -428,9 +536,9 @@ impl Engine {
 								if cursor_abs_line > 0 {
 									cursor_abs_line -= 1;
 									// Recompute col: walk to the new byte offset.
-									if let Ok(bytes) = registry.collect_document_bytes(
-										root_id.unwrap_or(rid),
-									) {
+									if let Ok(bytes) =
+										registry.collect_document_bytes(root_id.unwrap_or(rid))
+									{
 										let (_, col) =
 											line_col_from_byte_offset(&bytes, delete_start);
 										cursor_abs_col = col;
@@ -488,6 +596,10 @@ impl Engine {
 						cursor_abs_line = 0;
 						cursor_abs_col = 0;
 						ledger.clear();
+						semantic_highlights.clear();
+						last_semantic_state = u64::MAX;
+						last_semantic_len = usize::MAX;
+						last_semantic_path = None;
 						needs_render = true;
 					} else {
 						// New file — create empty document
@@ -522,6 +634,10 @@ impl Engine {
 						cursor_abs_line = 0;
 						cursor_abs_col = 0;
 						ledger.clear();
+						semantic_highlights.clear();
+						last_semantic_state = u64::MAX;
+						last_semantic_len = usize::MAX;
+						last_semantic_path = None;
 						needs_render = true;
 					}
 				}
@@ -732,6 +848,11 @@ impl Engine {
 									if count == 0 {
 										status_message = Some("Pattern not found".to_string());
 									} else {
+										push_document_rewrite_delta(
+											&mut ledger,
+											&bytes,
+											&new_bytes,
+										);
 										let (new_root, _) =
 											create_document_from_bytes(&registry, &new_bytes);
 										root_id = Some(new_root);
@@ -743,11 +864,10 @@ impl Engine {
 										cursor_node = node;
 										cursor_offset = offset;
 										cursor_abs_col = clamped_col;
-	
+
 										search_matches.clear();
 										search_match_index = None;
 										search_match_info = None;
-										ledger.clear();
 										status_message = Some(format!("{} substitution(s)", count));
 									}
 								}
@@ -859,6 +979,7 @@ impl Engine {
 									let (_, _, match_len) = search_matches[idx];
 									new_bytes.extend_from_slice(&bytes[byte_off + match_len..]);
 									cs.replacements_done += 1;
+									push_document_rewrite_delta(&mut ledger, &bytes, &new_bytes);
 
 									let (new_root, _) =
 										create_document_from_bytes(&registry, &new_bytes);
@@ -907,7 +1028,6 @@ impl Engine {
 
 									search_matches = new_matches;
 
-
 									if let Some(ni) = next_idx {
 										search_match_index = Some(ni);
 										let (ml2, mc2, _) = search_matches[ni];
@@ -929,7 +1049,6 @@ impl Engine {
 										));
 										mode_override = Some(EditorMode::Normal);
 										confirm_state = None;
-										ledger.clear();
 										let (node, offset, _) = registry.find_node_at_line_col(
 											new_rid,
 											cursor_abs_line,
@@ -990,6 +1109,7 @@ impl Engine {
 									new_bytes.extend_from_slice(&bytes[..byte_off]);
 									new_bytes.extend_from_slice(&replaced);
 									cs.replacements_done += count;
+									push_document_rewrite_delta(&mut ledger, &bytes, &new_bytes);
 
 									let (new_root, _new_leaf) =
 										create_document_from_bytes(&registry, &new_bytes);
@@ -1012,7 +1132,6 @@ impl Engine {
 								search_match_index = None;
 								search_match_info = None;
 								confirm_state = None;
-								ledger.clear();
 							}
 							ConfirmAction::Quit => {
 								let done = cs.replacements_done;
@@ -1044,6 +1163,9 @@ impl Engine {
 
 							// Always store in the unnamed register.
 							registers.insert('"', line_text.clone());
+							if register != '"' && register != '+' {
+								registers.insert(register, line_text.clone());
+							}
 
 							// If '+' register was requested, also push to OS clipboard.
 							if register == '+' {
@@ -1069,10 +1191,13 @@ impl Engine {
 						// Resolve the text to paste.
 						let paste_text: Option<String> = if register == '+' {
 							// System clipboard — read from OS, fall back to unnamed register.
-							clipboard.get_text()
+							clipboard
+								.get_text()
 								.or_else(|| registers.get(&'"').cloned())
 						} else {
-							registers.get(&register).cloned()
+							registers
+								.get(&register)
+								.cloned()
 								.or_else(|| registers.get(&'"').cloned())
 						};
 
@@ -1080,30 +1205,20 @@ impl Engine {
 							if !text.is_empty() {
 								if let Ok(bytes) = registry.collect_document_bytes(rid) {
 									// Insert after current line (Vim 'p' for line-wise yank).
-									let global_offset = byte_offset_from_line_col(
-										&bytes,
-										cursor_abs_line,
-										0,
-									);
-									let off = global_offset as usize;
-									let line_end = bytes[off..]
-										.iter()
-										.position(|&b| b == b'\n')
-										.map(|p| off + p + 1)
-										.unwrap_or(bytes.len());
-									let insert_offset = line_end as u64;
+									let (insert_offset, inserted_text, target_cursor_line) =
+										linewise_put_insertion(&bytes, cursor_abs_line, &text);
 
 									// Build new document through delta + ledger.
 									let mut new_bytes =
-										Vec::with_capacity(bytes.len() + text.len());
-									new_bytes.extend_from_slice(&bytes[..line_end]);
-									new_bytes.extend_from_slice(text.as_bytes());
-									new_bytes.extend_from_slice(&bytes[line_end..]);
+										Vec::with_capacity(bytes.len() + inserted_text.len());
+									new_bytes.extend_from_slice(&bytes[..insert_offset]);
+									new_bytes.extend_from_slice(inserted_text.as_bytes());
+									new_bytes.extend_from_slice(&bytes[insert_offset..]);
 
 									let delta = TextDelta {
-										global_byte_offset: insert_offset,
+										global_byte_offset: insert_offset as u64,
 										deleted_text: String::new(),
-										inserted_text: text,
+										inserted_text,
 										state_before: 0,
 										state_after: 0,
 									};
@@ -1113,9 +1228,8 @@ impl Engine {
 										create_document_from_bytes(&registry, &new_bytes);
 									root_id = Some(new_root);
 
-
 									// Place cursor on the first line of pasted text.
-									cursor_abs_line += 1;
+									cursor_abs_line = target_cursor_line;
 									cursor_abs_col = 0;
 									let (node, offset, clamped_col) = registry
 										.find_node_at_line_col(
@@ -1200,7 +1314,8 @@ impl Engine {
 					// 1. Virtual Query (Look-behind 60 lines, Look-ahead 120 lines total)
 					let virtual_start_line = scroll_y.saturating_sub(60);
 					let virtual_line_count = viewport_lines + 120;
-					let virtual_tokens = registry.query_viewport(rid, virtual_start_line, virtual_line_count);
+					let virtual_tokens =
+						registry.query_viewport(rid, virtual_start_line, virtual_line_count);
 
 					// 2. Visible Query (The actual UI screen)
 					let visible_tokens = registry.query_viewport(rid, scroll_y, viewport_lines);
@@ -1216,7 +1331,11 @@ impl Engine {
 						}
 					}
 
-					(virtual_tokens, visible_tokens, registry.get_total_newlines(rid))
+					(
+						virtual_tokens,
+						visible_tokens,
+						registry.get_total_newlines(rid),
+					)
 				} else {
 					(Vec::new(), Vec::new(), 0)
 				};
@@ -1244,21 +1363,48 @@ impl Engine {
 							// Dual-Lock Gate: triggers on user mutation OR silent DMA load.
 							if let Some(rid) = root_id {
 								if let Ok(live_bytes) = registry.collect_document_bytes(rid) {
-									if ledger.current_state_id != last_semantic_state || live_bytes.len() != last_semantic_len {
+									let path_changed =
+										last_semantic_path.as_deref() != Some(path.as_str());
+									if path_changed
+										|| ledger.current_state_id != last_semantic_state
+										|| live_bytes.len() != last_semantic_len
+									{
 										// Skip incomplete 0-byte ghost reads on startup.
 										if !live_bytes.is_empty() && live_bytes.len() < 1_048_576 {
-											let text = String::from_utf8_lossy(&live_bytes).into_owned();
-											reactor.send(text, 0, file_path.clone().unwrap_or_default(), ledger.current_state_id);
+											let text =
+												String::from_utf8_lossy(&live_bytes).into_owned();
+											reactor.send(
+												text,
+												0,
+												file_path.clone().unwrap_or_default(),
+												ledger.current_state_id,
+											);
 											// Lock only after a successful, non-empty send.
 											last_semantic_state = ledger.current_state_id;
 											last_semantic_len = live_bytes.len();
+											last_semantic_path = Some(path.clone());
 											semantic_highlights.clear();
 										}
 									}
 								}
 							}
+						} else {
+							semantic_highlights.clear();
+							last_semantic_state = ledger.current_state_id;
+							last_semantic_len = 0;
+							last_semantic_path = Some(path.clone());
 						}
+					} else {
+						semantic_highlights.clear();
+						last_semantic_state = u64::MAX;
+						last_semantic_len = usize::MAX;
+						last_semantic_path = None;
 					}
+				} else {
+					semantic_highlights.clear();
+					last_semantic_state = u64::MAX;
+					last_semantic_len = usize::MAX;
+					last_semantic_path = None;
 				}
 
 				// Non-blocking poll: grab latest semantic highlights if ready.
@@ -1340,4 +1486,36 @@ fn merge_highlights(
 	// Sort by start byte for the projector's binary search.
 	merged.sort_unstable_by_key(|s| s.0);
 	merged
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{document_rewrite_delta, linewise_put_insertion};
+
+	#[test]
+	fn rewrite_delta_tracks_changed_middle_span() {
+		let delta =
+			document_rewrite_delta("fn main() {}\n", "fn demo() {}\n").expect("expected a delta");
+		assert_eq!(delta.0, 3);
+		assert_eq!(delta.1, "main");
+		assert_eq!(delta.2, "demo");
+	}
+
+	#[test]
+	fn linewise_put_adds_newline_at_eof_without_trailing_break() {
+		let (insert_offset, inserted_text, target_cursor_line) =
+			linewise_put_insertion(b"alpha", 0, "beta");
+		assert_eq!(insert_offset, 5);
+		assert_eq!(inserted_text, "\nbeta");
+		assert_eq!(target_cursor_line, 1);
+	}
+
+	#[test]
+	fn linewise_put_stays_on_first_line_for_empty_docs() {
+		let (insert_offset, inserted_text, target_cursor_line) =
+			linewise_put_insertion(b"", 0, "beta\n");
+		assert_eq!(insert_offset, 0);
+		assert_eq!(inserted_text, "beta\n");
+		assert_eq!(target_cursor_line, 0);
+	}
 }
