@@ -612,6 +612,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 					.send(EditorCommand::MoveCursor(MoveDirection::Bottom));
 				self.g_prefix = false;
 			}
+			KeyCode::Char('u') => {
+				let _ = self.tx_cmd.send(EditorCommand::Undo);
+				self.g_prefix = false;
+			}
+			KeyCode::Char('r') if modifiers.contains(event::KeyModifiers::CONTROL) => {
+				let _ = self.tx_cmd.send(EditorCommand::Redo);
+				self.g_prefix = false;
+			}
 			KeyCode::Char('i') => {
 				self.current_mode = EditorMode::Insert;
 				self.g_prefix = false;

@@ -1,4 +1,5 @@
 use crate::ecs::{NodeId, UastRegistry};
+use crate::engine::undo::{TextDelta, UndoLedger, byte_offset_from_line_col, line_col_from_byte_offset};
 use crate::svp::highlight::TokenCategory;
 use crate::svp::semantic::SemanticReactor;
 use crate::svp::{RequestPriority, SvpResolver, ingest_svp_file};
@@ -76,6 +77,8 @@ pub enum EditorCommand {
 		flags: SubstituteFlags,
 	},
 	ConfirmResponse(ConfirmAction),
+	Undo,
+	Redo,
 	InternalRefresh,
 	Quit,
 }
@@ -273,6 +276,9 @@ impl Engine {
 		// Interactive replace state
 		let mut confirm_state: Option<ConfirmState> = None;
 
+		// Undo/Redo ledger
+		let mut ledger = UndoLedger::new();
+
 		let mut cursor_node = NodeId(std::num::NonZeroU32::new(1).unwrap());
 		let mut cursor_offset = 0;
 
@@ -327,13 +333,27 @@ impl Engine {
 					}
 				}
 				EditorCommand::InsertChar(c) => {
-					if let Some(_rid) = root_id {
+					if let Some(rid) = root_id {
+						// Compute global byte offset at cursor for the delta.
+						let global_offset = if let Ok(bytes) = registry.collect_document_bytes(rid) {
+							byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col)
+						} else {
+							0
+						};
+
 						let mut buf = [0; 4];
 						let s = c.encode_utf8(&mut buf);
 						let (new_node, new_offset) =
 							registry.insert_text(cursor_node, cursor_offset, s.as_bytes());
 						cursor_node = new_node;
 						cursor_offset = new_offset;
+
+						ledger.push(TextDelta {
+							global_byte_offset: global_offset,
+							deleted_text: String::new(),
+							inserted_text: s.to_string(),
+						});
+
 						if c == '\n' {
 							cursor_abs_line += 1;
 							cursor_abs_col = 0;
@@ -345,14 +365,63 @@ impl Engine {
 					}
 				}
 				EditorCommand::Backspace => {
-					if let Some(_rid) = root_id {
-						let (new_node, new_offset) =
-							registry.delete_backwards(cursor_node, cursor_offset);
-						cursor_node = new_node;
-						cursor_offset = new_offset;
-						cursor_abs_col = cursor_abs_col.saturating_sub(1);
-						is_dirty = true;
-						needs_render = true;
+					if let Some(rid) = root_id {
+						// Compute global byte offset and peek at the char to be deleted.
+						let global_offset = if let Ok(bytes) = registry.collect_document_bytes(rid) {
+							byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col)
+						} else {
+							0
+						};
+
+						if global_offset > 0 {
+							// Extract the character about to be deleted.
+							let (deleted_text, delete_start) =
+								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+									let off = global_offset as usize;
+									let mut start = off - 1;
+									while start > 0 && (bytes[start] & 0xC0) == 0x80 {
+										start -= 1;
+									}
+									(
+										String::from_utf8_lossy(&bytes[start..off]).into_owned(),
+										start as u64,
+									)
+								} else {
+									(String::new(), global_offset - 1)
+								};
+
+							let (new_node, new_offset) =
+								registry.delete_backwards(cursor_node, cursor_offset);
+							cursor_node = new_node;
+							cursor_offset = new_offset;
+
+							if !deleted_text.is_empty() {
+								ledger.push(TextDelta {
+									global_byte_offset: delete_start,
+									deleted_text: deleted_text.clone(),
+									inserted_text: String::new(),
+								});
+							}
+
+							// Update cursor position after backspace.
+							if deleted_text == "\n" {
+								if cursor_abs_line > 0 {
+									cursor_abs_line -= 1;
+									// Recompute col: walk to the new byte offset.
+									if let Ok(bytes) = registry.collect_document_bytes(
+										root_id.unwrap_or(rid),
+									) {
+										let (_, col) =
+											line_col_from_byte_offset(&bytes, delete_start);
+										cursor_abs_col = col;
+									}
+								}
+							} else {
+								cursor_abs_col = cursor_abs_col.saturating_sub(1);
+							}
+							is_dirty = true;
+							needs_render = true;
+						}
 					}
 				}
 				EditorCommand::Scroll(delta) => {
@@ -400,6 +469,7 @@ impl Engine {
 						cursor_offset = 0;
 						cursor_abs_line = 0;
 						cursor_abs_col = 0;
+						ledger.clear();
 						needs_render = true;
 					} else {
 						// New file — create empty document
@@ -434,6 +504,7 @@ impl Engine {
 						cursor_offset = 0;
 						cursor_abs_line = 0;
 						cursor_abs_col = 0;
+						ledger.clear();
 						needs_render = true;
 					}
 				}
@@ -663,6 +734,7 @@ impl Engine {
 										search_matches.clear();
 										search_match_index = None;
 										search_match_info = None;
+										ledger.clear();
 										status_message = Some(format!("{} substitution(s)", count));
 									}
 								}
@@ -845,6 +917,7 @@ impl Engine {
 										));
 										mode_override = Some(EditorMode::Normal);
 										confirm_state = None;
+										ledger.clear();
 										let (node, offset, _) = registry.find_node_at_line_col(
 											new_rid,
 											cursor_abs_line,
@@ -928,6 +1001,7 @@ impl Engine {
 								search_match_index = None;
 								search_match_info = None;
 								confirm_state = None;
+								ledger.clear();
 							}
 							ConfirmAction::Quit => {
 								let done = cs.replacements_done;
@@ -941,6 +1015,58 @@ impl Engine {
 						}
 					}
 					needs_render = true;
+				}
+				EditorCommand::Undo => {
+					if let Some(rid) = root_id {
+						if let Some((new_root, new_leaf, cursor_byte)) =
+							ledger.undo(&registry, rid)
+						{
+							root_id = Some(new_root);
+							cursor_node = new_leaf;
+							cursor_offset = 0;
+							if let Ok(bytes) = registry.collect_document_bytes(new_root) {
+								let (line, col) = line_col_from_byte_offset(&bytes, cursor_byte);
+								cursor_abs_line = line;
+								file_size = bytes.len() as u64;
+								let (node, offset, clamped_col) =
+									registry.find_node_at_line_col(new_root, line, col);
+								cursor_node = node;
+								cursor_offset = offset;
+								cursor_abs_col = clamped_col;
+							}
+							is_dirty = true;
+							needs_render = true;
+						} else {
+							status_message = Some("Already at oldest change".to_string());
+							needs_render = true;
+						}
+					}
+				}
+				EditorCommand::Redo => {
+					if let Some(rid) = root_id {
+						if let Some((new_root, new_leaf, cursor_byte)) =
+							ledger.redo(&registry, rid)
+						{
+							root_id = Some(new_root);
+							cursor_node = new_leaf;
+							cursor_offset = 0;
+							if let Ok(bytes) = registry.collect_document_bytes(new_root) {
+								let (line, col) = line_col_from_byte_offset(&bytes, cursor_byte);
+								cursor_abs_line = line;
+								file_size = bytes.len() as u64;
+								let (node, offset, clamped_col) =
+									registry.find_node_at_line_col(new_root, line, col);
+								cursor_node = node;
+								cursor_offset = offset;
+								cursor_abs_col = clamped_col;
+							}
+							is_dirty = true;
+							needs_render = true;
+						} else {
+							status_message = Some("Already at newest change".to_string());
+							needs_render = true;
+						}
+					}
 				}
 				EditorCommand::InternalRefresh => {
 					needs_render = true;
