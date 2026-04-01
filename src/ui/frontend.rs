@@ -276,8 +276,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 						// Yank flash override: gold highlight over the yanked byte range.
 						if let Some((flash_start, flash_end)) = view.yank_flash {
-							if current_global_byte >= flash_start
-								&& current_global_byte < flash_end
+							if current_global_byte >= flash_start && current_global_byte < flash_end
 							{
 								style = Style::default()
 									.bg(Color::Rgb(229, 192, 123))
@@ -657,9 +656,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			}
 			KeyCode::Char('y') => {
 				if self.y_prefix {
-					let _ = self
-						.tx_cmd
-						.send(EditorCommand::YankLine { register });
+					let _ = self.tx_cmd.send(EditorCommand::YankLine { register });
 					self.clear_prefixes();
 				} else {
 					self.y_prefix = true;
@@ -668,9 +665,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 			}
 			KeyCode::Char('p') => {
-				let _ = self
-					.tx_cmd
-					.send(EditorCommand::Put { register });
+				let _ = self.tx_cmd.send(EditorCommand::Put { register });
 				self.clear_prefixes();
 			}
 			KeyCode::Char('u') => {
@@ -704,19 +699,27 @@ impl<B: Backend + io::Write> Frontend<B> {
 				self.clear_prefixes();
 			}
 			KeyCode::Up => {
-				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Up));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Up));
 				self.clear_prefixes();
 			}
 			KeyCode::Down => {
-				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Down));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Down));
 				self.clear_prefixes();
 			}
 			KeyCode::Left => {
-				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Left));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Left));
 				self.clear_prefixes();
 			}
 			KeyCode::Right => {
-				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Right));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Right));
 				self.clear_prefixes();
 			}
 			KeyCode::Esc => {
@@ -839,16 +842,24 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let _ = self.tx_cmd.send(EditorCommand::Backspace);
 			}
 			KeyCode::Up => {
-				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Up));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Up));
 			}
 			KeyCode::Down => {
-				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Down));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Down));
 			}
 			KeyCode::Left => {
-				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Left));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Left));
 			}
 			KeyCode::Right => {
-				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Right));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Right));
 			}
 			KeyCode::Char(c) => {
 				let _ = self.tx_cmd.send(EditorCommand::InsertChar(c));

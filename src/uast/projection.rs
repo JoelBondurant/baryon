@@ -238,33 +238,33 @@ impl UastProjection for UastRegistry {
 		let mut curr = Some(root);
 		let mut line_accumulator = 0;
 
-			while let Some(node) = curr {
-				let idx = node.index();
-				let m = unsafe { &*self.metrics[idx].get() };
+		while let Some(node) = curr {
+			let idx = node.index();
+			let m = unsafe { &*self.metrics[idx].get() };
 
-				if line_accumulator + m.newlines >= target_line {
-					if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
-						curr = Some(child);
-						continue;
-					} else {
-						let text = self.resolve_physical_bytes(node);
-
-						let target_line_in_node = target_line.saturating_sub(line_accumulator);
-						if let Some(line_start) =
-							line_start_offset(text.as_bytes(), target_line_in_node)
-						{
-							let (line_offset, clamped_col) =
-								offset_for_visual_col(&text.as_bytes()[line_start..], target_col);
-							return (node, line_start as u32 + line_offset, clamped_col);
-						}
-
-						return (node, text.len() as u32, 0);
-					}
+			if line_accumulator + m.newlines >= target_line {
+				if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
+					curr = Some(child);
+					continue;
 				} else {
-					line_accumulator += m.newlines;
-					curr = unsafe { (*self.edges[idx].get()).next_sibling };
+					let text = self.resolve_physical_bytes(node);
+
+					let target_line_in_node = target_line.saturating_sub(line_accumulator);
+					if let Some(line_start) =
+						line_start_offset(text.as_bytes(), target_line_in_node)
+					{
+						let (line_offset, clamped_col) =
+							offset_for_visual_col(&text.as_bytes()[line_start..], target_col);
+						return (node, line_start as u32 + line_offset, clamped_col);
+					}
+
+					return (node, text.len() as u32, 0);
 				}
+			} else {
+				line_accumulator += m.newlines;
+				curr = unsafe { (*self.edges[idx].get()).next_sibling };
 			}
+		}
 
 		(root, 0, 0)
 	}

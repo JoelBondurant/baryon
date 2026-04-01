@@ -103,7 +103,9 @@ fn classify_token(kind: SyntaxKind) -> TokenCategory {
 		| SyntaxKind::UNDERSCORE
 		| SyntaxKind::QUESTION => TokenCategory::Punctuation,
 
-		SyntaxKind::IDENT => TokenCategory::Unclassified,
+		// Lexical fallback for names keeps edit-boundary characters from flashing
+		// white while semantic highlighting catches up asynchronously.
+		SyntaxKind::IDENT => TokenCategory::Variable,
 
 		_ => TokenCategory::Unclassified,
 	}
@@ -126,4 +128,15 @@ pub fn highlight_viewport(viewport: &ViewportTree) -> Vec<(u64, u64, TokenCatego
 	}
 
 	highlights
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{TokenCategory, classify_token};
+	use ra_ap_syntax::SyntaxKind;
+
+	#[test]
+	fn ident_tokens_have_a_lexical_fallback_category() {
+		assert_eq!(classify_token(SyntaxKind::IDENT), TokenCategory::Variable);
+	}
 }

@@ -65,7 +65,7 @@ impl UndoLedger {
 		&mut self,
 		registry: &UastRegistry,
 		root: NodeId,
-	) -> Option<(NodeId, NodeId, u64, u64)> {
+	) -> Option<(NodeId, NodeId, u64, u64, TextDelta)> {
 		let delta = self.undo_stack.pop()?;
 		let bytes = registry.collect_document_bytes(root).ok()?;
 
@@ -83,8 +83,9 @@ impl UndoLedger {
 		let cursor_byte = delta.global_byte_offset + delta.deleted_text.len() as u64;
 
 		self.current_state_id = delta.state_before;
+		let cache_delta = delta.clone();
 		self.redo_stack.push(delta);
-		Some((new_root, new_leaf, cursor_byte, new_size))
+		Some((new_root, new_leaf, cursor_byte, new_size, cache_delta))
 	}
 
 	/// Pop the most recent undone delta, re-apply it forward,
@@ -93,13 +94,14 @@ impl UndoLedger {
 		&mut self,
 		registry: &UastRegistry,
 		root: NodeId,
-	) -> Option<(NodeId, NodeId, u64, u64)> {
+	) -> Option<(NodeId, NodeId, u64, u64, TextDelta)> {
 		let delta = self.redo_stack.pop()?;
 		let bytes = registry.collect_document_bytes(root).ok()?;
 
 		let offset = delta.global_byte_offset as usize;
 		let delete_len = delta.deleted_text.len();
-		let mut new_bytes = Vec::with_capacity(bytes.len() - delete_len + delta.inserted_text.len());
+		let mut new_bytes =
+			Vec::with_capacity(bytes.len() - delete_len + delta.inserted_text.len());
 
 		// Forward: remove deleted_text, insert inserted_text.
 		new_bytes.extend_from_slice(&bytes[..offset]);
@@ -111,8 +113,9 @@ impl UndoLedger {
 		let cursor_byte = delta.global_byte_offset + delta.inserted_text.len() as u64;
 
 		self.current_state_id = delta.state_after;
+		let cache_delta = delta.clone();
 		self.undo_stack.push(delta);
-		Some((new_root, new_leaf, cursor_byte, new_size))
+		Some((new_root, new_leaf, cursor_byte, new_size, cache_delta))
 	}
 }
 

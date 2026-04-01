@@ -40,7 +40,13 @@ impl App {
 		});
 
 		// 2. Spawn Engine Thread
-		let engine = Engine::new(registry.clone(), resolver.clone(), rx_cmd, tx_cmd.clone(), tx_view);
+		let engine = Engine::new(
+			registry.clone(),
+			resolver.clone(),
+			rx_cmd,
+			tx_cmd.clone(),
+			tx_view,
+		);
 		thread::spawn(move || {
 			engine.run();
 		});

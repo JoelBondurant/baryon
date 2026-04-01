@@ -280,7 +280,66 @@ fn document_rewrite_delta(before: &str, after: &str) -> Option<(u64, String, Str
 	))
 }
 
-fn push_document_rewrite_delta(ledger: &mut UndoLedger, before: &[u8], after: &[u8]) {
+fn shift_byte_offset(byte_offset: u64, shift: i64) -> u64 {
+	if shift >= 0 {
+		byte_offset + shift as u64
+	} else {
+		byte_offset - (-shift) as u64
+	}
+}
+
+fn rebase_semantic_highlights_after_delta(
+	semantic_highlights: &mut Vec<(u64, u64, TokenCategory)>,
+	delta: &TextDelta,
+) {
+	if semantic_highlights.is_empty() {
+		return;
+	}
+
+	let edit_start = delta.global_byte_offset;
+	let edit_end_before = edit_start + delta.deleted_text.len() as u64;
+	let shift = delta.inserted_text.len() as i64 - delta.deleted_text.len() as i64;
+
+	semantic_highlights.retain_mut(|(start, end, _)| {
+		if *end <= edit_start {
+			return true;
+		}
+
+		if *start >= edit_end_before {
+			*start = shift_byte_offset(*start, shift);
+			*end = shift_byte_offset(*end, shift);
+			return true;
+		}
+
+		false
+	});
+}
+
+fn push_delta_and_rebase(
+	ledger: &mut UndoLedger,
+	semantic_highlights: &mut Vec<(u64, u64, TokenCategory)>,
+	delta: TextDelta,
+) {
+	rebase_semantic_highlights_after_delta(semantic_highlights, &delta);
+	ledger.push(delta);
+}
+
+fn invert_text_delta(delta: &TextDelta) -> TextDelta {
+	TextDelta {
+		global_byte_offset: delta.global_byte_offset,
+		deleted_text: delta.inserted_text.clone(),
+		inserted_text: delta.deleted_text.clone(),
+		state_before: 0,
+		state_after: 0,
+	}
+}
+
+fn push_document_rewrite_delta(
+	ledger: &mut UndoLedger,
+	semantic_highlights: &mut Vec<(u64, u64, TokenCategory)>,
+	before: &[u8],
+	after: &[u8],
+) {
 	if before == after {
 		return;
 	}
@@ -291,24 +350,32 @@ fn push_document_rewrite_delta(ledger: &mut UndoLedger, before: &[u8], after: &[
 		if let Some((global_byte_offset, deleted_text, inserted_text)) =
 			document_rewrite_delta(before_text, after_text)
 		{
-			ledger.push(TextDelta {
-				global_byte_offset,
-				deleted_text,
-				inserted_text,
-				state_before: 0,
-				state_after: 0,
-			});
+			push_delta_and_rebase(
+				ledger,
+				semantic_highlights,
+				TextDelta {
+					global_byte_offset,
+					deleted_text,
+					inserted_text,
+					state_before: 0,
+					state_after: 0,
+				},
+			);
 		}
 		return;
 	}
 
-	ledger.push(TextDelta {
-		global_byte_offset: 0,
-		deleted_text: String::from_utf8_lossy(before).into_owned(),
-		inserted_text: String::from_utf8_lossy(after).into_owned(),
-		state_before: 0,
-		state_after: 0,
-	});
+	push_delta_and_rebase(
+		ledger,
+		semantic_highlights,
+		TextDelta {
+			global_byte_offset: 0,
+			deleted_text: String::from_utf8_lossy(before).into_owned(),
+			inserted_text: String::from_utf8_lossy(after).into_owned(),
+			state_before: 0,
+			state_after: 0,
+		},
+	);
 }
 
 fn linewise_put_insertion(doc: &[u8], cursor_line: u32, text: &str) -> (usize, String, u32) {
@@ -371,6 +438,8 @@ impl Engine {
 		let mut last_semantic_state: u64 = u64::MAX;
 		let mut last_semantic_len: usize = usize::MAX;
 		let mut last_semantic_path: Option<String> = None;
+		let mut next_semantic_request_id: u64 = 1;
+		let mut pending_semantic_request_id: Option<u64> = None;
 
 		let mut cursor_abs_line: u32 = 0;
 		let mut cursor_abs_col: u32 = 0;
@@ -474,13 +543,17 @@ impl Engine {
 						cursor_node = new_node;
 						cursor_offset = new_offset;
 
-						ledger.push(TextDelta {
-							global_byte_offset: global_offset,
-							deleted_text: String::new(),
-							inserted_text: s.to_string(),
-							state_before: 0,
-							state_after: 0,
-						});
+						push_delta_and_rebase(
+							&mut ledger,
+							&mut semantic_highlights,
+							TextDelta {
+								global_byte_offset: global_offset,
+								deleted_text: String::new(),
+								inserted_text: s.to_string(),
+								state_before: 0,
+								state_after: 0,
+							},
+						);
 						if c == '\n' {
 							cursor_abs_line += 1;
 							cursor_abs_col = 0;
@@ -523,13 +596,17 @@ impl Engine {
 							cursor_offset = new_offset;
 
 							if !deleted_text.is_empty() {
-								ledger.push(TextDelta {
-									global_byte_offset: delete_start,
-									deleted_text: deleted_text.clone(),
-									inserted_text: String::new(),
-									state_before: 0,
-									state_after: 0,
-								});
+								push_delta_and_rebase(
+									&mut ledger,
+									&mut semantic_highlights,
+									TextDelta {
+										global_byte_offset: delete_start,
+										deleted_text: deleted_text.clone(),
+										inserted_text: String::new(),
+										state_before: 0,
+										state_after: 0,
+									},
+								);
 							}
 
 							// Update cursor position after backspace.
@@ -601,6 +678,7 @@ impl Engine {
 						last_semantic_state = u64::MAX;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
+						pending_semantic_request_id = None;
 						needs_render = true;
 					} else {
 						// New file — create empty document
@@ -639,6 +717,7 @@ impl Engine {
 						last_semantic_state = u64::MAX;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
+						pending_semantic_request_id = None;
 						needs_render = true;
 					}
 				}
@@ -851,6 +930,7 @@ impl Engine {
 									} else {
 										push_document_rewrite_delta(
 											&mut ledger,
+											&mut semantic_highlights,
 											&bytes,
 											&new_bytes,
 										);
@@ -980,7 +1060,12 @@ impl Engine {
 									let (_, _, match_len) = search_matches[idx];
 									new_bytes.extend_from_slice(&bytes[byte_off + match_len..]);
 									cs.replacements_done += 1;
-									push_document_rewrite_delta(&mut ledger, &bytes, &new_bytes);
+									push_document_rewrite_delta(
+										&mut ledger,
+										&mut semantic_highlights,
+										&bytes,
+										&new_bytes,
+									);
 
 									let (new_root, _) =
 										create_document_from_bytes(&registry, &new_bytes);
@@ -1110,7 +1195,12 @@ impl Engine {
 									new_bytes.extend_from_slice(&bytes[..byte_off]);
 									new_bytes.extend_from_slice(&replaced);
 									cs.replacements_done += count;
-									push_document_rewrite_delta(&mut ledger, &bytes, &new_bytes);
+									push_document_rewrite_delta(
+										&mut ledger,
+										&mut semantic_highlights,
+										&bytes,
+										&new_bytes,
+									);
 
 									let (new_root, _new_leaf) =
 										create_document_from_bytes(&registry, &new_bytes);
@@ -1216,14 +1306,17 @@ impl Engine {
 									new_bytes.extend_from_slice(inserted_text.as_bytes());
 									new_bytes.extend_from_slice(&bytes[insert_offset..]);
 
-									let delta = TextDelta {
-										global_byte_offset: insert_offset as u64,
-										deleted_text: String::new(),
-										inserted_text,
-										state_before: 0,
-										state_after: 0,
-									};
-									ledger.push(delta);
+									push_delta_and_rebase(
+										&mut ledger,
+										&mut semantic_highlights,
+										TextDelta {
+											global_byte_offset: insert_offset as u64,
+											deleted_text: String::new(),
+											inserted_text,
+											state_before: 0,
+											state_after: 0,
+										},
+									);
 
 									let (new_root, _) =
 										create_document_from_bytes(&registry, &new_bytes);
@@ -1252,9 +1345,13 @@ impl Engine {
 				}
 				EditorCommand::Undo => {
 					if let Some(rid) = root_id {
-						if let Some((new_root, new_leaf, cursor_byte, _)) =
+						if let Some((new_root, new_leaf, cursor_byte, _, delta)) =
 							ledger.undo(&registry, rid)
 						{
+							rebase_semantic_highlights_after_delta(
+								&mut semantic_highlights,
+								&invert_text_delta(&delta),
+							);
 							root_id = Some(new_root);
 							cursor_node = new_leaf;
 							cursor_offset = 0;
@@ -1276,9 +1373,13 @@ impl Engine {
 				}
 				EditorCommand::Redo => {
 					if let Some(rid) = root_id {
-						if let Some((new_root, new_leaf, cursor_byte, _)) =
+						if let Some((new_root, new_leaf, cursor_byte, _, delta)) =
 							ledger.redo(&registry, rid)
 						{
+							rebase_semantic_highlights_after_delta(
+								&mut semantic_highlights,
+								&delta,
+							);
 							root_id = Some(new_root);
 							cursor_node = new_leaf;
 							cursor_offset = 0;
@@ -1374,17 +1475,20 @@ impl Engine {
 										if !live_bytes.is_empty() && live_bytes.len() < 1_048_576 {
 											let text =
 												String::from_utf8_lossy(&live_bytes).into_owned();
+											let request_id = next_semantic_request_id;
+											next_semantic_request_id += 1;
 											reactor.send(
 												text,
 												0,
 												file_path.clone().unwrap_or_default(),
 												ledger.current_state_id,
+												request_id,
 											);
 											// Lock only after a successful, non-empty send.
 											last_semantic_state = ledger.current_state_id;
 											last_semantic_len = live_bytes.len();
 											last_semantic_path = Some(path.clone());
-											semantic_highlights.clear();
+											pending_semantic_request_id = Some(request_id);
 										}
 									}
 								}
@@ -1394,24 +1498,30 @@ impl Engine {
 							last_semantic_state = ledger.current_state_id;
 							last_semantic_len = 0;
 							last_semantic_path = Some(path.clone());
+							pending_semantic_request_id = None;
 						}
 					} else {
 						semantic_highlights.clear();
 						last_semantic_state = u64::MAX;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
+						pending_semantic_request_id = None;
 					}
 				} else {
 					semantic_highlights.clear();
 					last_semantic_state = u64::MAX;
 					last_semantic_len = usize::MAX;
 					last_semantic_path = None;
+					pending_semantic_request_id = None;
 				}
 
 				// Non-blocking poll: grab latest semantic highlights if ready.
-				while let Some((state_id, fresh)) = reactor.try_recv() {
-					if state_id == ledger.current_state_id {
+				while let Some((state_id, request_id, fresh)) = reactor.try_recv() {
+					if Some(request_id) == pending_semantic_request_id
+						&& state_id == ledger.current_state_id
+					{
 						semantic_highlights = fresh;
+						pending_semantic_request_id = None;
 					}
 				}
 
@@ -1491,7 +1601,11 @@ fn merge_highlights(
 
 #[cfg(test)]
 mod tests {
-	use super::{document_rewrite_delta, linewise_put_insertion};
+	use super::{
+		document_rewrite_delta, linewise_put_insertion, rebase_semantic_highlights_after_delta,
+	};
+	use crate::engine::undo::TextDelta;
+	use crate::svp::highlight::TokenCategory;
 
 	#[test]
 	fn rewrite_delta_tracks_changed_middle_span() {
@@ -1518,5 +1632,53 @@ mod tests {
 		assert_eq!(insert_offset, 0);
 		assert_eq!(inserted_text, "beta\n");
 		assert_eq!(target_cursor_line, 0);
+	}
+
+	#[test]
+	fn semantic_cache_rebases_spans_after_backspace() {
+		let mut semantic = vec![
+			(0, 3, TokenCategory::Keyword),
+			(10, 13, TokenCategory::Module),
+		];
+
+		rebase_semantic_highlights_after_delta(
+			&mut semantic,
+			&TextDelta {
+				global_byte_offset: 5,
+				deleted_text: "x".to_string(),
+				inserted_text: String::new(),
+				state_before: 0,
+				state_after: 0,
+			},
+		);
+
+		assert_eq!(
+			semantic,
+			vec![
+				(0, 3, TokenCategory::Keyword),
+				(9, 12, TokenCategory::Module),
+			]
+		);
+	}
+
+	#[test]
+	fn semantic_cache_drops_spans_crossing_the_edit_boundary() {
+		let mut semantic = vec![
+			(4, 7, TokenCategory::Variable),
+			(10, 14, TokenCategory::Type),
+		];
+
+		rebase_semantic_highlights_after_delta(
+			&mut semantic,
+			&TextDelta {
+				global_byte_offset: 5,
+				deleted_text: String::new(),
+				inserted_text: "x".to_string(),
+				state_before: 0,
+				state_after: 0,
+			},
+		);
+
+		assert_eq!(semantic, vec![(11, 15, TokenCategory::Type)]);
 	}
 }
