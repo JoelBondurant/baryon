@@ -5,6 +5,7 @@ use crate::uast::projection::Viewport;
 use crate::ui::Frontend;
 use crossterm::{
 	cursor::SetCursorStyle,
+	event::{DisableMouseCapture, EnableMouseCapture},
 	execute,
 	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -55,7 +56,7 @@ impl App {
 		// 3. Setup Frontend
 		enable_raw_mode()?;
 		let mut stdout = io::stdout();
-		execute!(stdout, EnterAlternateScreen)?;
+		execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 		let backend = CrosstermBackend::new(stdout);
 		let terminal = ratatui::Terminal::new(backend)?;
 
@@ -69,6 +70,7 @@ impl App {
 		execute!(
 			term.backend_mut(),
 			SetCursorStyle::DefaultUserShape,
+			DisableMouseCapture,
 			LeaveAlternateScreen
 		)?;
 		term.show_cursor()?;
