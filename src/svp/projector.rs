@@ -5,6 +5,8 @@ pub struct HighlightProjector {
 	spans: Vec<(u64, u64, TokenCategory)>,
 }
 
+pub const WHITESPACE_COLOR: Color = Color::Rgb(76, 86, 106);
+
 impl HighlightProjector {
 	pub fn new(mut spans: Vec<(u64, u64, TokenCategory)>) -> Self {
 		spans.sort_by_key(|span| span.0);
@@ -41,6 +43,7 @@ impl HighlightProjector {
 			TokenCategory::MutableVariable => Some(Color::Rgb(209, 154, 102)),
 			TokenCategory::Method => Some(Color::Rgb(97, 175, 239)),
 			TokenCategory::Crate => Some(Color::Rgb(86, 182, 194)),
+			TokenCategory::Whitespace => Some(Color::Rgb(76, 86, 106)),
 			TokenCategory::Punctuation => Some(Color::Rgb(171, 178, 191)),
 			TokenCategory::Operator => Some(Color::Rgb(86, 182, 194)),
 			TokenCategory::Unclassified => None,

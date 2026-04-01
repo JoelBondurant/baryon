@@ -266,26 +266,68 @@ impl<B: Backend + io::Write> Frontend<B> {
 							}
 						}
 
-						byte_idx += c.len_utf8();
-						current_global_byte += c.len_utf8() as u64;
+						// Peek ahead to detect trailing spaces (space before \n or end of token).
+						let char_len = c.len_utf8();
+						let is_trailing_space = c == ' ' && {
+							let rest = &text.as_bytes()[byte_idx + char_len..];
+							rest.is_empty() || rest[0] == b'\n'
+						};
+
+						byte_idx += char_len;
+						current_global_byte += char_len as u64;
 
 						if y >= render_height {
 							break;
 						}
+
+						let ws_style = style.fg(crate::svp::projector::WHITESPACE_COLOR);
+
 						if c == '\n' {
+							// EOL marker before advancing the line.
+							if x < max_width as usize {
+								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+									cell.set_char('¬').set_style(ws_style);
+								}
+							}
 							y += 1;
 							x = gutter_width as usize;
 						} else if c == '\t' {
+							// Dynamic tab expansion (tabstop = 4).
 							let tab_size = 4;
-							let spaces = tab_size - (x - gutter_width as usize) % tab_size;
-							for _ in 0..spaces {
+							let col = x - gutter_width as usize;
+							let spaces_to_add = tab_size - (col % tab_size);
+							// First cell: tab start glyph.
+							if x < max_width as usize {
+								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+									cell.set_char('▸').set_style(ws_style);
+								}
+							}
+							x += 1;
+							// Remaining cells: plain spaces.
+							for _ in 1..spaces_to_add {
 								if x < max_width as usize {
 									if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-										cell.set_char(' ').set_style(style);
+										cell.set_char(' ').set_style(ws_style);
 									}
 								}
 								x += 1;
 							}
+						} else if is_trailing_space {
+							// Trailing space marker.
+							if x < max_width as usize {
+								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+									cell.set_char('~').set_style(ws_style);
+								}
+							}
+							x += 1;
+						} else if c == ' ' {
+							// Mid-line space marker.
+							if x < max_width as usize {
+								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+									cell.set_char('␣').set_style(ws_style);
+								}
+							}
+							x += 1;
 						} else {
 							if x < max_width as usize {
 								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {

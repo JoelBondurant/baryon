@@ -23,6 +23,7 @@ pub enum TokenCategory {
 	MutableVariable,
 	Method,
 	Crate,
+	Whitespace,
 	Unclassified,
 }
 
