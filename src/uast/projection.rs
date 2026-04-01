@@ -1,3 +1,4 @@
+use crate::core::TAB_SIZE;
 use crate::ecs::{NodeId, UastRegistry};
 use crate::uast::kind::SemanticKind;
 
@@ -33,7 +34,7 @@ pub struct Viewport {
 
 fn advance_visual_col(col: &mut u32, byte: u8) {
 	if byte == b'\t' {
-		*col += 4 - (*col % 4);
+		*col += TAB_SIZE - (*col % TAB_SIZE);
 	} else {
 		*col += 1;
 	}

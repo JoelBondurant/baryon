@@ -1,3 +1,4 @@
+use crate::core::TAB_SIZE;
 use crate::ecs::{NodeId, UastRegistry};
 use crate::uast::UastProjection;
 
@@ -157,7 +158,7 @@ pub fn line_col_from_byte_offset(doc: &[u8], byte_offset: u64) -> (u32, u32) {
 			line += 1;
 			col = 0;
 		} else if b == b'\t' {
-			col += 4 - (col % 4);
+			col += TAB_SIZE - (col % TAB_SIZE);
 		} else {
 			col += 1;
 		}
@@ -181,7 +182,7 @@ pub fn byte_offset_from_line_col(doc: &[u8], target_line: u32, target_col: u32) 
 			line += 1;
 			col = 0;
 		} else if b == b'\t' {
-			col += 4 - (col % 4);
+			col += TAB_SIZE - (col % TAB_SIZE);
 		} else {
 			col += 1;
 		}

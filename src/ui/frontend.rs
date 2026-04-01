@@ -1,3 +1,4 @@
+use crate::core::TAB_SIZE;
 use crate::engine::{
 	ConfirmAction, EditorCommand, EditorMode, MoveDirection, SubstituteFlags, SubstituteRange,
 };
@@ -310,10 +311,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 							y += 1;
 							x = gutter_width as usize;
 						} else if c == '\t' {
-							// Dynamic tab expansion (tabstop = 4).
-							let tab_size = 4;
+							// Dynamic tab expansion (tabstop = TAB_SIZE).
 							let col = x - gutter_width as usize;
-							let spaces_to_add = tab_size - (col % tab_size);
+							let spaces_to_add = TAB_SIZE as usize - (col % TAB_SIZE as usize);
 							// First cell: tab start glyph.
 							if x < max_width as usize {
 								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {

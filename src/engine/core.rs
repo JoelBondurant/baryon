@@ -1,3 +1,4 @@
+use crate::core::TAB_SIZE;
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::clipboard::ClipboardHandle;
 use crate::engine::undo::{
@@ -107,7 +108,7 @@ fn advance_col(b: u8, line: &mut u32, col: &mut u32) {
 		*line += 1;
 		*col = 0;
 	} else if b == b'\t' {
-		*col += 4 - (*col % 4);
+		*col += TAB_SIZE - (*col % TAB_SIZE);
 	} else {
 		*col += 1;
 	}
