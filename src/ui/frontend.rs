@@ -181,8 +181,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 			let max_height = buf.area.height;
 
 			if let Some(view) = current_viewport {
-				let scroll_y = view.cursor_abs_pos.0.saturating_sub(20);
-				let max_line_on_screen = scroll_y + max_height.saturating_sub(1) as u32;
+				let scroll_y = view.cursor_abs_pos.line.saturating_sub(20);
+				let max_line_on_screen = scroll_y.get() + max_height.saturating_sub(1) as u32;
 
 				let digits = max_line_on_screen.max(1).ilog10() + 1;
 				let gutter_width: u16 = digits as u16 + 1;
@@ -197,7 +197,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 							cell.set_char(' ').set_style(gutter_style);
 						}
 					}
-					let line_num = scroll_y + gy as u32 + 1;
+					let line_num = scroll_y.get() + gy as u32 + 1;
 					if line_num <= view.total_lines + 1 {
 						let line_str = line_num.to_string();
 						if line_str.len() < gutter_width as usize {
@@ -220,7 +220,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 				let projector =
 					crate::svp::projector::HighlightProjector::new(view.highlights.clone());
-				let mut current_global_byte: u64 = view.global_start_byte;
+				let mut current_global_byte = view.global_start_byte;
 
 				for token in &view.tokens {
 					let base_style = match token.kind {
@@ -292,7 +292,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 						};
 
 						byte_idx += char_len;
-						current_global_byte += char_len as u64;
+						current_global_byte = current_global_byte.saturating_add(char_len as u64);
 
 						if y >= render_height {
 							break;
@@ -360,8 +360,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 
 				// --- HARDWARE CURSOR ---
-				let visual_cursor_y = view.cursor_abs_pos.0.saturating_sub(scroll_y) as u16;
-				let visual_cursor_x = (view.cursor_abs_pos.1 as u16)
+				let visual_cursor_y = view
+					.cursor_abs_pos
+					.line
+					.saturating_sub(scroll_y.get())
+					.get() as u16;
+				let visual_cursor_x = (view.cursor_abs_pos.col.get() as u16)
 					.checked_add(gutter_width)
 					.unwrap_or(max_width);
 				if visual_cursor_y < max_height - 1 && visual_cursor_x < max_width {
@@ -521,7 +525,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 				// Right-aligned segments: [search] | filesize | encoding | line:col
 				let (cursor_line, cursor_col) = current_viewport
 					.as_ref()
-					.map(|v| (v.cursor_abs_pos.0 + 1, v.cursor_abs_pos.1 + 1))
+					.map(|v| {
+						(
+							v.cursor_abs_pos.line.get() + 1,
+							v.cursor_abs_pos.col.get() + 1,
+						)
+					})
 					.unwrap_or((1, 1));
 
 				let search_info = current_viewport
@@ -773,7 +782,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let cursor_line = self
 						.current_viewport
 						.as_ref()
-						.map(|v| v.cursor_abs_pos.0)
+						.map(|v| v.cursor_abs_pos.line.get())
 						.unwrap_or(0);
 					if let Some((pattern, replacement, flags, range)) =
 						parse_substitute(&self.command_buffer, cursor_line)
@@ -960,8 +969,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 					None => return,
 				};
 
-				let scroll_y = view.cursor_abs_pos.0.saturating_sub(20);
-				let max_line = scroll_y + view.total_lines;
+				let scroll_y = view.cursor_abs_pos.line.saturating_sub(20);
+				let max_line = scroll_y.get() + view.total_lines;
 				let digits = max_line.max(1).ilog10() + 1;
 				let gutter_width = digits as u16 + 1;
 
@@ -973,7 +982,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 					return;
 				}
 
-				let abs_line = scroll_y + click_y as u32;
+				let abs_line = scroll_y.get() + click_y as u32;
 				let target_visual_col = u32::from(click_x - gutter_width);
 
 				let _ = self

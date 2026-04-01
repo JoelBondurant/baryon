@@ -14,21 +14,35 @@ use ra_ap_syntax::Edition;
 use ra_ap_vfs::{FileId, Vfs, VfsPath, file_set::FileSet};
 use rustc_hash::FxHashMap;
 
-use crate::svp::highlight::TokenCategory;
+use crate::core::DocByte;
+use crate::svp::highlight::{HighlightSpan, TokenCategory};
 
-/// Payload: (file_text, global_byte_offset, absolute_file_path, state_id, request_id).
-type SemanticPayload = (String, u64, String, u64, u64);
+#[derive(Debug)]
+pub struct SemanticRequest {
+	pub content: String,
+	pub global_offset: DocByte,
+	pub file_path: String,
+	pub state_id: u64,
+	pub request_id: u64,
+}
+
+#[derive(Debug)]
+pub struct SemanticResponse {
+	pub state_id: u64,
+	pub request_id: u64,
+	pub highlights: Vec<HighlightSpan>,
+}
 
 pub struct SemanticReactor {
-	tx_in: mpsc::Sender<SemanticPayload>,
-	rx_out: mpsc::Receiver<(u64, u64, Vec<(u64, u64, TokenCategory)>)>,
+	tx_in: mpsc::Sender<SemanticRequest>,
+	rx_out: mpsc::Receiver<SemanticResponse>,
 	_handle: thread::JoinHandle<()>,
 }
 
 impl SemanticReactor {
 	pub fn new(tx_cmd: mpsc::Sender<crate::engine::EditorCommand>) -> Self {
-		let (tx_in, rx_worker) = mpsc::channel::<SemanticPayload>();
-		let (tx_worker, rx_out) = mpsc::channel::<(u64, u64, Vec<(u64, u64, TokenCategory)>)>();
+		let (tx_in, rx_worker) = mpsc::channel::<SemanticRequest>();
+		let (tx_worker, rx_out) = mpsc::channel::<SemanticResponse>();
 
 		let handle = thread::Builder::new()
 			.name("semantic-reactor".into())
@@ -45,27 +59,18 @@ impl SemanticReactor {
 	}
 
 	/// Push new file content to the reactor. Non-blocking.
-	pub fn send(
-		&self,
-		content: String,
-		global_offset: u64,
-		file_path: String,
-		state_id: u64,
-		request_id: u64,
-	) {
-		let _ = self
-			.tx_in
-			.send((content, global_offset, file_path, state_id, request_id));
+	pub fn send(&self, request: SemanticRequest) {
+		let _ = self.tx_in.send(request);
 	}
 
 	/// Try to receive semantic highlights. Non-blocking.
-	pub fn try_recv(&self) -> Option<(u64, u64, Vec<(u64, u64, TokenCategory)>)> {
+	pub fn try_recv(&self) -> Option<SemanticResponse> {
 		self.rx_out.try_recv().ok()
 	}
 
 	fn run_event_loop(
-		rx: mpsc::Receiver<SemanticPayload>,
-		tx: mpsc::Sender<(u64, u64, Vec<(u64, u64, TokenCategory)>)>,
+		rx: mpsc::Receiver<SemanticRequest>,
+		tx: mpsc::Sender<SemanticResponse>,
 		tx_cmd: mpsc::Sender<crate::engine::EditorCommand>,
 	) {
 		let mut host: Option<AnalysisHost> = None;
@@ -74,25 +79,25 @@ impl SemanticReactor {
 
 		while let Ok(first) = rx.recv() {
 			// Drain: collapse all pending messages, keep only the freshest.
-			let (mut text, mut global_offset, mut file_path, mut state_id, mut request_id) = first;
+			let mut request = first;
 			while let Ok(newer) = rx.try_recv() {
-				(text, global_offset, file_path, state_id, request_id) = newer;
+				request = newer;
 			}
 
 			// (Re-)initialize when file changes or on first message.
-			if host.is_none() || file_path != current_file_path {
-				let (h, fid) =
-					init_workspace(&file_path).unwrap_or_else(|| init_single_file(&text));
+			if host.is_none() || request.file_path != current_file_path {
+				let (h, fid) = init_workspace(&request.file_path)
+					.unwrap_or_else(|| init_single_file(&request.content));
 				host = Some(h);
 				active_file_id = fid;
-				current_file_path = file_path;
+				current_file_path = request.file_path.clone();
 			}
 
 			let h = host.as_mut().unwrap();
 
 			// Apply the latest editor text.
 			let mut change = ChangeWithProcMacros::default();
-			change.change_file(active_file_id, Some(text));
+			change.change_file(active_file_id, Some(request.content.clone()));
 			h.apply_change(change);
 
 			let analysis = h.analysis();
@@ -119,12 +124,20 @@ impl SemanticReactor {
 							if cat == TokenCategory::Unclassified {
 								return None;
 							}
-							let start = global_offset + u64::from(u32::from(hl.range.start()));
-							let end = global_offset + u64::from(u32::from(hl.range.end()));
-							Some((start, end, cat))
+							let start = request
+								.global_offset
+								.saturating_add(u64::from(u32::from(hl.range.start())));
+							let end = request
+								.global_offset
+								.saturating_add(u64::from(u32::from(hl.range.end())));
+							Some(HighlightSpan::new(start, end, cat))
 						})
 						.collect();
-					let _ = tx.send((state_id, request_id, mapped));
+					let _ = tx.send(SemanticResponse {
+						state_id: request.state_id,
+						request_id: request.request_id,
+						highlights: mapped,
+					});
 					let _ = tx_cmd.send(crate::engine::EditorCommand::InternalRefresh);
 				}
 				Err(_cancelled) => {

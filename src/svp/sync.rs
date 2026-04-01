@@ -1,7 +1,8 @@
+use crate::core::DocByte;
 use memchr::memmem;
 
 pub struct ViewportChunk {
-	pub global_offset: u64,
+	pub global_offset: DocByte,
 	pub buffer: Vec<u8>,
 }
 

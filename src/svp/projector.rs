@@ -1,24 +1,25 @@
-use crate::svp::highlight::TokenCategory;
+use crate::core::DocByte;
+use crate::svp::highlight::{HighlightSpan, TokenCategory};
 use ratatui::style::Color;
 
 pub struct HighlightProjector {
-	spans: Vec<(u64, u64, TokenCategory)>,
+	spans: Vec<HighlightSpan>,
 }
 
 pub const WHITESPACE_COLOR: Color = Color::Rgb(76, 86, 106);
 
 impl HighlightProjector {
-	pub fn new(mut spans: Vec<(u64, u64, TokenCategory)>) -> Self {
-		spans.sort_by_key(|span| span.0);
+	pub fn new(mut spans: Vec<HighlightSpan>) -> Self {
+		spans.sort_by_key(|span| span.start);
 		Self { spans }
 	}
 
-	pub fn style_for_byte(&self, byte_offset: u64) -> Option<Color> {
-		let idx = self.spans.partition_point(|span| span.0 <= byte_offset);
+	pub fn style_for_byte(&self, byte_offset: DocByte) -> Option<Color> {
+		let idx = self.spans.partition_point(|span| span.start <= byte_offset);
 		if idx > 0 {
 			let span = &self.spans[idx - 1];
-			if byte_offset < span.1 {
-				return Self::color_for_category(span.2);
+			if byte_offset < span.end {
+				return Self::color_for_category(span.category);
 			}
 		}
 		None

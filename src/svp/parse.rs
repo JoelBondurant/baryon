@@ -1,8 +1,9 @@
+use crate::core::DocByte;
 use crate::svp::sync::ViewportChunk;
 use ra_ap_syntax::{AstNode, SourceFile, SyntaxNode, TextRange};
 
 pub struct ViewportTree {
-	pub global_chunk_offset: u64,
+	pub global_chunk_offset: DocByte,
 	pub fragment_start: usize,
 	pub tree: SyntaxNode,
 }
@@ -24,12 +25,18 @@ pub fn parse_fragment(chunk: &ViewportChunk, bounds: (usize, usize)) -> Viewport
 }
 
 impl ViewportTree {
-	pub fn local_to_global(&self, local_range: TextRange) -> (u64, u64) {
+	pub fn local_to_global(&self, local_range: TextRange) -> (DocByte, DocByte) {
 		let start: u32 = local_range.start().into();
 		let end: u32 = local_range.end().into();
 
-		let global_start = self.global_chunk_offset + self.fragment_start as u64 + start as u64;
-		let global_end = self.global_chunk_offset + self.fragment_start as u64 + end as u64;
+		let global_start = self
+			.global_chunk_offset
+			.saturating_add(self.fragment_start as u64)
+			.saturating_add(start as u64);
+		let global_end = self
+			.global_chunk_offset
+			.saturating_add(self.fragment_start as u64)
+			.saturating_add(end as u64);
 
 		(global_start, global_end)
 	}

@@ -1,13 +1,13 @@
-use crate::core::TAB_SIZE;
+use crate::core::{CursorPosition, DocByte, DocLine, TAB_SIZE, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::clipboard::ClipboardHandle;
 use crate::engine::undo::{
 	TextDelta, UndoLedger, byte_offset_from_line_col, line_col_from_byte_offset,
 };
-use crate::svp::highlight::TokenCategory;
-use crate::svp::semantic::SemanticReactor;
+use crate::svp::highlight::HighlightSpan;
+use crate::svp::semantic::{SemanticReactor, SemanticRequest};
 use crate::svp::{RequestPriority, SvpResolver, ingest_svp_file};
-use crate::uast::{UastMutation, UastProjection, Viewport};
+use crate::uast::{NodeCursorTarget, UastMutation, UastProjection, Viewport};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 use std::collections::HashMap;
@@ -103,12 +103,12 @@ struct ConfirmState {
 	range: SubstituteRange,
 }
 
-fn advance_col(b: u8, line: &mut u32, col: &mut u32) {
+fn advance_col(b: u8, line: &mut DocLine, col: &mut VisualCol) {
 	if b == b'\n' {
 		*line += 1;
-		*col = 0;
+		*col = VisualCol::ZERO;
 	} else if b == b'\t' {
-		*col += TAB_SIZE - (*col % TAB_SIZE);
+		*col += TAB_SIZE - (col.get() % TAB_SIZE);
 	} else {
 		*col += 1;
 	}
@@ -140,11 +140,13 @@ fn line_byte_range(doc: &[u8], start_line: u32, end_line: u32) -> (usize, usize)
 fn resolve_byte_range(
 	range: &SubstituteRange,
 	doc: &[u8],
-	cursor_line: u32,
+	cursor_line: DocLine,
 ) -> Option<(usize, usize)> {
 	match range {
 		SubstituteRange::WholeFile => None,
-		SubstituteRange::CurrentLine => Some(line_byte_range(doc, cursor_line, cursor_line)),
+		SubstituteRange::CurrentLine => {
+			Some(line_byte_range(doc, cursor_line.get(), cursor_line.get()))
+		}
 		SubstituteRange::SingleLine(n) => Some(line_byte_range(doc, *n, *n)),
 		SubstituteRange::LineRange(a, b) => Some(line_byte_range(doc, *a, *b)),
 	}
@@ -158,10 +160,10 @@ fn build_regex(pattern: &str, case_insensitive: bool) -> Result<Regex, String> {
 }
 
 /// Returns Vec of (line, col, match_byte_len) for each match.
-fn find_all_matches(doc_bytes: &[u8], re: &Regex) -> Vec<(u32, u32, usize)> {
+fn find_all_matches(doc_bytes: &[u8], re: &Regex) -> Vec<(DocLine, VisualCol, usize)> {
 	let mut matches = Vec::new();
-	let mut line = 0u32;
-	let mut col = 0u32;
+	let mut line = DocLine::ZERO;
+	let mut col = VisualCol::ZERO;
 	let mut prev_pos = 0usize;
 
 	for m in re.find_iter(doc_bytes) {
@@ -280,16 +282,16 @@ fn document_rewrite_delta(before: &str, after: &str) -> Option<(u64, String, Str
 	))
 }
 
-fn shift_byte_offset(byte_offset: u64, shift: i64) -> u64 {
+fn shift_byte_offset(byte_offset: DocByte, shift: i64) -> DocByte {
 	if shift >= 0 {
-		byte_offset + shift as u64
+		byte_offset.saturating_add(shift as u64)
 	} else {
-		byte_offset - (-shift) as u64
+		byte_offset.saturating_sub((-shift) as u64)
 	}
 }
 
 fn rebase_semantic_highlights_after_delta(
-	semantic_highlights: &mut Vec<(u64, u64, TokenCategory)>,
+	semantic_highlights: &mut Vec<HighlightSpan>,
 	delta: &TextDelta,
 ) {
 	if semantic_highlights.is_empty() {
@@ -297,17 +299,17 @@ fn rebase_semantic_highlights_after_delta(
 	}
 
 	let edit_start = delta.global_byte_offset;
-	let edit_end_before = edit_start + delta.deleted_text.len() as u64;
+	let edit_end_before = edit_start.saturating_add(delta.deleted_text.len() as u64);
 	let shift = delta.inserted_text.len() as i64 - delta.deleted_text.len() as i64;
 
-	semantic_highlights.retain_mut(|(start, end, _)| {
-		if *end <= edit_start {
+	semantic_highlights.retain_mut(|span| {
+		if span.end <= edit_start {
 			return true;
 		}
 
-		if *start >= edit_end_before {
-			*start = shift_byte_offset(*start, shift);
-			*end = shift_byte_offset(*end, shift);
+		if span.start >= edit_end_before {
+			span.start = shift_byte_offset(span.start, shift);
+			span.end = shift_byte_offset(span.end, shift);
 			return true;
 		}
 
@@ -317,7 +319,7 @@ fn rebase_semantic_highlights_after_delta(
 
 fn push_delta_and_rebase(
 	ledger: &mut UndoLedger,
-	semantic_highlights: &mut Vec<(u64, u64, TokenCategory)>,
+	semantic_highlights: &mut Vec<HighlightSpan>,
 	delta: TextDelta,
 ) {
 	rebase_semantic_highlights_after_delta(semantic_highlights, &delta);
@@ -336,7 +338,7 @@ fn invert_text_delta(delta: &TextDelta) -> TextDelta {
 
 fn push_document_rewrite_delta(
 	ledger: &mut UndoLedger,
-	semantic_highlights: &mut Vec<(u64, u64, TokenCategory)>,
+	semantic_highlights: &mut Vec<HighlightSpan>,
 	before: &[u8],
 	after: &[u8],
 ) {
@@ -354,7 +356,7 @@ fn push_document_rewrite_delta(
 				ledger,
 				semantic_highlights,
 				TextDelta {
-					global_byte_offset,
+					global_byte_offset: DocByte::new(global_byte_offset),
 					deleted_text,
 					inserted_text,
 					state_before: 0,
@@ -369,7 +371,7 @@ fn push_document_rewrite_delta(
 		ledger,
 		semantic_highlights,
 		TextDelta {
-			global_byte_offset: 0,
+			global_byte_offset: DocByte::ZERO,
 			deleted_text: String::from_utf8_lossy(before).into_owned(),
 			inserted_text: String::from_utf8_lossy(after).into_owned(),
 			state_before: 0,
@@ -378,9 +380,13 @@ fn push_document_rewrite_delta(
 	);
 }
 
-fn linewise_put_insertion(doc: &[u8], cursor_line: u32, text: &str) -> (usize, String, u32) {
-	let global_offset = byte_offset_from_line_col(doc, cursor_line, 0);
-	let off = global_offset as usize;
+fn linewise_put_insertion(
+	doc: &[u8],
+	cursor_line: DocLine,
+	text: &str,
+) -> (usize, String, DocLine) {
+	let global_offset = byte_offset_from_line_col(doc, cursor_line, VisualCol::ZERO);
+	let off = global_offset.get() as usize;
 	let line_end = doc[off..]
 		.iter()
 		.position(|&b| b == b'\n')
@@ -394,9 +400,24 @@ fn linewise_put_insertion(doc: &[u8], cursor_line: u32, text: &str) -> (usize, S
 	}
 	inserted_text.push_str(text);
 
-	let target_cursor_line = if doc.is_empty() { 0 } else { cursor_line + 1 };
+	let target_cursor_line = if doc.is_empty() {
+		DocLine::ZERO
+	} else {
+		cursor_line + 1
+	};
 
 	(line_end, inserted_text, target_cursor_line)
+}
+
+fn apply_cursor_target(
+	target: NodeCursorTarget,
+	cursor_node: &mut NodeId,
+	cursor_offset: &mut u32,
+	cursor_abs_col: &mut VisualCol,
+) {
+	*cursor_node = target.node_id;
+	*cursor_offset = target.node_byte.get();
+	*cursor_abs_col = target.visual_col;
 }
 
 pub struct Engine {
@@ -434,15 +455,15 @@ impl Engine {
 		let tx_cmd = self.tx_cmd;
 		let tx_view = self.tx_view;
 		let reactor = self.reactor;
-		let mut semantic_highlights: Vec<(u64, u64, TokenCategory)> = Vec::new();
+		let mut semantic_highlights: Vec<HighlightSpan> = Vec::new();
 		let mut last_semantic_state: u64 = u64::MAX;
 		let mut last_semantic_len: usize = usize::MAX;
 		let mut last_semantic_path: Option<String> = None;
 		let mut next_semantic_request_id: u64 = 1;
 		let mut pending_semantic_request_id: Option<u64> = None;
 
-		let mut cursor_abs_line: u32 = 0;
-		let mut cursor_abs_col: u32 = 0;
+		let mut cursor_abs_line = DocLine::ZERO;
+		let mut cursor_abs_col = VisualCol::ZERO;
 		let viewport_lines = 50;
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
@@ -454,7 +475,7 @@ impl Engine {
 		// Search state
 		let mut search_pattern: Option<String> = None;
 		let mut search_case_insensitive = false;
-		let mut search_matches: Vec<(u32, u32, usize)> = Vec::new(); // (line, col, match_byte_len)
+		let mut search_matches: Vec<(DocLine, VisualCol, usize)> = Vec::new();
 		let mut search_match_index: Option<usize> = None;
 		let mut search_match_info: Option<String> = None;
 
@@ -471,7 +492,7 @@ impl Engine {
 		let mut clipboard = ClipboardHandle::new();
 
 		// Yank flash: absolute byte range that should be gold-highlighted
-		let mut yank_flash: Option<(u64, u64)> = None;
+		let mut yank_flash: Option<(DocByte, DocByte)> = None;
 
 		let mut cursor_node = NodeId(std::num::NonZeroU32::new(1).unwrap());
 		let mut cursor_offset = 0;
@@ -488,7 +509,7 @@ impl Engine {
 							}
 							MoveDirection::Down => {
 								let total = registry.get_total_newlines(rid);
-								if cursor_abs_line < total {
+								if cursor_abs_line.get() < total {
 									cursor_abs_line += 1;
 								}
 							}
@@ -497,32 +518,38 @@ impl Engine {
 							}
 							MoveDirection::Right => cursor_abs_col += 1,
 							MoveDirection::Top => {
-								cursor_abs_line = 0;
-								cursor_abs_col = 0;
+								cursor_abs_line = DocLine::ZERO;
+								cursor_abs_col = VisualCol::ZERO;
 							}
 							MoveDirection::Bottom => {
-								cursor_abs_line = registry.get_total_newlines(rid);
-								cursor_abs_col = 0;
+								cursor_abs_line = DocLine::new(registry.get_total_newlines(rid));
+								cursor_abs_col = VisualCol::ZERO;
 							}
 						}
-						let (node, offset, clamped_col) =
+						let target =
 							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						cursor_node = node;
-						cursor_offset = offset;
-						cursor_abs_col = clamped_col;
+						apply_cursor_target(
+							target,
+							&mut cursor_node,
+							&mut cursor_offset,
+							&mut cursor_abs_col,
+						);
 						needs_render = true;
 					}
 				}
 				EditorCommand::GotoLine(target) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						cursor_abs_line = target.min(total);
-						cursor_abs_col = 0;
-						let (node, offset, clamped_col) =
+						cursor_abs_line = DocLine::new(target.min(total));
+						cursor_abs_col = VisualCol::ZERO;
+						let target =
 							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						cursor_node = node;
-						cursor_offset = offset;
-						cursor_abs_col = clamped_col;
+						apply_cursor_target(
+							target,
+							&mut cursor_node,
+							&mut cursor_offset,
+							&mut cursor_abs_col,
+						);
 						needs_render = true;
 					}
 				}
@@ -533,7 +560,7 @@ impl Engine {
 						{
 							byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col)
 						} else {
-							0
+							DocByte::ZERO
 						};
 
 						let mut buf = [0; 4];
@@ -556,7 +583,7 @@ impl Engine {
 						);
 						if c == '\n' {
 							cursor_abs_line += 1;
-							cursor_abs_col = 0;
+							cursor_abs_col = VisualCol::ZERO;
 						} else {
 							cursor_abs_col += 1;
 						}
@@ -570,24 +597,24 @@ impl Engine {
 						{
 							byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col)
 						} else {
-							0
+							DocByte::ZERO
 						};
 
-						if global_offset > 0 {
+						if global_offset > DocByte::ZERO {
 							// Extract the character about to be deleted.
 							let (deleted_text, delete_start) =
 								if let Ok(bytes) = registry.collect_document_bytes(rid) {
-									let off = global_offset as usize;
+									let off = global_offset.get() as usize;
 									let mut start = off - 1;
 									while start > 0 && (bytes[start] & 0xC0) == 0x80 {
 										start -= 1;
 									}
 									(
 										String::from_utf8_lossy(&bytes[start..off]).into_owned(),
-										start as u64,
+										DocByte::new(start as u64),
 									)
 								} else {
-									(String::new(), global_offset - 1)
+									(String::new(), global_offset.saturating_sub(1))
 								};
 
 							let (new_node, new_offset) =
@@ -611,7 +638,7 @@ impl Engine {
 
 							// Update cursor position after backspace.
 							if deleted_text == "\n" {
-								if cursor_abs_line > 0 {
+								if cursor_abs_line > DocLine::ZERO {
 									cursor_abs_line -= 1;
 									// Recompute col: walk to the new byte offset.
 									if let Ok(bytes) =
@@ -632,28 +659,34 @@ impl Engine {
 				EditorCommand::Scroll(delta) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						let new_line = (cursor_abs_line as i64 + delta as i64)
+						let new_line = (cursor_abs_line.get() as i64 + delta as i64)
 							.max(0)
 							.min(total as i64) as u32;
-						cursor_abs_line = new_line;
-						let (node, offset, clamped_col) =
+						cursor_abs_line = DocLine::new(new_line);
+						let target =
 							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						cursor_node = node;
-						cursor_offset = offset;
-						cursor_abs_col = clamped_col;
+						apply_cursor_target(
+							target,
+							&mut cursor_node,
+							&mut cursor_offset,
+							&mut cursor_abs_col,
+						);
 					}
 					needs_render = true;
 				}
 				EditorCommand::ClickCursor(line, col) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						cursor_abs_line = line.min(total);
-						cursor_abs_col = col;
-						let (node, offset, clamped_col) =
+						cursor_abs_line = DocLine::new(line.min(total));
+						cursor_abs_col = VisualCol::new(col);
+						let target =
 							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						cursor_node = node;
-						cursor_offset = offset;
-						cursor_abs_col = clamped_col;
+						apply_cursor_target(
+							target,
+							&mut cursor_node,
+							&mut cursor_offset,
+							&mut cursor_abs_col,
+						);
 					}
 					needs_render = true;
 				}
@@ -671,8 +704,8 @@ impl Engine {
 							.get_first_child(rid)
 							.expect("Failed to load new file root");
 						cursor_offset = 0;
-						cursor_abs_line = 0;
-						cursor_abs_col = 0;
+						cursor_abs_line = DocLine::ZERO;
+						cursor_abs_col = VisualCol::ZERO;
 						ledger.clear();
 						semantic_highlights.clear();
 						last_semantic_state = u64::MAX;
@@ -710,8 +743,8 @@ impl Engine {
 						root_id = Some(rid);
 						cursor_node = leaf;
 						cursor_offset = 0;
-						cursor_abs_line = 0;
-						cursor_abs_col = 0;
+						cursor_abs_line = DocLine::ZERO;
+						cursor_abs_col = VisualCol::ZERO;
 						ledger.clear();
 						semantic_highlights.clear();
 						last_semantic_state = u64::MAX;
@@ -823,10 +856,13 @@ impl Engine {
 										search_match_index = Some(idx);
 										let (ml, mc, _) = matches[idx];
 										cursor_abs_line = ml;
-										let (node, offset, _) =
-											registry.find_node_at_line_col(rid, ml, mc);
-										cursor_node = node;
-										cursor_offset = offset;
+										let target = registry.find_node_at_line_col(rid, ml, mc);
+										apply_cursor_target(
+											target,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_col,
+										);
 										cursor_abs_col = mc;
 										search_pattern = Some(pattern);
 										search_case_insensitive = false;
@@ -866,9 +902,13 @@ impl Engine {
 							search_match_index = Some(idx);
 							let (ml, mc, _) = search_matches[idx];
 							cursor_abs_line = ml;
-							let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
-							cursor_node = node;
-							cursor_offset = offset;
+							let target = registry.find_node_at_line_col(rid, ml, mc);
+							apply_cursor_target(
+								target,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_col,
+							);
 							cursor_abs_col = mc;
 							let info = format!("[{}/{}]", idx + 1, search_matches.len());
 							search_match_info = Some(if wrapped {
@@ -893,9 +933,13 @@ impl Engine {
 							search_match_index = Some(idx);
 							let (ml, mc, _) = search_matches[idx];
 							cursor_abs_line = ml;
-							let (node, offset, _) = registry.find_node_at_line_col(rid, ml, mc);
-							cursor_node = node;
-							cursor_offset = offset;
+							let target = registry.find_node_at_line_col(rid, ml, mc);
+							apply_cursor_target(
+								target,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_col,
+							);
 							cursor_abs_col = mc;
 							let info = format!("[{}/{}]", idx + 1, search_matches.len());
 							search_match_info = Some(if wrapped {
@@ -937,14 +981,21 @@ impl Engine {
 										let (new_root, _) =
 											create_document_from_bytes(&registry, &new_bytes);
 										root_id = Some(new_root);
-										cursor_abs_line = cursor_abs_line
-											.min(new_bytes.iter().filter(|&&b| b == b'\n').count()
-												as u32);
-										let (node, offset, clamped_col) = registry
-											.find_node_at_line_col(new_root, cursor_abs_line, 0);
-										cursor_node = node;
-										cursor_offset = offset;
-										cursor_abs_col = clamped_col;
+										cursor_abs_line = DocLine::new(cursor_abs_line.get().min(
+											new_bytes.iter().filter(|&&b| b == b'\n').count()
+												as u32,
+										));
+										let target = registry.find_node_at_line_col(
+											new_root,
+											cursor_abs_line,
+											VisualCol::ZERO,
+										);
+										apply_cursor_target(
+											target,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_col,
+										);
 
 										search_matches.clear();
 										search_match_index = None;
@@ -974,7 +1025,7 @@ impl Engine {
 							Ok(re) => match registry.collect_document_bytes(rid) {
 								Ok(bytes) => {
 									let all_matches = find_all_matches(&bytes, &re);
-									let matches: Vec<(u32, u32, usize)> = match &range {
+									let matches: Vec<(DocLine, VisualCol, usize)> = match &range {
 										SubstituteRange::WholeFile => all_matches,
 										SubstituteRange::CurrentLine => all_matches
 											.into_iter()
@@ -984,14 +1035,16 @@ impl Engine {
 											let n = *n;
 											all_matches
 												.into_iter()
-												.filter(move |&(l, _, _)| l == n)
+												.filter(move |&(l, _, _)| l.get() == n)
 												.collect()
 										}
 										SubstituteRange::LineRange(a, b) => {
 											let (a, b) = (*a, *b);
 											all_matches
 												.into_iter()
-												.filter(move |&(l, _, _)| l >= a && l <= b)
+												.filter(move |&(l, _, _)| {
+													l.get() >= a && l.get() <= b
+												})
 												.collect()
 										}
 									};
@@ -1012,10 +1065,13 @@ impl Engine {
 										});
 										let (ml, mc, _) = search_matches[0];
 										cursor_abs_line = ml;
-										let (node, offset, _) =
-											registry.find_node_at_line_col(rid, ml, mc);
-										cursor_node = node;
-										cursor_offset = offset;
+										let target = registry.find_node_at_line_col(rid, ml, mc);
+										apply_cursor_target(
+											target,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_col,
+										);
 										cursor_abs_col = mc;
 										mode_override = Some(EditorMode::Confirm);
 										status_message =
@@ -1044,8 +1100,8 @@ impl Engine {
 									let (ml, mc, _) = search_matches[idx];
 									// Find byte offset of this match (mc is visual column)
 									let mut byte_off = 0usize;
-									let mut line = 0u32;
-									let mut col = 0u32;
+									let mut line = DocLine::ZERO;
+									let mut col = VisualCol::ZERO;
 									for &b in bytes.iter() {
 										if line == ml && col == mc {
 											break;
@@ -1075,27 +1131,30 @@ impl Engine {
 									// Re-scan for remaining matches after replacement point, filtered by range
 									let re = build_regex(&pat, cs.flags.case_insensitive).unwrap();
 									let all_new = find_all_matches(&new_bytes, &re);
-									let new_matches: Vec<(u32, u32, usize)> = match &cs.range {
-										SubstituteRange::WholeFile => all_new,
-										SubstituteRange::CurrentLine => all_new
-											.into_iter()
-											.filter(|&(l, _, _)| l == ml)
-											.collect(),
-										SubstituteRange::SingleLine(n) => {
-											let n = *n;
-											all_new
+									let new_matches: Vec<(DocLine, VisualCol, usize)> =
+										match &cs.range {
+											SubstituteRange::WholeFile => all_new,
+											SubstituteRange::CurrentLine => all_new
 												.into_iter()
-												.filter(move |&(l, _, _)| l == n)
-												.collect()
-										}
-										SubstituteRange::LineRange(a, b) => {
-											let (a, b) = (*a, *b);
-											all_new
-												.into_iter()
-												.filter(move |&(l, _, _)| l >= a && l <= b)
-												.collect()
-										}
-									};
+												.filter(|&(l, _, _)| l == ml)
+												.collect(),
+											SubstituteRange::SingleLine(n) => {
+												let n = *n;
+												all_new
+													.into_iter()
+													.filter(move |&(l, _, _)| l.get() == n)
+													.collect()
+											}
+											SubstituteRange::LineRange(a, b) => {
+												let (a, b) = (*a, *b);
+												all_new
+													.into_iter()
+													.filter(move |&(l, _, _)| {
+														l.get() >= a && l.get() <= b
+													})
+													.collect()
+											}
+										};
 									// Find next match at or after the replacement point
 									let rep_end_line;
 									let rep_end_col;
@@ -1118,10 +1177,14 @@ impl Engine {
 										search_match_index = Some(ni);
 										let (ml2, mc2, _) = search_matches[ni];
 										cursor_abs_line = ml2;
-										let (node, offset, _) =
+										let target =
 											registry.find_node_at_line_col(new_rid, ml2, mc2);
-										cursor_node = node;
-										cursor_offset = offset;
+										apply_cursor_target(
+											target,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_col,
+										);
 										cursor_abs_col = mc2;
 										status_message = Some(format!(
 											"Replace? [y/n/a/q] ({}/{})",
@@ -1135,13 +1198,17 @@ impl Engine {
 										));
 										mode_override = Some(EditorMode::Normal);
 										confirm_state = None;
-										let (node, offset, _) = registry.find_node_at_line_col(
+										let target = registry.find_node_at_line_col(
 											new_rid,
 											cursor_abs_line,
 											cursor_abs_col,
 										);
-										cursor_node = node;
-										cursor_offset = offset;
+										apply_cursor_target(
+											target,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_col,
+										);
 									}
 								}
 							}
@@ -1151,10 +1218,13 @@ impl Engine {
 									search_match_index = Some(idx + 1);
 									let (ml, mc, _) = search_matches[idx + 1];
 									cursor_abs_line = ml;
-									let (node, offset, _) =
-										registry.find_node_at_line_col(rid, ml, mc);
-									cursor_node = node;
-									cursor_offset = offset;
+									let target = registry.find_node_at_line_col(rid, ml, mc);
+									apply_cursor_target(
+										target,
+										&mut cursor_node,
+										&mut cursor_offset,
+										&mut cursor_abs_col,
+									);
 									cursor_abs_col = mc;
 									status_message = Some(format!(
 										"Replace? [y/n/a/q] ({}/{})",
@@ -1174,8 +1244,8 @@ impl Engine {
 									let idx = search_match_index.unwrap_or(0);
 									let (ml, mc, _) = search_matches[idx];
 									let mut byte_off = 0usize;
-									let mut line = 0u32;
-									let mut col = 0u32;
+									let mut line = DocLine::ZERO;
+									let mut col = VisualCol::ZERO;
 									for &b in bytes.iter() {
 										if line == ml && col == mc {
 											break;
@@ -1206,15 +1276,17 @@ impl Engine {
 										create_document_from_bytes(&registry, &new_bytes);
 									root_id = Some(new_root);
 
-									let (node, offset, clamped_col) = registry
-										.find_node_at_line_col(
-											new_root,
-											cursor_abs_line,
-											cursor_abs_col,
-										);
-									cursor_node = node;
-									cursor_offset = offset;
-									cursor_abs_col = clamped_col;
+									let target = registry.find_node_at_line_col(
+										new_root,
+										cursor_abs_line,
+										cursor_abs_col,
+									);
+									apply_cursor_target(
+										target,
+										&mut cursor_node,
+										&mut cursor_offset,
+										&mut cursor_abs_col,
+									);
 									status_message =
 										Some(format!("{} substitution(s)", cs.replacements_done));
 								}
@@ -1241,8 +1313,8 @@ impl Engine {
 					if let Some(rid) = root_id {
 						if let Ok(bytes) = registry.collect_document_bytes(rid) {
 							let global_offset =
-								byte_offset_from_line_col(&bytes, cursor_abs_line, 0);
-							let off = global_offset as usize;
+								byte_offset_from_line_col(&bytes, cursor_abs_line, VisualCol::ZERO);
+							let off = global_offset.get() as usize;
 							// Find the end of the current line (including the \n).
 							let line_end = bytes[off..]
 								.iter()
@@ -1264,7 +1336,8 @@ impl Engine {
 							}
 
 							// Yank flash: highlight the yanked line for 200ms.
-							yank_flash = Some((off as u64, line_end as u64));
+							yank_flash =
+								Some((DocByte::new(off as u64), DocByte::new(line_end as u64)));
 							let tx_flash = tx_cmd.clone();
 							std::thread::spawn(move || {
 								std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1310,7 +1383,7 @@ impl Engine {
 										&mut ledger,
 										&mut semantic_highlights,
 										TextDelta {
-											global_byte_offset: insert_offset as u64,
+											global_byte_offset: DocByte::new(insert_offset as u64),
 											deleted_text: String::new(),
 											inserted_text,
 											state_before: 0,
@@ -1324,16 +1397,18 @@ impl Engine {
 
 									// Place cursor on the first line of pasted text.
 									cursor_abs_line = target_cursor_line;
-									cursor_abs_col = 0;
-									let (node, offset, clamped_col) = registry
-										.find_node_at_line_col(
-											new_root,
-											cursor_abs_line,
-											cursor_abs_col,
-										);
-									cursor_node = node;
-									cursor_offset = offset;
-									cursor_abs_col = clamped_col;
+									cursor_abs_col = VisualCol::ZERO;
+									let target = registry.find_node_at_line_col(
+										new_root,
+										cursor_abs_line,
+										cursor_abs_col,
+									);
+									apply_cursor_target(
+										target,
+										&mut cursor_node,
+										&mut cursor_offset,
+										&mut cursor_abs_col,
+									);
 									needs_render = true;
 								}
 							}
@@ -1358,11 +1433,13 @@ impl Engine {
 							if let Ok(bytes) = registry.collect_document_bytes(new_root) {
 								let (line, col) = line_col_from_byte_offset(&bytes, cursor_byte);
 								cursor_abs_line = line;
-								let (node, offset, clamped_col) =
-									registry.find_node_at_line_col(new_root, line, col);
-								cursor_node = node;
-								cursor_offset = offset;
-								cursor_abs_col = clamped_col;
+								let target = registry.find_node_at_line_col(new_root, line, col);
+								apply_cursor_target(
+									target,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_col,
+								);
 							}
 							needs_render = true;
 						} else {
@@ -1386,11 +1463,13 @@ impl Engine {
 							if let Ok(bytes) = registry.collect_document_bytes(new_root) {
 								let (line, col) = line_col_from_byte_offset(&bytes, cursor_byte);
 								cursor_abs_line = line;
-								let (node, offset, clamped_col) =
-									registry.find_node_at_line_col(new_root, line, col);
-								cursor_node = node;
-								cursor_offset = offset;
-								cursor_abs_col = clamped_col;
+								let target = registry.find_node_at_line_col(new_root, line, col);
+								apply_cursor_target(
+									target,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_col,
+								);
 							}
 							needs_render = true;
 						} else {
@@ -1446,7 +1525,7 @@ impl Engine {
 					.as_ref()
 					.map(|_| "Replace? [y/n/a/q]".to_string());
 
-				let mut global_start_byte = 0;
+				let mut global_start_byte = DocByte::ZERO;
 				let mut highlights = Vec::new();
 
 				if let Some(path) = &file_path {
@@ -1477,13 +1556,13 @@ impl Engine {
 												String::from_utf8_lossy(&live_bytes).into_owned();
 											let request_id = next_semantic_request_id;
 											next_semantic_request_id += 1;
-											reactor.send(
-												text,
-												0,
-												file_path.clone().unwrap_or_default(),
-												ledger.current_state_id,
+											reactor.send(SemanticRequest {
+												content: text,
+												global_offset: DocByte::ZERO,
+												file_path: file_path.clone().unwrap_or_default(),
+												state_id: ledger.current_state_id,
 												request_id,
-											);
+											});
 											// Lock only after a successful, non-empty send.
 											last_semantic_state = ledger.current_state_id;
 											last_semantic_len = live_bytes.len();
@@ -1516,11 +1595,11 @@ impl Engine {
 				}
 
 				// Non-blocking poll: grab latest semantic highlights if ready.
-				while let Some((state_id, request_id, fresh)) = reactor.try_recv() {
-					if Some(request_id) == pending_semantic_request_id
-						&& state_id == ledger.current_state_id
+				while let Some(response) = reactor.try_recv() {
+					if Some(response.request_id) == pending_semantic_request_id
+						&& response.state_id == ledger.current_state_id
 					{
-						semantic_highlights = fresh;
+						semantic_highlights = response.highlights;
 						pending_semantic_request_id = None;
 					}
 				}
@@ -1535,7 +1614,7 @@ impl Engine {
 
 				let _ = tx_view.send(Viewport {
 					tokens,
-					cursor_abs_pos: (cursor_abs_line, cursor_abs_col),
+					cursor_abs_pos: CursorPosition::new(cursor_abs_line, cursor_abs_col),
 					total_lines,
 					status_message: status_message.take(),
 					should_quit: pending_quit,
@@ -1568,18 +1647,15 @@ impl Engine {
 /// Semantic tags (struct, trait, variable resolution) overwrite lexical tags
 /// wherever their byte ranges overlap. Lexical spans that fall outside any
 /// semantic span are preserved unchanged.
-fn merge_highlights(
-	lexical: &[(u64, u64, TokenCategory)],
-	semantic: &[(u64, u64, TokenCategory)],
-) -> Vec<(u64, u64, TokenCategory)> {
+fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Vec<HighlightSpan> {
 	let mut merged = Vec::with_capacity(lexical.len() + semantic.len());
 
-	for &(lex_start, lex_end, lex_cat) in lexical {
+	for &lex_span in lexical {
 		// Binary search for the first semantic span that could overlap.
-		let search = semantic.partition_point(|s| s.1 <= lex_start);
+		let search = semantic.partition_point(|span| span.end <= lex_span.start);
 		let mut overwritten = false;
-		for sem in &semantic[search..] {
-			if sem.0 >= lex_end {
+		for sem_span in &semantic[search..] {
+			if sem_span.start >= lex_span.end {
 				break;
 			}
 			// Semantic span overlaps this lexical span — replace it.
@@ -1587,7 +1663,7 @@ fn merge_highlights(
 			break;
 		}
 		if !overwritten {
-			merged.push((lex_start, lex_end, lex_cat));
+			merged.push(lex_span);
 		}
 	}
 
@@ -1595,7 +1671,7 @@ fn merge_highlights(
 	merged.extend_from_slice(semantic);
 
 	// Sort by start byte for the projector's binary search.
-	merged.sort_unstable_by_key(|s| s.0);
+	merged.sort_unstable_by_key(|span| span.start);
 	merged
 }
 
@@ -1604,8 +1680,9 @@ mod tests {
 	use super::{
 		document_rewrite_delta, linewise_put_insertion, rebase_semantic_highlights_after_delta,
 	};
+	use crate::core::{DocByte, DocLine};
 	use crate::engine::undo::TextDelta;
-	use crate::svp::highlight::TokenCategory;
+	use crate::svp::highlight::{HighlightSpan, TokenCategory};
 
 	#[test]
 	fn rewrite_delta_tracks_changed_middle_span() {
@@ -1619,32 +1696,32 @@ mod tests {
 	#[test]
 	fn linewise_put_adds_newline_at_eof_without_trailing_break() {
 		let (insert_offset, inserted_text, target_cursor_line) =
-			linewise_put_insertion(b"alpha", 0, "beta");
+			linewise_put_insertion(b"alpha", DocLine::ZERO, "beta");
 		assert_eq!(insert_offset, 5);
 		assert_eq!(inserted_text, "\nbeta");
-		assert_eq!(target_cursor_line, 1);
+		assert_eq!(target_cursor_line, DocLine::new(1));
 	}
 
 	#[test]
 	fn linewise_put_stays_on_first_line_for_empty_docs() {
 		let (insert_offset, inserted_text, target_cursor_line) =
-			linewise_put_insertion(b"", 0, "beta\n");
+			linewise_put_insertion(b"", DocLine::ZERO, "beta\n");
 		assert_eq!(insert_offset, 0);
 		assert_eq!(inserted_text, "beta\n");
-		assert_eq!(target_cursor_line, 0);
+		assert_eq!(target_cursor_line, DocLine::ZERO);
 	}
 
 	#[test]
 	fn semantic_cache_rebases_spans_after_backspace() {
 		let mut semantic = vec![
-			(0, 3, TokenCategory::Keyword),
-			(10, 13, TokenCategory::Module),
+			HighlightSpan::new(DocByte::new(0), DocByte::new(3), TokenCategory::Keyword),
+			HighlightSpan::new(DocByte::new(10), DocByte::new(13), TokenCategory::Module),
 		];
 
 		rebase_semantic_highlights_after_delta(
 			&mut semantic,
 			&TextDelta {
-				global_byte_offset: 5,
+				global_byte_offset: DocByte::new(5),
 				deleted_text: "x".to_string(),
 				inserted_text: String::new(),
 				state_before: 0,
@@ -1655,8 +1732,8 @@ mod tests {
 		assert_eq!(
 			semantic,
 			vec![
-				(0, 3, TokenCategory::Keyword),
-				(9, 12, TokenCategory::Module),
+				HighlightSpan::new(DocByte::new(0), DocByte::new(3), TokenCategory::Keyword),
+				HighlightSpan::new(DocByte::new(9), DocByte::new(12), TokenCategory::Module),
 			]
 		);
 	}
@@ -1664,14 +1741,14 @@ mod tests {
 	#[test]
 	fn semantic_cache_drops_spans_crossing_the_edit_boundary() {
 		let mut semantic = vec![
-			(4, 7, TokenCategory::Variable),
-			(10, 14, TokenCategory::Type),
+			HighlightSpan::new(DocByte::new(4), DocByte::new(7), TokenCategory::Variable),
+			HighlightSpan::new(DocByte::new(10), DocByte::new(14), TokenCategory::Type),
 		];
 
 		rebase_semantic_highlights_after_delta(
 			&mut semantic,
 			&TextDelta {
-				global_byte_offset: 5,
+				global_byte_offset: DocByte::new(5),
 				deleted_text: String::new(),
 				inserted_text: "x".to_string(),
 				state_before: 0,
@@ -1679,6 +1756,13 @@ mod tests {
 			},
 		);
 
-		assert_eq!(semantic, vec![(11, 15, TokenCategory::Type)]);
+		assert_eq!(
+			semantic,
+			vec![HighlightSpan::new(
+				DocByte::new(11),
+				DocByte::new(15),
+				TokenCategory::Type,
+			)]
+		);
 	}
 }

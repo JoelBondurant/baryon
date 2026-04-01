@@ -1,3 +1,4 @@
+use crate::core::DocByte;
 use crate::svp::parse::ViewportTree;
 use ra_ap_syntax::SyntaxKind;
 
@@ -25,6 +26,23 @@ pub enum TokenCategory {
 	Crate,
 	Whitespace,
 	Unclassified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighlightSpan {
+	pub start: DocByte,
+	pub end: DocByte,
+	pub category: TokenCategory,
+}
+
+impl HighlightSpan {
+	pub const fn new(start: DocByte, end: DocByte, category: TokenCategory) -> Self {
+		Self {
+			start,
+			end,
+			category,
+		}
+	}
 }
 
 fn classify_token(kind: SyntaxKind) -> TokenCategory {
@@ -111,7 +129,7 @@ fn classify_token(kind: SyntaxKind) -> TokenCategory {
 	}
 }
 
-pub fn highlight_viewport(viewport: &ViewportTree) -> Vec<(u64, u64, TokenCategory)> {
+pub fn highlight_viewport(viewport: &ViewportTree) -> Vec<HighlightSpan> {
 	let mut highlights = Vec::new();
 
 	for token in viewport
@@ -123,7 +141,7 @@ pub fn highlight_viewport(viewport: &ViewportTree) -> Vec<(u64, u64, TokenCatego
 
 		if category != TokenCategory::Unclassified {
 			let (start, end) = viewport.local_to_global(token.text_range());
-			highlights.push((start, end, category));
+			highlights.push(HighlightSpan::new(start, end, category));
 		}
 	}
 
