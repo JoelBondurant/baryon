@@ -11,7 +11,7 @@ pub fn expand_path(path: &str) -> PathBuf {
 			return PathBuf::from(home);
 		}
 	}
-	
+
 	// Canonicalize handles ".." and "." but requires the path to exist.
 	// For simplicity in this prototype, we'll just use PathBuf::from
 	// which handles ".." correctly during standard file operations.

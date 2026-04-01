@@ -1,19 +1,28 @@
-use std::sync::Arc;
 use crate::ecs::id::NodeId;
 use crate::ecs::registry::UastRegistry;
+use crate::svp::pointer::SvpPointer;
+use crate::svp::resolver::{DMA_CHUNK_SIZE, RequestPriority, SvpRequest, SvpResolver};
 use crate::uast::kind::SemanticKind;
 use crate::uast::metrics::SpanMetrics;
-use crate::svp::pointer::SvpPointer;
-use crate::svp::resolver::{SvpResolver, SvpRequest, RequestPriority, DMA_CHUNK_SIZE};
+use std::sync::Arc;
 
-pub fn ingest_svp_file(resolver: &SvpResolver, registry: &Arc<UastRegistry>, file_size: u64, device_id: u16, path: String) -> NodeId {
+pub fn ingest_svp_file(
+	resolver: &SvpResolver,
+	registry: &Arc<UastRegistry>,
+	file_size: u64,
+	device_id: u16,
+	path: String,
+) -> NodeId {
 	let chunk_count = (file_size + DMA_CHUNK_SIZE as u64 - 1) / DMA_CHUNK_SIZE as u64;
 	let mut chunk = registry.reserve_chunk(chunk_count as u32 + 1).expect("OOM");
 
 	let root_id = chunk.spawn_node(
 		SemanticKind::RelationalTable,
 		None,
-		SpanMetrics { byte_length: file_size as u32, newlines: 0 },
+		SpanMetrics {
+			byte_length: file_size as u32,
+			newlines: 0,
+		},
 	);
 
 	let mut first_leaf_id = None;
@@ -35,10 +44,15 @@ pub fn ingest_svp_file(resolver: &SvpResolver, registry: &Arc<UastRegistry>, fil
 				device_id,
 				head_trim: (byte_offset % 512) as u16,
 			}),
-			SpanMetrics { byte_length, newlines: 0 },
+			SpanMetrics {
+				byte_length,
+				newlines: 0,
+			},
 		);
 
-		if first_leaf_id.is_none() { first_leaf_id = Some(leaf_id); }
+		if first_leaf_id.is_none() {
+			first_leaf_id = Some(leaf_id);
+		}
 		last_leaf_id = Some(leaf_id);
 
 		chunk.append_local_child(root_id, leaf_id);

@@ -8,6 +8,7 @@ pub struct RenderToken {
 	pub text: String,
 	#[allow(dead_code)]
 	pub absolute_start_line: u32,
+	pub absolute_start_byte: u64,
 	pub is_virtual: bool,
 }
 
@@ -25,12 +26,19 @@ pub struct Viewport {
 	pub search_match_info: Option<String>,
 	pub confirm_prompt: Option<String>,
 	pub mode_override: Option<crate::engine::EditorMode>,
+	pub global_start_byte: u64,
+	pub highlights: Vec<(u64, u64, crate::svp::highlight::TokenCategory)>,
 }
 
 pub trait UastProjection {
 	fn query_viewport(&self, root: NodeId, target_line: u32, line_count: u32) -> Vec<RenderToken>;
 	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId>;
-	fn find_node_at_line_col(&self, root: NodeId, target_line: u32, target_col: u32) -> (NodeId, u32, u32);
+	fn find_node_at_line_col(
+		&self,
+		root: NodeId,
+		target_line: u32,
+		target_col: u32,
+	) -> (NodeId, u32, u32);
 	fn collect_document_bytes(&self, root: NodeId) -> Result<Vec<u8>, &'static str>;
 }
 
@@ -39,6 +47,7 @@ impl UastProjection for UastRegistry {
 		let mut tokens = Vec::new();
 		let mut curr = Some(root);
 		let mut line_accumulator = 0;
+		let mut byte_accumulator: u64 = 0;
 
 		// PHASE 1: DESCENT (O(log N))
 		while let Some(node) = curr {
@@ -55,6 +64,7 @@ impl UastProjection for UastRegistry {
 				}
 			} else {
 				line_accumulator += m.newlines;
+				byte_accumulator += m.byte_length as u64;
 				let next_sibling = unsafe { (*self.edges[idx].get()).next_sibling };
 				curr = next_sibling;
 			}
@@ -79,9 +89,12 @@ impl UastProjection for UastRegistry {
 			let kind = unsafe { *self.kinds[idx].get() };
 
 			let mut display_text = text.clone();
+			let mut token_start_byte = byte_accumulator;
+
 			if line_accumulator < target_line {
 				if line_accumulator + m.newlines < target_line {
 					line_accumulator += m.newlines;
+					byte_accumulator += m.byte_length as u64;
 					visit = self.get_next_node_in_walk(node);
 					continue;
 				}
@@ -100,6 +113,7 @@ impl UastProjection for UastRegistry {
 						}
 					}
 					display_text = text[byte_offset..].to_string();
+					token_start_byte += byte_offset as u64;
 				}
 				line_accumulator = target_line;
 			}
@@ -109,6 +123,7 @@ impl UastProjection for UastRegistry {
 				kind,
 				text: display_text,
 				absolute_start_line: line_accumulator,
+				absolute_start_byte: token_start_byte,
 				is_virtual,
 			});
 
@@ -120,10 +135,18 @@ impl UastProjection for UastRegistry {
 				line_accumulator += m.newlines;
 				collected_lines += m.newlines;
 			} else {
-				let lines_shown = tokens.last().unwrap().text.chars().filter(|&c| c == '\n').count() as u32;
+				let lines_shown = tokens
+					.last()
+					.unwrap()
+					.text
+					.chars()
+					.filter(|&c| c == '\n')
+					.count() as u32;
 				line_accumulator += lines_shown;
 				collected_lines += lines_shown;
 			}
+
+			byte_accumulator += m.byte_length as u64;
 
 			if collected_lines >= line_count {
 				break;
@@ -155,7 +178,12 @@ impl UastProjection for UastRegistry {
 		}
 	}
 
-	fn find_node_at_line_col(&self, root: NodeId, target_line: u32, target_col: u32) -> (NodeId, u32, u32) {
+	fn find_node_at_line_col(
+		&self,
+		root: NodeId,
+		target_line: u32,
+		target_col: u32,
+	) -> (NodeId, u32, u32) {
 		let mut curr = Some(root);
 		let mut line_accumulator = 0;
 

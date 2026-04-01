@@ -1,0 +1,105 @@
+use crate::svp::parse::ViewportTree;
+use ra_ap_syntax::SyntaxKind;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenCategory {
+	Keyword,
+	String,
+	Comment,
+	Type,
+	Function,
+	Number,
+	Punctuation,
+	Unclassified,
+}
+
+fn classify_token(kind: SyntaxKind) -> TokenCategory {
+	match kind {
+		SyntaxKind::FN_KW
+		| SyntaxKind::LET_KW
+		| SyntaxKind::MUT_KW
+		| SyntaxKind::IF_KW
+		| SyntaxKind::ELSE_KW
+		| SyntaxKind::MATCH_KW
+		| SyntaxKind::RETURN_KW
+		| SyntaxKind::STRUCT_KW
+		| SyntaxKind::ENUM_KW
+		| SyntaxKind::TRAIT_KW
+		| SyntaxKind::IMPL_KW
+		| SyntaxKind::PUB_KW
+		| SyntaxKind::USE_KW
+		| SyntaxKind::MOD_KW => TokenCategory::Keyword,
+
+		SyntaxKind::STRING | SyntaxKind::BYTE_STRING => TokenCategory::String,
+
+		SyntaxKind::COMMENT => TokenCategory::Comment,
+
+		SyntaxKind::INT_NUMBER | SyntaxKind::FLOAT_NUMBER => TokenCategory::Number,
+
+		SyntaxKind::L_CURLY
+		| SyntaxKind::R_CURLY
+		| SyntaxKind::L_PAREN
+		| SyntaxKind::R_PAREN
+		| SyntaxKind::L_BRACK
+		| SyntaxKind::R_BRACK
+		| SyntaxKind::COMMA
+		| SyntaxKind::SEMICOLON
+		| SyntaxKind::COLON
+		| SyntaxKind::DOT
+		| SyntaxKind::EQ
+		| SyntaxKind::FAT_ARROW
+		| SyntaxKind::THIN_ARROW
+		| SyntaxKind::BANG
+		| SyntaxKind::MINUS
+		| SyntaxKind::MINUSEQ
+		| SyntaxKind::PLUS
+		| SyntaxKind::PLUSEQ
+		| SyntaxKind::STAR
+		| SyntaxKind::STAREQ
+		| SyntaxKind::SLASH
+		| SyntaxKind::SLASHEQ
+		| SyntaxKind::PERCENT
+		| SyntaxKind::PERCENTEQ
+		| SyntaxKind::CARET
+		| SyntaxKind::CARETEQ
+		| SyntaxKind::PIPE
+		| SyntaxKind::PIPEEQ
+		| SyntaxKind::AMP
+		| SyntaxKind::AMPEQ
+		| SyntaxKind::L_ANGLE
+		| SyntaxKind::R_ANGLE
+		| SyntaxKind::LTEQ
+		| SyntaxKind::GTEQ
+		| SyntaxKind::SHL
+		| SyntaxKind::SHLEQ
+		| SyntaxKind::SHR
+		| SyntaxKind::SHREQ
+		| SyntaxKind::AT
+		| SyntaxKind::UNDERSCORE
+		| SyntaxKind::QUESTION => TokenCategory::Punctuation,
+
+		SyntaxKind::IDENT => TokenCategory::Unclassified,
+
+		_ => TokenCategory::Unclassified,
+	}
+}
+
+pub fn highlight_viewport(viewport: &ViewportTree) -> Vec<(u64, u64, TokenCategory)> {
+	let mut highlights = Vec::new();
+
+	for token in viewport
+		.tree
+		.descendants_with_tokens()
+		.filter_map(|element| element.into_token())
+	{
+		let category = classify_token(token.kind());
+
+		if category != TokenCategory::Unclassified {
+			let (start, end) = viewport.local_to_global(token.text_range());
+			highlights.push((start, end, category));
+		}
+	}
+
+	highlights
+}

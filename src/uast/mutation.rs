@@ -1,6 +1,6 @@
 use crate::ecs::{NodeId, UastRegistry};
-use crate::uast::kind::SemanticKind;
 use crate::svp::pointer::SvpPointer;
+use crate::uast::kind::SemanticKind;
 
 pub trait UastMutation {
 	fn apply_edit(&self, target: NodeId, added_bytes: i32, added_newlines: i32);

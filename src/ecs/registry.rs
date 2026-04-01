@@ -1,11 +1,11 @@
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use crate::ecs::chunk::RegistryChunk;
 use crate::ecs::id::NodeId;
-use crate::uast::kind::SemanticKind;
 use crate::svp::pointer::SvpPointer;
+use crate::uast::kind::SemanticKind;
 use crate::uast::metrics::SpanMetrics;
 use crate::uast::topology::TreeEdges;
-use crate::ecs::chunk::RegistryChunk;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// ==========================================
 /// THE CONCURRENT ECS REGISTRY (WORLD)

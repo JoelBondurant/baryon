@@ -1,16 +1,18 @@
+use crate::engine::{
+	ConfirmAction, EditorCommand, EditorMode, MoveDirection, SubstituteFlags, SubstituteRange,
+};
 use crate::uast::kind::SemanticKind;
 use crate::uast::projection::Viewport;
-use crate::engine::{EditorMode, EditorCommand, MoveDirection, ConfirmAction, SubstituteRange, SubstituteFlags};
-use regex_automata::meta::Regex;
-use regex_automata::util::syntax;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
 use ratatui::{
+	Terminal,
 	backend::Backend,
 	style::{Color, Modifier, Style},
-	Terminal,
 };
-use crossterm::execute;
+use regex_automata::meta::Regex;
+use regex_automata::util::syntax;
 use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -49,6 +51,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 	}
 
 	pub fn run(&mut self) -> Result<(), io::Error> {
+		self.terminal
+			.clear()
+			.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 		self.apply_cursor_style();
 		let mut initial_draw = true;
 		loop {
@@ -71,9 +76,18 @@ impl<B: Backend + io::Write> Frontend<B> {
 				got_new_view = true;
 			}
 
-			if got_new_view || self.needs_redraw || matches!(self.current_mode, EditorMode::Command | EditorMode::Insert | EditorMode::Search | EditorMode::Confirm) {
+			if got_new_view
+				|| self.needs_redraw
+				|| matches!(
+					self.current_mode,
+					EditorMode::Command
+						| EditorMode::Insert
+						| EditorMode::Search
+						| EditorMode::Confirm
+				) {
 				self.needs_redraw = false;
-				self.draw().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+				self.draw()
+					.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 			}
 			if event::poll(Duration::from_millis(16))? {
 				loop {
@@ -83,27 +97,47 @@ impl<B: Backend + io::Write> Frontend<B> {
 							self.needs_redraw = true;
 							match self.current_mode {
 								EditorMode::Normal => {
-									if self.handle_normal_key(key.code, key.modifiers, &mut should_quit) {
+									if self.handle_normal_key(
+										key.code,
+										key.modifiers,
+										&mut should_quit,
+									) {
 										break;
 									}
 								}
 								EditorMode::Insert => {
-									if self.handle_insert_key(key.code, key.modifiers, &mut should_quit) {
+									if self.handle_insert_key(
+										key.code,
+										key.modifiers,
+										&mut should_quit,
+									) {
 										break;
 									}
 								}
 								EditorMode::Command => {
-									if self.handle_command_key(key.code, key.modifiers, &mut should_quit) {
+									if self.handle_command_key(
+										key.code,
+										key.modifiers,
+										&mut should_quit,
+									) {
 										break;
 									}
 								}
 								EditorMode::Search => {
-									if self.handle_search_key(key.code, key.modifiers, &mut should_quit) {
+									if self.handle_search_key(
+										key.code,
+										key.modifiers,
+										&mut should_quit,
+									) {
 										break;
 									}
 								}
 								EditorMode::Confirm => {
-									if self.handle_confirm_key(key.code, key.modifiers, &mut should_quit) {
+									if self.handle_confirm_key(
+										key.code,
+										key.modifiers,
+										&mut should_quit,
+									) {
 										break;
 									}
 								}
@@ -143,7 +177,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 				let digits = max_line_on_screen.max(1).ilog10() + 1;
 				let gutter_width: u16 = digits as u16 + 1;
-				let gutter_style = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::Indexed(242));
+				let gutter_style = Style::default()
+					.bg(Color::Rgb(18, 18, 18))
+					.fg(Color::Indexed(242));
 
 				// --- GUTTER RENDERING ---
 				for gy in 0..(max_height - 1) {
@@ -173,10 +209,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 				let search_pat = view.search_pattern.as_deref().unwrap_or("");
 
+				let projector =
+					crate::svp::projector::HighlightProjector::new(view.highlights.clone());
+				let mut current_global_byte: u64 = view.global_start_byte;
+
 				for token in &view.tokens {
 					let base_style = match token.kind {
-						SemanticKind::Token => Style::default().fg(Color::LightGreen),
-						_ => Style::default().fg(Color::White),
+						SemanticKind::Token => Style::default().fg(Color::Indexed(253)),
+						_ => Style::default().fg(Color::Indexed(253)),
 					};
 
 					let virtual_style = if token.is_virtual {
@@ -185,10 +225,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 						base_style
 					};
 
-					let text = if token.text.is_empty() { "[DMA PENDING...]" } else { &token.text };
+					let text = if token.text.is_empty() {
+						"[DMA PENDING...]"
+					} else {
+						&token.text
+					};
 
 					// Precompute highlight byte ranges for search matches in this token
-					let highlight_style = Style::default().bg(Color::Rgb(180, 140, 50)).fg(Color::Black);
+					let highlight_style = Style::default()
+						.bg(Color::Rgb(180, 140, 50))
+						.fg(Color::Black);
 					let search_ci = view.search_case_insensitive;
 					let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
 					if !search_pat.is_empty() && !token.text.is_empty() {
@@ -205,11 +251,27 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 					let mut byte_idx = 0usize;
 					for c in text.chars() {
-						let in_highlight = highlight_ranges.iter().any(|&(s, e)| byte_idx >= s && byte_idx < e);
-						let style = if in_highlight { highlight_style } else { virtual_style };
-						byte_idx += c.len_utf8();
+						let in_highlight = highlight_ranges
+							.iter()
+							.any(|&(s, e)| byte_idx >= s && byte_idx < e);
 
-						if y >= render_height { break; }
+						let mut style = if in_highlight {
+							highlight_style
+						} else {
+							virtual_style
+						};
+						if !in_highlight && !token.is_virtual {
+							if let Some(fg) = projector.style_for_byte(current_global_byte) {
+								style = style.fg(fg);
+							}
+						}
+
+						byte_idx += c.len_utf8();
+						current_global_byte += c.len_utf8() as u64;
+
+						if y >= render_height {
+							break;
+						}
 						if c == '\n' {
 							y += 1;
 							x = gutter_width as usize;
@@ -233,12 +295,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 							x += 1;
 						}
 					}
-					if y >= render_height { break; }
+					if y >= render_height {
+						break;
+					}
 				}
 
 				// --- HARDWARE CURSOR ---
 				let visual_cursor_y = view.cursor_abs_pos.0.saturating_sub(scroll_y) as u16;
-				let visual_cursor_x = (view.cursor_abs_pos.1 as u16).checked_add(gutter_width).unwrap_or(max_width);
+				let visual_cursor_x = (view.cursor_abs_pos.1 as u16)
+					.checked_add(gutter_width)
+					.unwrap_or(max_width);
 				if visual_cursor_y < max_height - 1 && visual_cursor_x < max_width {
 					cursor_to_set = Some((visual_cursor_x, visual_cursor_y));
 				}
@@ -259,7 +325,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 			if let Some(msg) = status_message {
 				// Overlay status message (write feedback, errors)
 				for (i, c) in msg.chars().enumerate() {
-					if i >= w { break; }
+					if i >= w {
+						break;
+					}
 					if let Some(cell) = buf.cell_mut((i as u16, bar_y)) {
 						cell.set_char(c);
 					}
@@ -267,7 +335,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 			} else {
 				// Mode label
 				let mode_str = match current_mode {
-					EditorMode::Normal => if g_prefix { "NOR g" } else { "NOR" },
+					EditorMode::Normal => {
+						if g_prefix {
+							"NOR g"
+						} else {
+							"NOR"
+						}
+					}
 					EditorMode::Insert => "INS",
 					EditorMode::Command => "CMD",
 					EditorMode::Search => "FIND",
@@ -286,7 +360,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 				// [ MODE ]
 				let mode_text = format!(" {} ", mode_str);
 				for c in mode_text.chars() {
-					if x >= w { break; }
+					if x >= w {
+						break;
+					}
 					if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
 						cell.set_char(c).set_style(mode_style);
 					}
@@ -302,14 +378,17 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 
 				// Middle section: command input OR filename
-				let (file_name, file_sz, dirty) = current_viewport.as_ref()
+				let (file_name, file_sz, dirty) = current_viewport
+					.as_ref()
 					.map(|v| (v.file_name.as_deref(), v.file_size, v.is_dirty))
 					.unwrap_or((None, 0, false));
 
 				if *current_mode == EditorMode::Command {
 					let cmd_text = format!(":{}", command_buffer);
 					for c in cmd_text.chars() {
-						if x >= w { break; }
+						if x >= w {
+							break;
+						}
 						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
 							cell.set_char(c).set_style(bar_bg);
 						}
@@ -318,18 +397,23 @@ impl<B: Backend + io::Write> Frontend<B> {
 				} else if *current_mode == EditorMode::Search {
 					let search_text = format!("/{}", search_buffer);
 					for c in search_text.chars() {
-						if x >= w { break; }
+						if x >= w {
+							break;
+						}
 						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
 							cell.set_char(c).set_style(bar_bg);
 						}
 						x += 1;
 					}
 				} else if *current_mode == EditorMode::Confirm {
-					let prompt = current_viewport.as_ref()
+					let prompt = current_viewport
+						.as_ref()
 						.and_then(|v| v.confirm_prompt.as_deref())
 						.unwrap_or("Replace? [y/n/a/q]");
 					for c in prompt.chars() {
-						if x >= w { break; }
+						if x >= w {
+							break;
+						}
 						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
 							cell.set_char(c).set_style(bar_bg);
 						}
@@ -337,9 +421,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 					}
 				} else {
 					let display_name = file_name
-						.map(|p| std::path::Path::new(p).file_name()
-							.and_then(|n| n.to_str())
-							.unwrap_or(p))
+						.map(|p| {
+							std::path::Path::new(p)
+								.file_name()
+								.and_then(|n| n.to_str())
+								.unwrap_or(p)
+						})
 						.unwrap_or("[No File]");
 					let name_style = if dirty {
 						bar_bg.fg(Color::Rgb(255, 200, 120))
@@ -347,7 +434,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 						bar_bg
 					};
 					for c in display_name.chars() {
-						if x >= w { break; }
+						if x >= w {
+							break;
+						}
 						if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
 							cell.set_char(c).set_style(name_style);
 						}
@@ -362,7 +451,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 						}
 						if x < w {
 							if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
-								cell.set_char('\u{25CF}').set_style(bar_bg.fg(Color::Rgb(255, 160, 80)));
+								cell.set_char('\u{25CF}')
+									.set_style(bar_bg.fg(Color::Rgb(255, 160, 80)));
 							}
 							x += 1;
 						}
@@ -370,14 +460,20 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 
 				// Right-aligned segments: [search] | filesize | encoding | line:col
-				let (cursor_line, cursor_col) = current_viewport.as_ref()
+				let (cursor_line, cursor_col) = current_viewport
+					.as_ref()
 					.map(|v| (v.cursor_abs_pos.0 + 1, v.cursor_abs_pos.1 + 1))
 					.unwrap_or((1, 1));
 
-				let search_info = current_viewport.as_ref().and_then(|v| v.search_match_info.as_deref());
+				let search_info = current_viewport
+					.as_ref()
+					.and_then(|v| v.search_match_info.as_deref());
 				let size_str = format_file_size(file_sz);
 				let right_text = match search_info {
-					Some(info) => format!("{} | {} | UTF-8 | {}:{} ", info, size_str, cursor_line, cursor_col),
+					Some(info) => format!(
+						"{} | {} | UTF-8 | {}:{} ",
+						info, size_str, cursor_line, cursor_col
+					),
 					None => format!("{} | UTF-8 | {}:{} ", size_str, cursor_line, cursor_col),
 				};
 
@@ -387,10 +483,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let search_style = bar_bg.fg(Color::Rgb(200, 160, 255));
 					for (i, c) in right_text.chars().enumerate() {
 						let rx = right_start + i;
-						if rx >= w { break; }
+						if rx >= w {
+							break;
+						}
 						let style = if c == '|' {
 							dim_style
-						} else if search_info.is_some() && rx < right_start + search_info.unwrap().len() {
+						} else if search_info.is_some()
+							&& rx < right_start + search_info.unwrap().len()
+						{
 							search_style
 						} else {
 							bar_bg
@@ -409,7 +509,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 		Ok(())
 	}
 
-	fn handle_normal_key(&mut self, code: KeyCode, modifiers: event::KeyModifiers, should_quit: &mut bool) -> bool {
+	fn handle_normal_key(
+		&mut self,
+		code: KeyCode,
+		modifiers: event::KeyModifiers,
+		should_quit: &mut bool,
+	) -> bool {
 		match code {
 			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
 				let _ = self.tx_cmd.send(EditorCommand::Quit);
@@ -421,19 +526,46 @@ impl<B: Backend + io::Write> Frontend<B> {
 				self.command_buffer.clear();
 				self.g_prefix = false;
 			}
-			KeyCode::Char('h') => { let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Left)); self.g_prefix = false; }
-			KeyCode::Char('j') => { let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Down)); self.g_prefix = false; }
-			KeyCode::Char('k') => { let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Up)); self.g_prefix = false; }
-			KeyCode::Char('l') => { let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Right)); self.g_prefix = false; }
+			KeyCode::Char('h') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Left));
+				self.g_prefix = false;
+			}
+			KeyCode::Char('j') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Down));
+				self.g_prefix = false;
+			}
+			KeyCode::Char('k') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Up));
+				self.g_prefix = false;
+			}
+			KeyCode::Char('l') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Right));
+				self.g_prefix = false;
+			}
 			KeyCode::Char('g') => {
 				if self.g_prefix {
-					let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Top));
+					let _ = self
+						.tx_cmd
+						.send(EditorCommand::MoveCursor(MoveDirection::Top));
 					self.g_prefix = false;
 				} else {
 					self.g_prefix = true;
 				}
 			}
-			KeyCode::Char('G') => { let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Bottom)); self.g_prefix = false; }
+			KeyCode::Char('G') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Bottom));
+				self.g_prefix = false;
+			}
 			KeyCode::Char('i') => {
 				self.current_mode = EditorMode::Insert;
 				self.g_prefix = false;
@@ -444,16 +576,34 @@ impl<B: Backend + io::Write> Frontend<B> {
 				self.search_buffer.clear();
 				self.g_prefix = false;
 			}
-			KeyCode::Char('n') => { let _ = self.tx_cmd.send(EditorCommand::SearchNext); self.g_prefix = false; }
-			KeyCode::Char('N') => { let _ = self.tx_cmd.send(EditorCommand::SearchPrev); self.g_prefix = false; }
-			KeyCode::Backspace | KeyCode::Delete => { let _ = self.tx_cmd.send(EditorCommand::Backspace); self.g_prefix = false; }
-			KeyCode::Esc => { self.g_prefix = false; }
-			_ => { self.g_prefix = false; }
+			KeyCode::Char('n') => {
+				let _ = self.tx_cmd.send(EditorCommand::SearchNext);
+				self.g_prefix = false;
+			}
+			KeyCode::Char('N') => {
+				let _ = self.tx_cmd.send(EditorCommand::SearchPrev);
+				self.g_prefix = false;
+			}
+			KeyCode::Backspace | KeyCode::Delete => {
+				let _ = self.tx_cmd.send(EditorCommand::Backspace);
+				self.g_prefix = false;
+			}
+			KeyCode::Esc => {
+				self.g_prefix = false;
+			}
+			_ => {
+				self.g_prefix = false;
+			}
 		}
 		false
 	}
 
-	fn handle_command_key(&mut self, code: KeyCode, modifiers: event::KeyModifiers, should_quit: &mut bool) -> bool {
+	fn handle_command_key(
+		&mut self,
+		code: KeyCode,
+		modifiers: event::KeyModifiers,
+		should_quit: &mut bool,
+	) -> bool {
 		match code {
 			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
 				let _ = self.tx_cmd.send(EditorCommand::Quit);
@@ -466,26 +616,48 @@ impl<B: Backend + io::Write> Frontend<B> {
 				} else if self.command_buffer.starts_with("w ") {
 					let path = self.command_buffer[2..].trim();
 					let expanded = crate::core::path::expand_path(path);
-					let _ = self.tx_cmd.send(EditorCommand::WriteFileAs(expanded.to_string_lossy().to_string()));
+					let _ = self.tx_cmd.send(EditorCommand::WriteFileAs(
+						expanded.to_string_lossy().to_string(),
+					));
 				} else if self.command_buffer == "x" || self.command_buffer == "wq" {
 					let _ = self.tx_cmd.send(EditorCommand::WriteAndQuit);
 				} else if self.command_buffer.starts_with("e ") {
 					let path = self.command_buffer[2..].trim();
 					let expanded = crate::core::path::expand_path(path);
-					let _ = self.tx_cmd.send(EditorCommand::LoadFile(expanded.to_string_lossy().to_string()));
+					let _ = self.tx_cmd.send(EditorCommand::LoadFile(
+						expanded.to_string_lossy().to_string(),
+					));
 				} else if let Ok(line_num) = self.command_buffer.parse::<u32>() {
-					let _ = self.tx_cmd.send(EditorCommand::GotoLine(line_num.saturating_sub(1)));
+					let _ = self
+						.tx_cmd
+						.send(EditorCommand::GotoLine(line_num.saturating_sub(1)));
 				} else if self.command_buffer == "q" {
 					let _ = self.tx_cmd.send(EditorCommand::Quit);
 					*should_quit = true;
 					return true;
 				} else if self.command_buffer.contains("s/") {
-					let cursor_line = self.current_viewport.as_ref().map(|v| v.cursor_abs_pos.0).unwrap_or(0);
-					if let Some((pattern, replacement, flags, range)) = parse_substitute(&self.command_buffer, cursor_line) {
+					let cursor_line = self
+						.current_viewport
+						.as_ref()
+						.map(|v| v.cursor_abs_pos.0)
+						.unwrap_or(0);
+					if let Some((pattern, replacement, flags, range)) =
+						parse_substitute(&self.command_buffer, cursor_line)
+					{
 						if flags.confirm {
-							let _ = self.tx_cmd.send(EditorCommand::SubstituteConfirm { pattern, replacement, range, flags });
+							let _ = self.tx_cmd.send(EditorCommand::SubstituteConfirm {
+								pattern,
+								replacement,
+								range,
+								flags,
+							});
 						} else {
-							let _ = self.tx_cmd.send(EditorCommand::SubstituteAll { pattern, replacement, range, flags });
+							let _ = self.tx_cmd.send(EditorCommand::SubstituteAll {
+								pattern,
+								replacement,
+								range,
+								flags,
+							});
 						}
 					} else {
 						self.status_message = Some("Invalid substitution syntax".to_string());
@@ -495,7 +667,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 				self.current_mode = EditorMode::Normal;
 			}
-			KeyCode::Esc => { self.current_mode = EditorMode::Normal; }
+			KeyCode::Esc => {
+				self.current_mode = EditorMode::Normal;
+			}
 			KeyCode::Backspace => {
 				if self.command_buffer.is_empty() {
 					self.current_mode = EditorMode::Normal;
@@ -503,13 +677,20 @@ impl<B: Backend + io::Write> Frontend<B> {
 					self.command_buffer.pop();
 				}
 			}
-			KeyCode::Char(c) => { self.command_buffer.push(c); }
+			KeyCode::Char(c) => {
+				self.command_buffer.push(c);
+			}
 			_ => {}
 		}
 		false
 	}
 
-	fn handle_insert_key(&mut self, code: KeyCode, modifiers: event::KeyModifiers, should_quit: &mut bool) -> bool {
+	fn handle_insert_key(
+		&mut self,
+		code: KeyCode,
+		modifiers: event::KeyModifiers,
+		should_quit: &mut bool,
+	) -> bool {
 		match code {
 			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
 				let _ = self.tx_cmd.send(EditorCommand::Quit);
@@ -520,15 +701,26 @@ impl<B: Backend + io::Write> Frontend<B> {
 				self.current_mode = EditorMode::Normal;
 				self.apply_cursor_style();
 			}
-			KeyCode::Enter => { let _ = self.tx_cmd.send(EditorCommand::InsertChar('\n')); }
-			KeyCode::Backspace => { let _ = self.tx_cmd.send(EditorCommand::Backspace); }
-			KeyCode::Char(c) => { let _ = self.tx_cmd.send(EditorCommand::InsertChar(c)); }
+			KeyCode::Enter => {
+				let _ = self.tx_cmd.send(EditorCommand::InsertChar('\n'));
+			}
+			KeyCode::Backspace => {
+				let _ = self.tx_cmd.send(EditorCommand::Backspace);
+			}
+			KeyCode::Char(c) => {
+				let _ = self.tx_cmd.send(EditorCommand::InsertChar(c));
+			}
 			_ => {}
 		}
 		false
 	}
 
-	fn handle_search_key(&mut self, code: KeyCode, modifiers: event::KeyModifiers, should_quit: &mut bool) -> bool {
+	fn handle_search_key(
+		&mut self,
+		code: KeyCode,
+		modifiers: event::KeyModifiers,
+		should_quit: &mut bool,
+	) -> bool {
 		match code {
 			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
 				let _ = self.tx_cmd.send(EditorCommand::Quit);
@@ -537,11 +729,15 @@ impl<B: Backend + io::Write> Frontend<B> {
 			}
 			KeyCode::Enter => {
 				if !self.search_buffer.is_empty() {
-					let _ = self.tx_cmd.send(EditorCommand::SearchStart(self.search_buffer.clone()));
+					let _ = self
+						.tx_cmd
+						.send(EditorCommand::SearchStart(self.search_buffer.clone()));
 				}
 				self.current_mode = EditorMode::Normal;
 			}
-			KeyCode::Esc => { self.current_mode = EditorMode::Normal; }
+			KeyCode::Esc => {
+				self.current_mode = EditorMode::Normal;
+			}
 			KeyCode::Backspace => {
 				if self.search_buffer.is_empty() {
 					self.current_mode = EditorMode::Normal;
@@ -549,24 +745,45 @@ impl<B: Backend + io::Write> Frontend<B> {
 					self.search_buffer.pop();
 				}
 			}
-			KeyCode::Char(c) => { self.search_buffer.push(c); }
+			KeyCode::Char(c) => {
+				self.search_buffer.push(c);
+			}
 			_ => {}
 		}
 		false
 	}
 
-	fn handle_confirm_key(&mut self, code: KeyCode, modifiers: event::KeyModifiers, should_quit: &mut bool) -> bool {
+	fn handle_confirm_key(
+		&mut self,
+		code: KeyCode,
+		modifiers: event::KeyModifiers,
+		should_quit: &mut bool,
+	) -> bool {
 		match code {
 			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
 				let _ = self.tx_cmd.send(EditorCommand::Quit);
 				*should_quit = true;
 				return true;
 			}
-			KeyCode::Char('y') => { let _ = self.tx_cmd.send(EditorCommand::ConfirmResponse(ConfirmAction::Yes)); }
-			KeyCode::Char('n') => { let _ = self.tx_cmd.send(EditorCommand::ConfirmResponse(ConfirmAction::No)); }
-			KeyCode::Char('a') => { let _ = self.tx_cmd.send(EditorCommand::ConfirmResponse(ConfirmAction::All)); }
+			KeyCode::Char('y') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::ConfirmResponse(ConfirmAction::Yes));
+			}
+			KeyCode::Char('n') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::ConfirmResponse(ConfirmAction::No));
+			}
+			KeyCode::Char('a') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::ConfirmResponse(ConfirmAction::All));
+			}
 			KeyCode::Char('q') | KeyCode::Esc => {
-				let _ = self.tx_cmd.send(EditorCommand::ConfirmResponse(ConfirmAction::Quit));
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::ConfirmResponse(ConfirmAction::Quit));
 			}
 			_ => {}
 		}
@@ -575,7 +792,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 	fn apply_cursor_style(&mut self) {
 		let style = match self.current_mode {
-			EditorMode::Normal | EditorMode::Command | EditorMode::Search | EditorMode::Confirm => SetCursorStyle::SteadyBlock,
+			EditorMode::Normal | EditorMode::Command | EditorMode::Search | EditorMode::Confirm => {
+				SetCursorStyle::SteadyBlock
+			}
 			EditorMode::Insert => SetCursorStyle::SteadyBar,
 		};
 		let _ = execute!(self.terminal.backend_mut(), style);
@@ -586,7 +805,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 	}
 }
 
-fn parse_substitute(cmd: &str, cursor_line: u32) -> Option<(String, String, SubstituteFlags, SubstituteRange)> {
+fn parse_substitute(
+	cmd: &str,
+	cursor_line: u32,
+) -> Option<(String, String, SubstituteFlags, SubstituteRange)> {
 	// Find "s/" to split range from pattern
 	let s_pos = cmd.find("s/")?;
 	let range_str = &cmd[..s_pos];
@@ -612,11 +834,15 @@ fn parse_substitute(cmd: &str, cursor_line: u32) -> Option<(String, String, Subs
 
 	// Parse pattern/replacement/flags
 	let parts: Vec<&str> = rest.splitn(3, '/').collect();
-	if parts.len() < 2 { return None; }
+	if parts.len() < 2 {
+		return None;
+	}
 	let pattern = parts[0].to_string();
 	let replacement = parts[1].to_string();
 	let flags_str = parts.get(2).unwrap_or(&"");
-	if pattern.is_empty() { return None; }
+	if pattern.is_empty() {
+		return None;
+	}
 
 	let mut flags = SubstituteFlags::default();
 	for c in flags_str.chars() {

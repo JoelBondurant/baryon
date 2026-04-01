@@ -1,9 +1,9 @@
-use std::num::NonZeroU32;
 use crate::ecs::id::NodeId;
 use crate::ecs::registry::UastRegistry;
-use crate::uast::kind::SemanticKind;
 use crate::svp::pointer::SvpPointer;
+use crate::uast::kind::SemanticKind;
 use crate::uast::metrics::SpanMetrics;
+use std::num::NonZeroU32;
 
 /// ==========================================
 /// THREAD-LOCAL CHUNK (THE WRITE CAPABILITY)

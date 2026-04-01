@@ -6,12 +6,12 @@ use crate::ui::Frontend;
 use crossterm::{
 	cursor::SetCursorStyle,
 	execute,
-	terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::backend::CrosstermBackend;
 use std::io;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 
 pub struct App;
@@ -47,7 +47,9 @@ impl App {
 		// --- INITIAL LOAD ---
 		if let Some(path) = initial_file {
 			let expanded = crate::core::path::expand_path(&path);
-			let _ = tx_cmd.send(EditorCommand::LoadFile(expanded.to_string_lossy().to_string()));
+			let _ = tx_cmd.send(EditorCommand::LoadFile(
+				expanded.to_string_lossy().to_string(),
+			));
 		}
 
 		// 3. Setup Frontend
@@ -64,7 +66,11 @@ impl App {
 		// 4. Teardown
 		disable_raw_mode()?;
 		let mut term = frontend.release_terminal();
-		execute!(term.backend_mut(), SetCursorStyle::DefaultUserShape, LeaveAlternateScreen)?;
+		execute!(
+			term.backend_mut(),
+			SetCursorStyle::DefaultUserShape,
+			LeaveAlternateScreen
+		)?;
 		term.show_cursor()?;
 
 		result

@@ -3,16 +3,16 @@ use crate::ecs::registry::UastRegistry;
 use crate::svp::pointer::SvpPointer;
 use crate::uast::mutation::UastMutation;
 use crossbeam_queue::ArrayQueue;
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
+use memchr::memchr_iter;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::thread;
-use memchr::memchr_iter;
 
 /// 64KB aligned DMA buffer size
 pub const DMA_CHUNK_SIZE: usize = 64 * 1024;
@@ -73,7 +73,12 @@ impl SvpResolver {
 	}
 
 	/// Internal helper to continue sequential scanning
-	fn request_scan_internal(queue: &ArrayQueue<SvpRequest>, node_id: NodeId, pointer: SvpPointer, last_node_id: NodeId) {
+	fn request_scan_internal(
+		queue: &ArrayQueue<SvpRequest>,
+		node_id: NodeId,
+		pointer: SvpPointer,
+		last_node_id: NodeId,
+	) {
 		let _ = queue.push(SvpRequest {
 			node_id,
 			pointer,
@@ -89,7 +94,7 @@ impl SvpResolver {
 		notifier: mpsc::Sender<()>,
 	) {
 		let mut ring = IoUring::new(256).expect("Failed to init io_uring");
-		
+
 		// Use a pool of buffers for concurrent requests
 		const BATCH_SIZE: usize = 16;
 		let mut buffers = vec![vec![0u8; DMA_CHUNK_SIZE]; BATCH_SIZE];
@@ -107,9 +112,10 @@ impl SvpResolver {
 					if let Some(raw_fd) = fd {
 						let is_viewport = req.priority == RequestPriority::High;
 						let buf_idx = in_flight;
-						let last_idx_plus_1 = req.last_node_id.map(|id| id.index() + 1).unwrap_or(0);
-						
-						let user_data = (req.node_id.index() as u64) 
+						let last_idx_plus_1 =
+							req.last_node_id.map(|id| id.index() + 1).unwrap_or(0);
+
+						let user_data = (req.node_id.index() as u64)
 							| ((is_viewport as u64) << 32)
 							| ((buf_idx as u64) << 33)
 							| ((last_idx_plus_1 as u64) << 40);
@@ -149,12 +155,13 @@ impl SvpResolver {
 					let _was_viewport = (ud >> 32) & 1 == 1;
 					let buf_idx = ((ud >> 33) & 0x7F) as usize;
 					let last_idx_plus_1 = (ud >> 40) as usize;
-					
+
 					let node_id = NodeId::from_index(node_idx);
 
 					if res >= 0 {
 						let byte_count = res as usize;
-						let newlines = memchr_iter(b'\n', &buffers[buf_idx][..byte_count]).count() as i32;
+						let newlines =
+							memchr_iter(b'\n', &buffers[buf_idx][..byte_count]).count() as i32;
 
 						// 1. ATOMIC INFLATION: Ensure every physical node is counted exactly once
 						if !registry.metrics_inflated[node_idx].swap(true, Ordering::Relaxed) {
@@ -169,7 +176,12 @@ impl SvpResolver {
 						if last_idx_plus_1 > 0 && node_idx + 1 < last_idx_plus_1 {
 							let next_idx = node_idx + 1;
 							if let Some(next_svp) = unsafe { *registry.spans[next_idx].get() } {
-								Self::request_scan_internal(&queue, NodeId::from_index(next_idx), next_svp, NodeId::from_index(last_idx_plus_1 - 1));
+								Self::request_scan_internal(
+									&queue,
+									NodeId::from_index(next_idx),
+									next_svp,
+									NodeId::from_index(last_idx_plus_1 - 1),
+								);
 							}
 						}
 						got_any = true;
