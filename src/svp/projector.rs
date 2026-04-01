@@ -37,7 +37,13 @@ impl HighlightProjector {
 			TokenCategory::Lifetime => Some(Color::Rgb(198, 120, 221)),
 			TokenCategory::Attribute => Some(Color::Rgb(171, 178, 191)),
 			TokenCategory::SelfKeyword => Some(Color::Rgb(224, 108, 117)),
-			TokenCategory::Operator | TokenCategory::Punctuation | TokenCategory::Unclassified => None,
+			TokenCategory::BuiltinType => Some(Color::Rgb(86, 182, 194)),
+			TokenCategory::MutableVariable => Some(Color::Rgb(209, 154, 102)),
+			TokenCategory::Method => Some(Color::Rgb(97, 175, 239)),
+			TokenCategory::Crate => Some(Color::Rgb(86, 182, 194)),
+			TokenCategory::Punctuation => Some(Color::Rgb(171, 178, 191)),
+			TokenCategory::Operator => Some(Color::Rgb(86, 182, 194)),
+			TokenCategory::Unclassified => None,
 		}
 	}
 }

@@ -19,6 +19,10 @@ pub enum TokenCategory {
 	Attribute,
 	Operator,
 	SelfKeyword,
+	BuiltinType,
+	MutableVariable,
+	Method,
+	Crate,
 	Unclassified,
 }
 

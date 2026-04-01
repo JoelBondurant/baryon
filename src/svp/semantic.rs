@@ -6,7 +6,7 @@ use triomphe::Arc;
 
 use ra_ap_base_db::{CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Env, SourceRoot};
 use ra_ap_cfg::CfgOptions;
-use ra_ap_ide::{AnalysisHost, HighlightConfig, HlTag, SymbolKind};
+use ra_ap_ide::{AnalysisHost, Highlight, HighlightConfig, HlMod, HlTag, SymbolKind};
 use ra_ap_ide_db::{ChangeWithProcMacros, MiniCore};
 use ra_ap_paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use ra_ap_project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSource};
@@ -97,7 +97,7 @@ impl SemanticReactor {
 				specialize_operator: false,
 				inject_doc_comment: false,
 				macro_bang: true,
-				syntactic_name_ref_highlighting: false,
+				syntactic_name_ref_highlighting: true,
 				minicore: MiniCore::default(),
 			};
 
@@ -106,7 +106,7 @@ impl SemanticReactor {
 					let mapped = highlights
 						.into_iter()
 						.filter_map(|hl| {
-							let cat = map_hl_tag(hl.highlight.tag);
+							let cat = map_hl_tag(hl.highlight);
 							if cat == TokenCategory::Unclassified {
 								return None;
 							}
@@ -254,9 +254,30 @@ fn init_single_file(initial_text: &str) -> (AnalysisHost, FileId) {
 	(host, file_id)
 }
 
-fn map_hl_tag(tag: HlTag) -> TokenCategory {
+fn map_hl_tag(highlight: Highlight) -> TokenCategory {
+	let mods = highlight.mods;
+	let tag = highlight.tag;
+
+	// Modifier-first checks: crate/library symbols and mutability.
+	if mods.contains(HlMod::CrateRoot) || mods.contains(HlMod::Library) {
+		if matches!(tag, HlTag::Symbol(SymbolKind::Module | SymbolKind::CrateRoot)) {
+			return TokenCategory::Crate;
+		}
+	}
+
+	if mods.contains(HlMod::Mutable)
+		&& matches!(
+			tag,
+			HlTag::Symbol(SymbolKind::Local | SymbolKind::ValueParam | SymbolKind::Field)
+		)
+	{
+		return TokenCategory::MutableVariable;
+	}
+
+	// Tag-based classification.
 	match tag {
-		HlTag::Symbol(SymbolKind::Function | SymbolKind::Method) => TokenCategory::Function,
+		HlTag::Symbol(SymbolKind::Method) => TokenCategory::Method,
+		HlTag::Symbol(SymbolKind::Function) => TokenCategory::Function,
 		HlTag::Symbol(
 			SymbolKind::Struct
 			| SymbolKind::Enum
@@ -268,9 +289,9 @@ fn map_hl_tag(tag: HlTag) -> TokenCategory {
 		HlTag::Symbol(SymbolKind::SelfParam | SymbolKind::SelfType) => {
 			TokenCategory::SelfKeyword
 		}
-		HlTag::Symbol(
-			SymbolKind::Local | SymbolKind::ValueParam | SymbolKind::Field,
-		) => TokenCategory::Variable,
+		HlTag::Symbol(SymbolKind::Local | SymbolKind::ValueParam | SymbolKind::Field) => {
+			TokenCategory::Variable
+		}
 		HlTag::Symbol(SymbolKind::Const | SymbolKind::Static | SymbolKind::ConstParam) => {
 			TokenCategory::Constant
 		}
@@ -286,7 +307,7 @@ fn map_hl_tag(tag: HlTag) -> TokenCategory {
 			| SymbolKind::DeriveHelper,
 		) => TokenCategory::Attribute,
 		HlTag::Symbol(_) => TokenCategory::Unclassified,
-		HlTag::BuiltinType => TokenCategory::Type,
+		HlTag::BuiltinType => TokenCategory::BuiltinType,
 		HlTag::Keyword | HlTag::BoolLiteral => TokenCategory::Keyword,
 		HlTag::Comment => TokenCategory::Comment,
 		HlTag::StringLiteral
