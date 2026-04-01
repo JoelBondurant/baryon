@@ -963,56 +963,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 
 				let abs_line = scroll_y + click_y as u32;
-				let target_visual_col = (click_x - gutter_width) as usize;
+				let target_visual_col = u32::from(click_x - gutter_width);
 
-				// Walk the viewport tokens for this line to resolve visual col -> logical col.
-				let mut current_line: u32 = scroll_y;
-				let mut visual_col: usize = 0;
-				let mut logical_col: u32 = 0;
-				let mut found = false;
-
-				'outer: for token in &view.tokens {
-					for c in token.text.chars() {
-						if current_line == abs_line {
-							if c == '\n' {
-								found = true;
-								break 'outer;
-							}
-							if visual_col >= target_visual_col {
-								found = true;
-								break 'outer;
-							}
-							if c == '\t' {
-								let tab_size = 4;
-								let spaces = tab_size - (visual_col % tab_size);
-								visual_col += spaces;
-							} else {
-								visual_col += 1;
-							}
-							logical_col += 1;
-						}
-						if c == '\n' {
-							current_line += 1;
-							if current_line > abs_line {
-								break 'outer;
-							}
-							visual_col = 0;
-							logical_col = 0;
-						}
-					}
-				}
-
-				if !found && current_line == abs_line {
-					// Clicked past end of line — place cursor at end.
-					found = true;
-				}
-
-				if found {
-					let _ = self
-						.tx_cmd
-						.send(EditorCommand::ClickCursor(abs_line, logical_col));
-					self.needs_redraw = true;
-				}
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::ClickCursor(abs_line, target_visual_col));
+				self.needs_redraw = true;
 			}
 			_ => {}
 		}
