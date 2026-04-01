@@ -1,4 +1,6 @@
 use crate::ecs::{NodeId, UastRegistry};
+use crate::svp::highlight::TokenCategory;
+use crate::svp::semantic::SemanticReactor;
 use crate::svp::{RequestPriority, SvpResolver, ingest_svp_file};
 use crate::uast::{UastMutation, UastProjection, Viewport};
 use regex_automata::meta::Regex;
@@ -221,6 +223,7 @@ pub struct Engine {
 	resolver: Arc<SvpResolver>,
 	rx_cmd: mpsc::Receiver<EditorCommand>,
 	tx_view: mpsc::Sender<Viewport>,
+	reactor: SemanticReactor,
 }
 
 impl Engine {
@@ -228,6 +231,7 @@ impl Engine {
 		registry: Arc<UastRegistry>,
 		resolver: Arc<SvpResolver>,
 		rx_cmd: mpsc::Receiver<EditorCommand>,
+		tx_cmd: mpsc::Sender<EditorCommand>,
 		tx_view: mpsc::Sender<Viewport>,
 	) -> Self {
 		Self {
@@ -235,6 +239,7 @@ impl Engine {
 			resolver,
 			rx_cmd,
 			tx_view,
+			reactor: SemanticReactor::new(tx_cmd),
 		}
 	}
 
@@ -243,6 +248,9 @@ impl Engine {
 		let resolver = self.resolver;
 		let rx_cmd = self.rx_cmd;
 		let tx_view = self.tx_view;
+		let reactor = self.reactor;
+		let mut semantic_highlights: Vec<(u64, u64, TokenCategory)> = Vec::new();
+		let mut last_semantic_hash: u64 = 0;
 
 		let mut cursor_abs_line: u32 = 0;
 		let mut cursor_abs_col: u32 = 0;
@@ -963,8 +971,35 @@ impl Engine {
 								v_global_start,
 								&virtual_buffer,
 							);
+
+							// Feed the semantic reactor: strip DMA null padding,
+							// hash-gate to avoid redundant Salsa mutations on scroll/idle.
+							if file_size < 1_048_576 {
+								let buf_len = virtual_buffer.len().min(file_size as usize);
+								let valid_bytes = &virtual_buffer[..buf_len];
+
+								use std::hash::{Hash, Hasher};
+								let mut hasher = std::collections::hash_map::DefaultHasher::new();
+								valid_bytes.hash(&mut hasher);
+								let hash = hasher.finish();
+
+								if hash != last_semantic_hash {
+									last_semantic_hash = hash;
+									let text = String::from_utf8_lossy(valid_bytes).into_owned();
+									reactor.send(text, v_global_start);
+								}
+							}
 						}
 					}
+				}
+
+				// Non-blocking poll: grab latest semantic highlights if ready.
+				if let Some(fresh) = reactor.try_recv() {
+					semantic_highlights = fresh;
+				}
+
+				if !semantic_highlights.is_empty() {
+					highlights = merge_highlights(&highlights, &semantic_highlights);
 				}
 
 				if let Some(first_visible) = tokens.first() {
@@ -995,4 +1030,40 @@ impl Engine {
 			}
 		}
 	}
+}
+
+/// Composite semantic highlights over lexical highlights.
+///
+/// Semantic tags (struct, trait, variable resolution) overwrite lexical tags
+/// wherever their byte ranges overlap. Lexical spans that fall outside any
+/// semantic span are preserved unchanged.
+fn merge_highlights(
+	lexical: &[(u64, u64, TokenCategory)],
+	semantic: &[(u64, u64, TokenCategory)],
+) -> Vec<(u64, u64, TokenCategory)> {
+	let mut merged = Vec::with_capacity(lexical.len() + semantic.len());
+
+	for &(lex_start, lex_end, lex_cat) in lexical {
+		// Binary search for the first semantic span that could overlap.
+		let search = semantic.partition_point(|s| s.1 <= lex_start);
+		let mut overwritten = false;
+		for sem in &semantic[search..] {
+			if sem.0 >= lex_end {
+				break;
+			}
+			// Semantic span overlaps this lexical span — replace it.
+			overwritten = true;
+			break;
+		}
+		if !overwritten {
+			merged.push((lex_start, lex_end, lex_cat));
+		}
+	}
+
+	// Append all semantic spans (they are authoritative where they exist).
+	merged.extend_from_slice(semantic);
+
+	// Sort by start byte for the projector's binary search.
+	merged.sort_unstable_by_key(|s| s.0);
+	merged
 }

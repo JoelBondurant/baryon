@@ -20,14 +20,14 @@ pub struct SemanticReactor {
 }
 
 impl SemanticReactor {
-	pub fn new() -> Self {
+	pub fn new(tx_cmd: mpsc::Sender<crate::engine::EditorCommand>) -> Self {
 		let (tx_in, rx_worker) = mpsc::channel::<(String, u64)>();
 		let (tx_worker, rx_out) = mpsc::channel::<Vec<(u64, u64, TokenCategory)>>();
 
 		let handle = thread::Builder::new()
 			.name("semantic-reactor".into())
 			.spawn(move || {
-				Self::run_event_loop(rx_worker, tx_worker);
+				Self::run_event_loop(rx_worker, tx_worker, tx_cmd);
 			})
 			.expect("failed to spawn semantic reactor thread");
 
@@ -51,12 +51,20 @@ impl SemanticReactor {
 	fn run_event_loop(
 		rx: mpsc::Receiver<(String, u64)>,
 		tx: mpsc::Sender<Vec<(u64, u64, TokenCategory)>>,
+		tx_cmd: mpsc::Sender<crate::engine::EditorCommand>,
 	) {
 		let file_id = FileId::from_raw(0);
 		let mut host = Self::init_host(file_id, "");
 
-		while let Ok((text, global_offset)) = rx.recv() {
-			// Apply the new file content.
+		while let Ok(first) = rx.recv() {
+			// Drain: collapse all pending messages, keep only the freshest.
+			let (mut text, mut global_offset) = first;
+			while let Ok((newer_text, newer_offset)) = rx.try_recv() {
+				text = newer_text;
+				global_offset = newer_offset;
+			}
+
+			// Apply only the latest file content to the AnalysisHost.
 			let mut change = ChangeWithProcMacros::default();
 			change.change_file(file_id, Some(text));
 			host.apply_change(change);
@@ -93,6 +101,7 @@ impl SemanticReactor {
 						})
 						.collect();
 					let _ = tx.send(mapped);
+					let _ = tx_cmd.send(crate::engine::EditorCommand::InternalRefresh);
 				}
 				Err(_cancelled) => {
 					// Salsa cancelled the query because the database was mutated
