@@ -30,6 +30,13 @@ impl HighlightProjector {
 			TokenCategory::Number => Some(Color::Yellow),
 			TokenCategory::Function => Some(Color::Blue),
 			TokenCategory::Type => Some(Color::Cyan),
+			TokenCategory::Variable => Some(Color::White),
+			TokenCategory::Constant => Some(Color::Yellow),
+			TokenCategory::Macro => Some(Color::LightMagenta),
+			TokenCategory::Module => Some(Color::LightCyan),
+			TokenCategory::Lifetime => Some(Color::LightRed),
+			TokenCategory::Attribute => Some(Color::DarkGray),
+			TokenCategory::Operator => None,
 			TokenCategory::Punctuation => None,
 			TokenCategory::Unclassified => None,
 		}

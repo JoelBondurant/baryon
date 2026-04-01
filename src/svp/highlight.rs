@@ -11,6 +11,13 @@ pub enum TokenCategory {
 	Function,
 	Number,
 	Punctuation,
+	Variable,
+	Constant,
+	Macro,
+	Module,
+	Lifetime,
+	Attribute,
+	Operator,
 	Unclassified,
 }
 

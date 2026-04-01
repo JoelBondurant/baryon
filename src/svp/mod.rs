@@ -6,6 +6,7 @@ pub mod pipeline;
 pub mod pointer;
 pub mod projector;
 pub mod resolver;
+pub mod semantic;
 pub mod sync;
 
 #[cfg(test)]
