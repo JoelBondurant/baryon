@@ -28,6 +28,7 @@ pub struct Viewport {
 	pub mode_override: Option<crate::engine::EditorMode>,
 	pub global_start_byte: u64,
 	pub highlights: Vec<(u64, u64, crate::svp::highlight::TokenCategory)>,
+	pub yank_flash: Option<(u64, u64)>,
 }
 
 pub trait UastProjection {

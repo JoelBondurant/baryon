@@ -16,19 +16,19 @@ use rustc_hash::FxHashMap;
 
 use crate::svp::highlight::TokenCategory;
 
-/// Payload: (file_text, global_byte_offset, absolute_file_path).
-type SemanticPayload = (String, u64, String);
+/// Payload: (file_text, global_byte_offset, absolute_file_path, state_id).
+type SemanticPayload = (String, u64, String, u64);
 
 pub struct SemanticReactor {
 	tx_in: mpsc::Sender<SemanticPayload>,
-	rx_out: mpsc::Receiver<Vec<(u64, u64, TokenCategory)>>,
+	rx_out: mpsc::Receiver<(u64, Vec<(u64, u64, TokenCategory)>)>,
 	_handle: thread::JoinHandle<()>,
 }
 
 impl SemanticReactor {
 	pub fn new(tx_cmd: mpsc::Sender<crate::engine::EditorCommand>) -> Self {
 		let (tx_in, rx_worker) = mpsc::channel::<SemanticPayload>();
-		let (tx_worker, rx_out) = mpsc::channel::<Vec<(u64, u64, TokenCategory)>>();
+		let (tx_worker, rx_out) = mpsc::channel::<(u64, Vec<(u64, u64, TokenCategory)>)>();
 
 		let handle = thread::Builder::new()
 			.name("semantic-reactor".into())
@@ -45,18 +45,18 @@ impl SemanticReactor {
 	}
 
 	/// Push new file content to the reactor. Non-blocking.
-	pub fn send(&self, content: String, global_offset: u64, file_path: String) {
-		let _ = self.tx_in.send((content, global_offset, file_path));
+	pub fn send(&self, content: String, global_offset: u64, file_path: String, state_id: u64) {
+		let _ = self.tx_in.send((content, global_offset, file_path, state_id));
 	}
 
 	/// Try to receive semantic highlights. Non-blocking.
-	pub fn try_recv(&self) -> Option<Vec<(u64, u64, TokenCategory)>> {
+	pub fn try_recv(&self) -> Option<(u64, Vec<(u64, u64, TokenCategory)>)> {
 		self.rx_out.try_recv().ok()
 	}
 
 	fn run_event_loop(
 		rx: mpsc::Receiver<SemanticPayload>,
-		tx: mpsc::Sender<Vec<(u64, u64, TokenCategory)>>,
+		tx: mpsc::Sender<(u64, Vec<(u64, u64, TokenCategory)>)>,
 		tx_cmd: mpsc::Sender<crate::engine::EditorCommand>,
 	) {
 		let mut host: Option<AnalysisHost> = None;
@@ -65,9 +65,9 @@ impl SemanticReactor {
 
 		while let Ok(first) = rx.recv() {
 			// Drain: collapse all pending messages, keep only the freshest.
-			let (mut text, mut global_offset, mut file_path) = first;
+			let (mut text, mut global_offset, mut file_path, mut state_id) = first;
 			while let Ok(newer) = rx.try_recv() {
-				(text, global_offset, file_path) = newer;
+				(text, global_offset, file_path, state_id) = newer;
 			}
 
 			// (Re-)initialize when file changes or on first message.
@@ -117,7 +117,7 @@ impl SemanticReactor {
 							Some((start, end, cat))
 						})
 						.collect();
-					let _ = tx.send(mapped);
+					let _ = tx.send((state_id, mapped));
 					let _ = tx_cmd.send(crate::engine::EditorCommand::InternalRefresh);
 				}
 				Err(_cancelled) => {

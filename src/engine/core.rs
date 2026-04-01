@@ -1,4 +1,5 @@
 use crate::ecs::{NodeId, UastRegistry};
+use crate::engine::clipboard::ClipboardHandle;
 use crate::engine::undo::{TextDelta, UndoLedger, byte_offset_from_line_col, line_col_from_byte_offset};
 use crate::svp::highlight::TokenCategory;
 use crate::svp::semantic::SemanticReactor;
@@ -6,6 +7,7 @@ use crate::svp::{RequestPriority, SvpResolver, ingest_svp_file};
 use crate::uast::{UastMutation, UastProjection, Viewport};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -77,8 +79,11 @@ pub enum EditorCommand {
 		flags: SubstituteFlags,
 	},
 	ConfirmResponse(ConfirmAction),
+	YankLine { register: char },
+	Put { register: char },
 	Undo,
 	Redo,
+	ClearFlash,
 	InternalRefresh,
 	Quit,
 }
@@ -225,6 +230,7 @@ pub struct Engine {
 	registry: Arc<UastRegistry>,
 	resolver: Arc<SvpResolver>,
 	rx_cmd: mpsc::Receiver<EditorCommand>,
+	tx_cmd: mpsc::Sender<EditorCommand>,
 	tx_view: mpsc::Sender<Viewport>,
 	reactor: SemanticReactor,
 }
@@ -237,12 +243,14 @@ impl Engine {
 		tx_cmd: mpsc::Sender<EditorCommand>,
 		tx_view: mpsc::Sender<Viewport>,
 	) -> Self {
+		let reactor = SemanticReactor::new(tx_cmd.clone());
 		Self {
 			registry,
 			resolver,
 			rx_cmd,
+			tx_cmd,
 			tx_view,
-			reactor: SemanticReactor::new(tx_cmd),
+			reactor,
 		}
 	}
 
@@ -250,18 +258,19 @@ impl Engine {
 		let registry = self.registry;
 		let resolver = self.resolver;
 		let rx_cmd = self.rx_cmd;
+		let tx_cmd = self.tx_cmd;
 		let tx_view = self.tx_view;
 		let reactor = self.reactor;
 		let mut semantic_highlights: Vec<(u64, u64, TokenCategory)> = Vec::new();
-		let mut last_semantic_hash: u64 = 0;
+		let mut last_semantic_state: u64 = u64::MAX;
+		let mut last_semantic_len: usize = usize::MAX;
 
 		let mut cursor_abs_line: u32 = 0;
 		let mut cursor_abs_col: u32 = 0;
 		let viewport_lines = 50;
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
-		let mut file_size: u64 = 0;
-		let mut is_dirty = false;
+
 		let mut status_message: Option<String> = None;
 		let mut pending_quit = false;
 		let mut mode_override: Option<EditorMode> = None;
@@ -278,6 +287,15 @@ impl Engine {
 
 		// Undo/Redo ledger
 		let mut ledger = UndoLedger::new();
+
+		// Registers ('"' = unnamed default, '+' = system clipboard)
+		let mut registers: HashMap<char, String> = HashMap::new();
+
+		// OS clipboard handle (lazy, survives display server failures)
+		let mut clipboard = ClipboardHandle::new();
+
+		// Yank flash: absolute byte range that should be gold-highlighted
+		let mut yank_flash: Option<(u64, u64)> = None;
 
 		let mut cursor_node = NodeId(std::num::NonZeroU32::new(1).unwrap());
 		let mut cursor_offset = 0;
@@ -352,15 +370,15 @@ impl Engine {
 							global_byte_offset: global_offset,
 							deleted_text: String::new(),
 							inserted_text: s.to_string(),
+							state_before: 0,
+							state_after: 0,
 						});
-
 						if c == '\n' {
 							cursor_abs_line += 1;
 							cursor_abs_col = 0;
 						} else {
 							cursor_abs_col += 1;
 						}
-						is_dirty = true;
 						needs_render = true;
 					}
 				}
@@ -400,6 +418,8 @@ impl Engine {
 									global_byte_offset: delete_start,
 									deleted_text: deleted_text.clone(),
 									inserted_text: String::new(),
+									state_before: 0,
+									state_after: 0,
 								});
 							}
 
@@ -419,7 +439,6 @@ impl Engine {
 							} else {
 								cursor_abs_col = cursor_abs_col.saturating_sub(1);
 							}
-							is_dirty = true;
 							needs_render = true;
 						}
 					}
@@ -460,8 +479,7 @@ impl Engine {
 						let rid =
 							ingest_svp_file(&resolver, &registry, fsize, device_id, path.clone());
 						file_path = Some(path);
-						file_size = fsize;
-						is_dirty = false;
+
 						root_id = Some(rid);
 						cursor_node = registry
 							.get_first_child(rid)
@@ -497,8 +515,7 @@ impl Engine {
 							*registry.virtual_data[leaf.index()].get() = Some(Vec::new());
 						}
 						file_path = Some(path);
-						file_size = 0;
-						is_dirty = false;
+
 						root_id = Some(rid);
 						cursor_node = leaf;
 						cursor_offset = 0;
@@ -516,8 +533,7 @@ impl Engine {
 									let len = bytes.len();
 									match std::fs::write(path, &bytes) {
 										Ok(_) => {
-											file_size = len as u64;
-											is_dirty = false;
+											ledger.mark_saved();
 											status_message =
 												Some(format!("\"{}\" {}B written", path, len));
 										}
@@ -543,8 +559,7 @@ impl Engine {
 								let len = bytes.len();
 								match std::fs::write(&path, &bytes) {
 									Ok(_) => {
-										file_size = len as u64;
-										is_dirty = false;
+										ledger.mark_saved();
 										status_message =
 											Some(format!("\"{}\" {}B written", path, len));
 										file_path = Some(path);
@@ -567,8 +582,7 @@ impl Engine {
 									let len = bytes.len();
 									match std::fs::write(path, &bytes) {
 										Ok(_) => {
-											file_size = len as u64;
-											is_dirty = false;
+											ledger.mark_saved();
 											status_message =
 												Some(format!("\"{}\" {}B written", path, len));
 											pending_quit = true;
@@ -729,8 +743,7 @@ impl Engine {
 										cursor_node = node;
 										cursor_offset = offset;
 										cursor_abs_col = clamped_col;
-										file_size = new_bytes.len() as u64;
-										is_dirty = true;
+	
 										search_matches.clear();
 										search_match_index = None;
 										search_match_info = None;
@@ -893,8 +906,7 @@ impl Engine {
 									});
 
 									search_matches = new_matches;
-									is_dirty = true;
-									file_size = new_bytes.len() as u64;
+
 
 									if let Some(ni) = next_idx {
 										search_match_index = Some(ni);
@@ -982,8 +994,7 @@ impl Engine {
 									let (new_root, _new_leaf) =
 										create_document_from_bytes(&registry, &new_bytes);
 									root_id = Some(new_root);
-									file_size = new_bytes.len() as u64;
-									is_dirty = true;
+
 									let (node, offset, clamped_col) = registry
 										.find_node_at_line_col(
 											new_root,
@@ -1016,9 +1027,117 @@ impl Engine {
 					}
 					needs_render = true;
 				}
+				EditorCommand::YankLine { register } => {
+					if let Some(rid) = root_id {
+						if let Ok(bytes) = registry.collect_document_bytes(rid) {
+							let global_offset =
+								byte_offset_from_line_col(&bytes, cursor_abs_line, 0);
+							let off = global_offset as usize;
+							// Find the end of the current line (including the \n).
+							let line_end = bytes[off..]
+								.iter()
+								.position(|&b| b == b'\n')
+								.map(|p| off + p + 1)
+								.unwrap_or(bytes.len());
+							let line_text =
+								String::from_utf8_lossy(&bytes[off..line_end]).into_owned();
+
+							// Always store in the unnamed register.
+							registers.insert('"', line_text.clone());
+
+							// If '+' register was requested, also push to OS clipboard.
+							if register == '+' {
+								clipboard.set_text(&line_text);
+							}
+
+							// Yank flash: highlight the yanked line for 200ms.
+							yank_flash = Some((off as u64, line_end as u64));
+							let tx_flash = tx_cmd.clone();
+							std::thread::spawn(move || {
+								std::thread::sleep(std::time::Duration::from_millis(200));
+								let _ = tx_flash.send(EditorCommand::ClearFlash);
+							});
+
+							let line_len = line_end - off;
+							status_message = Some(format!("{} bytes yanked", line_len));
+							needs_render = true;
+						}
+					}
+				}
+				EditorCommand::Put { register } => {
+					if let Some(rid) = root_id {
+						// Resolve the text to paste.
+						let paste_text: Option<String> = if register == '+' {
+							// System clipboard — read from OS, fall back to unnamed register.
+							clipboard.get_text()
+								.or_else(|| registers.get(&'"').cloned())
+						} else {
+							registers.get(&register).cloned()
+								.or_else(|| registers.get(&'"').cloned())
+						};
+
+						if let Some(text) = paste_text {
+							if !text.is_empty() {
+								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+									// Insert after current line (Vim 'p' for line-wise yank).
+									let global_offset = byte_offset_from_line_col(
+										&bytes,
+										cursor_abs_line,
+										0,
+									);
+									let off = global_offset as usize;
+									let line_end = bytes[off..]
+										.iter()
+										.position(|&b| b == b'\n')
+										.map(|p| off + p + 1)
+										.unwrap_or(bytes.len());
+									let insert_offset = line_end as u64;
+
+									// Build new document through delta + ledger.
+									let mut new_bytes =
+										Vec::with_capacity(bytes.len() + text.len());
+									new_bytes.extend_from_slice(&bytes[..line_end]);
+									new_bytes.extend_from_slice(text.as_bytes());
+									new_bytes.extend_from_slice(&bytes[line_end..]);
+
+									let delta = TextDelta {
+										global_byte_offset: insert_offset,
+										deleted_text: String::new(),
+										inserted_text: text,
+										state_before: 0,
+										state_after: 0,
+									};
+									ledger.push(delta);
+
+									let (new_root, _) =
+										create_document_from_bytes(&registry, &new_bytes);
+									root_id = Some(new_root);
+
+
+									// Place cursor on the first line of pasted text.
+									cursor_abs_line += 1;
+									cursor_abs_col = 0;
+									let (node, offset, clamped_col) = registry
+										.find_node_at_line_col(
+											new_root,
+											cursor_abs_line,
+											cursor_abs_col,
+										);
+									cursor_node = node;
+									cursor_offset = offset;
+									cursor_abs_col = clamped_col;
+									needs_render = true;
+								}
+							}
+						} else {
+							status_message = Some("Register empty".to_string());
+							needs_render = true;
+						}
+					}
+				}
 				EditorCommand::Undo => {
 					if let Some(rid) = root_id {
-						if let Some((new_root, new_leaf, cursor_byte)) =
+						if let Some((new_root, new_leaf, cursor_byte, _)) =
 							ledger.undo(&registry, rid)
 						{
 							root_id = Some(new_root);
@@ -1027,14 +1146,12 @@ impl Engine {
 							if let Ok(bytes) = registry.collect_document_bytes(new_root) {
 								let (line, col) = line_col_from_byte_offset(&bytes, cursor_byte);
 								cursor_abs_line = line;
-								file_size = bytes.len() as u64;
 								let (node, offset, clamped_col) =
 									registry.find_node_at_line_col(new_root, line, col);
 								cursor_node = node;
 								cursor_offset = offset;
 								cursor_abs_col = clamped_col;
 							}
-							is_dirty = true;
 							needs_render = true;
 						} else {
 							status_message = Some("Already at oldest change".to_string());
@@ -1044,7 +1161,7 @@ impl Engine {
 				}
 				EditorCommand::Redo => {
 					if let Some(rid) = root_id {
-						if let Some((new_root, new_leaf, cursor_byte)) =
+						if let Some((new_root, new_leaf, cursor_byte, _)) =
 							ledger.redo(&registry, rid)
 						{
 							root_id = Some(new_root);
@@ -1053,20 +1170,22 @@ impl Engine {
 							if let Ok(bytes) = registry.collect_document_bytes(new_root) {
 								let (line, col) = line_col_from_byte_offset(&bytes, cursor_byte);
 								cursor_abs_line = line;
-								file_size = bytes.len() as u64;
 								let (node, offset, clamped_col) =
 									registry.find_node_at_line_col(new_root, line, col);
 								cursor_node = node;
 								cursor_offset = offset;
 								cursor_abs_col = clamped_col;
 							}
-							is_dirty = true;
 							needs_render = true;
 						} else {
 							status_message = Some("Already at newest change".to_string());
 							needs_render = true;
 						}
 					}
+				}
+				EditorCommand::ClearFlash => {
+					yank_flash = None;
+					needs_render = true;
 				}
 				EditorCommand::InternalRefresh => {
 					needs_render = true;
@@ -1122,21 +1241,20 @@ impl Engine {
 								&virtual_buffer,
 							);
 
-							// Feed the semantic reactor: strip DMA null padding,
-							// hash-gate to avoid redundant Salsa mutations on scroll/idle.
-							if file_size < 1_048_576 {
-								let buf_len = virtual_buffer.len().min(file_size as usize);
-								let valid_bytes = &virtual_buffer[..buf_len];
-
-								use std::hash::{Hash, Hasher};
-								let mut hasher = std::collections::hash_map::DefaultHasher::new();
-								valid_bytes.hash(&mut hasher);
-								let hash = hasher.finish();
-
-								if hash != last_semantic_hash {
-									last_semantic_hash = hash;
-									let text = String::from_utf8_lossy(valid_bytes).into_owned();
-									reactor.send(text, v_global_start, path.clone());
+							// Dual-Lock Gate: triggers on user mutation OR silent DMA load.
+							if let Some(rid) = root_id {
+								if let Ok(live_bytes) = registry.collect_document_bytes(rid) {
+									if ledger.current_state_id != last_semantic_state || live_bytes.len() != last_semantic_len {
+										// Skip incomplete 0-byte ghost reads on startup.
+										if !live_bytes.is_empty() && live_bytes.len() < 1_048_576 {
+											let text = String::from_utf8_lossy(&live_bytes).into_owned();
+											reactor.send(text, 0, file_path.clone().unwrap_or_default(), ledger.current_state_id);
+											// Lock only after a successful, non-empty send.
+											last_semantic_state = ledger.current_state_id;
+											last_semantic_len = live_bytes.len();
+											semantic_highlights.clear();
+										}
+									}
 								}
 							}
 						}
@@ -1144,8 +1262,10 @@ impl Engine {
 				}
 
 				// Non-blocking poll: grab latest semantic highlights if ready.
-				if let Some(fresh) = reactor.try_recv() {
-					semantic_highlights = fresh;
+				while let Some((state_id, fresh)) = reactor.try_recv() {
+					if state_id == ledger.current_state_id {
+						semantic_highlights = fresh;
+					}
 				}
 
 				if !semantic_highlights.is_empty() {
@@ -1163,8 +1283,11 @@ impl Engine {
 					status_message: status_message.take(),
 					should_quit: pending_quit,
 					file_name: file_path.clone(),
-					file_size,
-					is_dirty,
+					file_size: root_id
+						.and_then(|rid| registry.collect_document_bytes(rid).ok())
+						.map(|b| b.len() as u64)
+						.unwrap_or(0),
+					is_dirty: ledger.is_dirty(),
 					search_pattern: search_pattern.clone(),
 					search_case_insensitive,
 					search_match_info: search_match_info.clone(),
@@ -1172,6 +1295,7 @@ impl Engine {
 					mode_override: mode_override.take(),
 					global_start_byte,
 					highlights,
+					yank_flash,
 				});
 
 				if pending_quit {

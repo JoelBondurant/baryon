@@ -9,7 +9,7 @@ use crossterm::execute;
 use ratatui::{
 	Terminal,
 	backend::Backend,
-	style::{Color, Modifier, Style},
+	style::{Color, Style},
 };
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -25,6 +25,8 @@ pub struct Frontend<B: Backend + io::Write> {
 	current_mode: EditorMode,
 	command_buffer: String,
 	g_prefix: bool,
+	y_prefix: bool,
+	pending_register: Option<char>,
 	status_message: Option<String>,
 	needs_redraw: bool,
 	search_buffer: String,
@@ -44,6 +46,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 			current_mode: EditorMode::Normal,
 			command_buffer: String::new(),
 			g_prefix: false,
+			y_prefix: false,
+			pending_register: None,
 			status_message: None,
 			needs_redraw: false,
 			search_buffer: String::new(),
@@ -223,11 +227,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 						_ => Style::default().fg(Color::Indexed(253)),
 					};
 
-					let virtual_style = if token.is_virtual {
-						base_style.add_modifier(Modifier::ITALIC).fg(Color::Yellow)
-					} else {
-						base_style
-					};
+					let virtual_style = base_style;
 
 					let text = if token.text.is_empty() {
 						"[DMA PENDING...]"
@@ -264,9 +264,23 @@ impl<B: Backend + io::Write> Frontend<B> {
 						} else {
 							virtual_style
 						};
-						if !in_highlight && !token.is_virtual {
+						// Undo/redo can rebuild the document as virtual nodes that still
+						// carry real bytes, so syntax colors must follow loaded text rather
+						// than the node's storage backing.
+						if !in_highlight && !token.text.is_empty() {
 							if let Some(fg) = projector.style_for_byte(current_global_byte) {
 								style = style.fg(fg);
+							}
+						}
+
+						// Yank flash override: gold highlight over the yanked byte range.
+						if let Some((flash_start, flash_end)) = view.yank_flash {
+							if current_global_byte >= flash_start
+								&& current_global_byte < flash_end
+							{
+								style = Style::default()
+									.bg(Color::Rgb(229, 192, 123))
+									.fg(Color::Black);
 							}
 						}
 
@@ -555,114 +569,161 @@ impl<B: Backend + io::Write> Frontend<B> {
 		Ok(())
 	}
 
+	fn clear_prefixes(&mut self) {
+		self.g_prefix = false;
+		self.y_prefix = false;
+		self.pending_register = None;
+	}
+
 	fn handle_normal_key(
 		&mut self,
 		code: KeyCode,
 		modifiers: event::KeyModifiers,
 		should_quit: &mut bool,
 	) -> bool {
+		// --- Register prefix state machine ---
+		// `"` starts register selection; next char becomes the register name.
+		if self.pending_register == Some('\0') {
+			// We are awaiting the register name character.
+			if let KeyCode::Char(c) = code {
+				self.pending_register = Some(c);
+				// Now awaiting the action (y/p). Don't clear prefixes.
+				return false;
+			} else {
+				self.clear_prefixes();
+				return false;
+			}
+		}
+
+		let register = self.pending_register.unwrap_or('"');
+
 		match code {
 			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
 				let _ = self.tx_cmd.send(EditorCommand::Quit);
 				*should_quit = true;
 				return true;
 			}
+			KeyCode::Char('"') => {
+				// Enter register-pending state. Use '\0' as sentinel for "awaiting name".
+				self.pending_register = Some('\0');
+				return false;
+			}
 			KeyCode::Char(':') => {
 				self.current_mode = EditorMode::Command;
 				self.command_buffer.clear();
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('h') => {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Left));
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('j') => {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Down));
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('k') => {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Up));
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('l') => {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Right));
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('g') => {
 				if self.g_prefix {
 					let _ = self
 						.tx_cmd
 						.send(EditorCommand::MoveCursor(MoveDirection::Top));
-					self.g_prefix = false;
+					self.clear_prefixes();
 				} else {
 					self.g_prefix = true;
+					self.y_prefix = false;
+					self.pending_register = None;
 				}
 			}
 			KeyCode::Char('G') => {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Bottom));
-				self.g_prefix = false;
+				self.clear_prefixes();
+			}
+			KeyCode::Char('y') => {
+				if self.y_prefix {
+					let _ = self
+						.tx_cmd
+						.send(EditorCommand::YankLine { register });
+					self.clear_prefixes();
+				} else {
+					self.y_prefix = true;
+					// Preserve pending_register through the y prefix.
+					self.g_prefix = false;
+				}
+			}
+			KeyCode::Char('p') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::Put { register });
+				self.clear_prefixes();
 			}
 			KeyCode::Char('u') => {
 				let _ = self.tx_cmd.send(EditorCommand::Undo);
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('r') if modifiers.contains(event::KeyModifiers::CONTROL) => {
 				let _ = self.tx_cmd.send(EditorCommand::Redo);
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('i') => {
 				self.current_mode = EditorMode::Insert;
-				self.g_prefix = false;
+				self.clear_prefixes();
 				self.apply_cursor_style();
 			}
 			KeyCode::Char('/') => {
 				self.current_mode = EditorMode::Search;
 				self.search_buffer.clear();
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('n') => {
 				let _ = self.tx_cmd.send(EditorCommand::SearchNext);
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Char('N') => {
 				let _ = self.tx_cmd.send(EditorCommand::SearchPrev);
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Backspace | KeyCode::Delete => {
 				let _ = self.tx_cmd.send(EditorCommand::Backspace);
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Up => {
 				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Up));
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Down => {
 				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Down));
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Left => {
 				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Left));
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Right => {
 				let _ = self.tx_cmd.send(EditorCommand::MoveCursor(MoveDirection::Right));
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			KeyCode::Esc => {
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 			_ => {
-				self.g_prefix = false;
+				self.clear_prefixes();
 			}
 		}
 		false
