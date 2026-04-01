@@ -18,6 +18,7 @@ pub enum TokenCategory {
 	Lifetime,
 	Attribute,
 	Operator,
+	SelfKeyword,
 	Unclassified,
 }
 

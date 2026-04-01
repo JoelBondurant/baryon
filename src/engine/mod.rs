@@ -986,7 +986,7 @@ impl Engine {
 								if hash != last_semantic_hash {
 									last_semantic_hash = hash;
 									let text = String::from_utf8_lossy(valid_bytes).into_owned();
-									reactor.send(text, v_global_start);
+									reactor.send(text, v_global_start, path.clone());
 								}
 							}
 						}

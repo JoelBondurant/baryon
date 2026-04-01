@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
@@ -7,21 +8,26 @@ use ra_ap_base_db::{CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Env, Sou
 use ra_ap_cfg::CfgOptions;
 use ra_ap_ide::{AnalysisHost, HighlightConfig, HlTag, SymbolKind};
 use ra_ap_ide_db::{ChangeWithProcMacros, MiniCore};
-use ra_ap_paths::AbsPathBuf;
+use ra_ap_paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
+use ra_ap_project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSource};
 use ra_ap_syntax::Edition;
-use ra_ap_vfs::{FileId, VfsPath, file_set::FileSet};
+use ra_ap_vfs::{FileId, Vfs, VfsPath, file_set::FileSet};
+use rustc_hash::FxHashMap;
 
 use crate::svp::highlight::TokenCategory;
 
+/// Payload: (file_text, global_byte_offset, absolute_file_path).
+type SemanticPayload = (String, u64, String);
+
 pub struct SemanticReactor {
-	tx_in: mpsc::Sender<(String, u64)>,
+	tx_in: mpsc::Sender<SemanticPayload>,
 	rx_out: mpsc::Receiver<Vec<(u64, u64, TokenCategory)>>,
 	_handle: thread::JoinHandle<()>,
 }
 
 impl SemanticReactor {
 	pub fn new(tx_cmd: mpsc::Sender<crate::engine::EditorCommand>) -> Self {
-		let (tx_in, rx_worker) = mpsc::channel::<(String, u64)>();
+		let (tx_in, rx_worker) = mpsc::channel::<SemanticPayload>();
 		let (tx_worker, rx_out) = mpsc::channel::<Vec<(u64, u64, TokenCategory)>>();
 
 		let handle = thread::Builder::new()
@@ -39,8 +45,8 @@ impl SemanticReactor {
 	}
 
 	/// Push new file content to the reactor. Non-blocking.
-	pub fn send(&self, content: String, global_offset: u64) {
-		let _ = self.tx_in.send((content, global_offset));
+	pub fn send(&self, content: String, global_offset: u64, file_path: String) {
+		let _ = self.tx_in.send((content, global_offset, file_path));
 	}
 
 	/// Try to receive semantic highlights. Non-blocking.
@@ -49,27 +55,38 @@ impl SemanticReactor {
 	}
 
 	fn run_event_loop(
-		rx: mpsc::Receiver<(String, u64)>,
+		rx: mpsc::Receiver<SemanticPayload>,
 		tx: mpsc::Sender<Vec<(u64, u64, TokenCategory)>>,
 		tx_cmd: mpsc::Sender<crate::engine::EditorCommand>,
 	) {
-		let file_id = FileId::from_raw(0);
-		let mut host = Self::init_host(file_id, "");
+		let mut host: Option<AnalysisHost> = None;
+		let mut active_file_id = FileId::from_raw(0);
+		let mut current_file_path = String::new();
 
 		while let Ok(first) = rx.recv() {
 			// Drain: collapse all pending messages, keep only the freshest.
-			let (mut text, mut global_offset) = first;
-			while let Ok((newer_text, newer_offset)) = rx.try_recv() {
-				text = newer_text;
-				global_offset = newer_offset;
+			let (mut text, mut global_offset, mut file_path) = first;
+			while let Ok(newer) = rx.try_recv() {
+				(text, global_offset, file_path) = newer;
 			}
 
-			// Apply only the latest file content to the AnalysisHost.
-			let mut change = ChangeWithProcMacros::default();
-			change.change_file(file_id, Some(text));
-			host.apply_change(change);
+			// (Re-)initialize when file changes or on first message.
+			if host.is_none() || file_path != current_file_path {
+				let (h, fid) = init_workspace(&file_path)
+					.unwrap_or_else(|| init_single_file(&text));
+				host = Some(h);
+				active_file_id = fid;
+				current_file_path = file_path;
+			}
 
-			let analysis = host.analysis();
+			let h = host.as_mut().unwrap();
+
+			// Apply the latest editor text.
+			let mut change = ChangeWithProcMacros::default();
+			change.change_file(active_file_id, Some(text));
+			h.apply_change(change);
+
+			let analysis = h.analysis();
 
 			let config = HighlightConfig {
 				strings: true,
@@ -84,7 +101,7 @@ impl SemanticReactor {
 				minicore: MiniCore::default(),
 			};
 
-			match analysis.highlight(config, file_id) {
+			match analysis.highlight(config, active_file_id) {
 				Ok(highlights) => {
 					let mapped = highlights
 						.into_iter()
@@ -104,60 +121,137 @@ impl SemanticReactor {
 					let _ = tx_cmd.send(crate::engine::EditorCommand::InternalRefresh);
 				}
 				Err(_cancelled) => {
-					// Salsa cancelled the query because the database was mutated
-					// mid-analysis. This is expected; we'll pick up the next payload.
+					// Salsa cancelled — will pick up next payload.
 				}
 			}
 		}
 	}
+}
 
-	fn init_host(file_id: FileId, initial_text: &str) -> AnalysisHost {
-		let mut host = AnalysisHost::new(None);
+/// Load a full Cargo workspace so rust-analyzer can resolve std, deps, etc.
+/// Blocks for 1-3s on first call (runs `cargo metadata`).
+fn init_workspace(file_path: &str) -> Option<(AnalysisHost, FileId)> {
+	let canonical = PathBuf::from(file_path).canonicalize().ok()?;
+	let utf8 = Utf8PathBuf::try_from(canonical).ok()?;
+	let abs_file = AbsPathBuf::assert(utf8);
 
-		// Build a FileSet containing our single file.
-		let mut file_set = FileSet::default();
-		file_set.insert(
-			file_id,
-			VfsPath::new_virtual_path("/baryon/active.rs".into()),
-		);
-		let source_root = SourceRoot::new_local(file_set);
+	// Discover the nearest Cargo.toml.
+	let manifest = ProjectManifest::discover_single(abs_file.parent()?).ok()?;
 
-		// Build a minimal CrateGraph with one crate.
-		let mut crate_graph = CrateGraphBuilder::default();
+	// Load workspace with sysroot for std/core resolution.
+	let cargo_config = CargoConfig {
+		sysroot: Some(RustLibSource::Discover),
+		..CargoConfig::default()
+	};
+	let ws = ProjectWorkspace::load(manifest, &cargo_config, &|_| {}).ok()?;
 
-		let proc_macro_cwd = Arc::new(AbsPathBuf::assert("/tmp".into()));
-		let ws_data = Arc::new(CrateWorkspaceData {
-			target: Err("not loaded".into()),
-			toolchain: None,
-		});
+	// Build the crate graph. The file loader reads each source file into the VFS.
+	let mut vfs = Vfs::default();
+	let extra_env: FxHashMap<String, Option<String>> = FxHashMap::default();
 
-		crate_graph.add_crate_root(
-			file_id,
-			Edition::Edition2024,
-			None,                // display_name
-			None,                // version
-			CfgOptions::default(),
-			None,                // potential_cfg_options
-			Env::default(),
-			CrateOrigin::Local {
-				repo: None,
-				name: None,
-			},
-			Vec::new(),          // crate_attrs
-			false,               // is_proc_macro
-			proc_macro_cwd,
-			ws_data,
-		);
+	let (crate_graph, _proc_macros) = ws.to_crate_graph(
+		&mut |path: &AbsPath| {
+			let contents = std::fs::read(path).ok();
+			let vfs_path = VfsPath::from(path.to_path_buf());
+			vfs.set_file_contents(vfs_path.clone(), contents);
+			vfs.file_id(&vfs_path).and_then(|(fid, exc)| {
+				(exc == ra_ap_vfs::FileExcluded::No).then_some(fid)
+			})
+		},
+		&extra_env,
+	);
 
-		// Assemble the initial change.
-		let mut change = ChangeWithProcMacros::default();
-		change.set_roots(vec![source_root]);
-		change.set_crate_graph(crate_graph);
-		change.change_file(file_id, Some(initial_text.to_owned()));
-		host.apply_change(change);
+	// Determine the project root directory for source root partitioning.
+	let project_root = abs_file.parent()?.to_path_buf();
 
-		host
+	// Build source roots: local (project files) vs library (sysroot/deps).
+	let mut local_file_set = FileSet::default();
+	let mut lib_file_set = FileSet::default();
+
+	for (fid, vfs_path) in vfs.iter() {
+		let is_local = vfs_path
+			.as_path()
+			.map(|p| p.starts_with(&project_root))
+			.unwrap_or(false);
+		if is_local {
+			local_file_set.insert(fid, vfs_path.clone());
+		} else {
+			lib_file_set.insert(fid, vfs_path.clone());
+		}
 	}
+
+	let mut roots = Vec::new();
+	roots.push(SourceRoot::new_local(local_file_set));
+	roots.push(SourceRoot::new_library(lib_file_set));
+
+	// Drain VFS changes into the initial ChangeWithProcMacros.
+	let mut change = ChangeWithProcMacros::default();
+	for (_, changed) in vfs.take_changes() {
+		match changed.change {
+			ra_ap_vfs::Change::Create(contents, _)
+			| ra_ap_vfs::Change::Modify(contents, _) => {
+				if let Ok(text) = String::from_utf8(contents) {
+					change.change_file(changed.file_id, Some(text));
+				}
+			}
+			ra_ap_vfs::Change::Delete => {}
+		}
+	}
+
+	change.set_roots(roots);
+	change.set_crate_graph(crate_graph);
+
+	let mut host = AnalysisHost::new(None);
+	host.apply_change(change);
+
+	// Resolve the active file's FileId.
+	let vfs_path = VfsPath::from(abs_file);
+	let (file_id, _) = vfs.file_id(&vfs_path)?;
+
+	Some((host, file_id))
+}
+
+/// Fallback: single-file universe with no dependency resolution.
+fn init_single_file(initial_text: &str) -> (AnalysisHost, FileId) {
+	let file_id = FileId::from_raw(0);
+	let mut host = AnalysisHost::new(None);
+
+	let mut file_set = FileSet::default();
+	file_set.insert(
+		file_id,
+		VfsPath::new_virtual_path("/baryon/active.rs".into()),
+	);
+	let source_root = SourceRoot::new_local(file_set);
+
+	let mut crate_graph = CrateGraphBuilder::default();
+	let proc_macro_cwd = Arc::new(AbsPathBuf::assert("/tmp".into()));
+	let ws_data = Arc::new(CrateWorkspaceData {
+		target: Err("not loaded".into()),
+		toolchain: None,
+	});
+
+	crate_graph.add_crate_root(
+		file_id,
+		Edition::Edition2024,
+		None,
+		None,
+		CfgOptions::default(),
+		None,
+		Env::default(),
+		CrateOrigin::Local { repo: None, name: None },
+		Vec::new(),
+		false,
+		proc_macro_cwd,
+		ws_data,
+	);
+
+	let mut change = ChangeWithProcMacros::default();
+	change.set_roots(vec![source_root]);
+	change.set_crate_graph(crate_graph);
+	change.change_file(file_id, Some(initial_text.to_owned()));
+	host.apply_change(change);
+
+	(host, file_id)
 }
 
 fn map_hl_tag(tag: HlTag) -> TokenCategory {
@@ -169,11 +263,13 @@ fn map_hl_tag(tag: HlTag) -> TokenCategory {
 			| SymbolKind::Union
 			| SymbolKind::TypeAlias
 			| SymbolKind::TypeParam
-			| SymbolKind::Trait
-			| SymbolKind::SelfType,
+			| SymbolKind::Trait,
 		) => TokenCategory::Type,
+		HlTag::Symbol(SymbolKind::SelfParam | SymbolKind::SelfType) => {
+			TokenCategory::SelfKeyword
+		}
 		HlTag::Symbol(
-			SymbolKind::Local | SymbolKind::SelfParam | SymbolKind::ValueParam | SymbolKind::Field,
+			SymbolKind::Local | SymbolKind::ValueParam | SymbolKind::Field,
 		) => TokenCategory::Variable,
 		HlTag::Symbol(SymbolKind::Const | SymbolKind::Static | SymbolKind::ConstParam) => {
 			TokenCategory::Constant

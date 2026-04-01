@@ -24,21 +24,20 @@ impl HighlightProjector {
 
 	fn color_for_category(category: TokenCategory) -> Option<Color> {
 		match category {
-			TokenCategory::Keyword => Some(Color::Magenta),
-			TokenCategory::String => Some(Color::Green),
-			TokenCategory::Comment => Some(Color::DarkGray),
-			TokenCategory::Number => Some(Color::Yellow),
-			TokenCategory::Function => Some(Color::Blue),
-			TokenCategory::Type => Some(Color::Cyan),
-			TokenCategory::Variable => Some(Color::White),
-			TokenCategory::Constant => Some(Color::Yellow),
-			TokenCategory::Macro => Some(Color::LightMagenta),
-			TokenCategory::Module => Some(Color::LightCyan),
-			TokenCategory::Lifetime => Some(Color::LightRed),
-			TokenCategory::Attribute => Some(Color::DarkGray),
-			TokenCategory::Operator => None,
-			TokenCategory::Punctuation => None,
-			TokenCategory::Unclassified => None,
+			TokenCategory::Keyword => Some(Color::Rgb(198, 120, 221)),
+			TokenCategory::String => Some(Color::Rgb(152, 195, 121)),
+			TokenCategory::Comment => Some(Color::Rgb(92, 99, 112)),
+			TokenCategory::Number => Some(Color::Rgb(209, 154, 102)),
+			TokenCategory::Function => Some(Color::Rgb(97, 175, 239)),
+			TokenCategory::Type => Some(Color::Rgb(229, 192, 123)),
+			TokenCategory::Variable => Some(Color::Rgb(224, 108, 117)),
+			TokenCategory::Constant => Some(Color::Rgb(209, 154, 102)),
+			TokenCategory::Macro => Some(Color::Rgb(86, 182, 194)),
+			TokenCategory::Module => Some(Color::Rgb(97, 175, 239)),
+			TokenCategory::Lifetime => Some(Color::Rgb(198, 120, 221)),
+			TokenCategory::Attribute => Some(Color::Rgb(171, 178, 191)),
+			TokenCategory::SelfKeyword => Some(Color::Rgb(224, 108, 117)),
+			TokenCategory::Operator | TokenCategory::Punctuation | TokenCategory::Unclassified => None,
 		}
 	}
 }
