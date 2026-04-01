@@ -1,4 +1,4 @@
-use crate::core::TAB_SIZE;
+use crate::core::{CursorPosition, DocLine, TAB_SIZE, VisualCol};
 use crate::engine::{
 	ConfirmAction, EditorCommand, EditorMode, MoveDirection, SubstituteFlags, SubstituteRange,
 };
@@ -771,9 +771,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 						expanded.to_string_lossy().to_string(),
 					));
 				} else if let Ok(line_num) = self.command_buffer.parse::<u32>() {
-					let _ = self
-						.tx_cmd
-						.send(EditorCommand::GotoLine(line_num.saturating_sub(1)));
+					let _ = self.tx_cmd.send(EditorCommand::GotoLine(DocLine::new(
+						line_num.saturating_sub(1),
+					)));
 				} else if self.command_buffer == "q" {
 					let _ = self.tx_cmd.send(EditorCommand::Quit);
 					*should_quit = true;
@@ -782,8 +782,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let cursor_line = self
 						.current_viewport
 						.as_ref()
-						.map(|v| v.cursor_abs_pos.line.get())
-						.unwrap_or(0);
+						.map(|v| v.cursor_abs_pos.line)
+						.unwrap_or(DocLine::ZERO);
 					if let Some((pattern, replacement, flags, range)) =
 						parse_substitute(&self.command_buffer, cursor_line)
 					{
@@ -987,7 +987,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 				let _ = self
 					.tx_cmd
-					.send(EditorCommand::ClickCursor(abs_line, target_visual_col));
+					.send(EditorCommand::ClickCursor(CursorPosition::new(
+						DocLine::new(abs_line),
+						VisualCol::new(target_visual_col),
+					)));
 				self.needs_redraw = true;
 			}
 			_ => {}
@@ -1011,7 +1014,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 fn parse_substitute(
 	cmd: &str,
-	cursor_line: u32,
+	cursor_line: DocLine,
 ) -> Option<(String, String, SubstituteFlags, SubstituteRange)> {
 	// Find "s/" to split range from pattern
 	let s_pos = cmd.find("s/")?;
@@ -1029,9 +1032,9 @@ fn parse_substitute(
 	} else if let Some((a_str, b_str)) = range_str.split_once(',') {
 		let a: u32 = a_str.parse::<u32>().ok()?.saturating_sub(1);
 		let b: u32 = b_str.parse::<u32>().ok()?.saturating_sub(1);
-		SubstituteRange::LineRange(a, b)
+		SubstituteRange::LineRange(DocLine::new(a), DocLine::new(b))
 	} else if let Ok(n) = range_str.parse::<u32>() {
-		SubstituteRange::SingleLine(n.saturating_sub(1))
+		SubstituteRange::SingleLine(DocLine::new(n.saturating_sub(1)))
 	} else {
 		return None;
 	};

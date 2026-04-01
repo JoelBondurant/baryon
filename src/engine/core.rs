@@ -44,8 +44,8 @@ pub enum MoveDirection {
 pub enum SubstituteRange {
 	WholeFile,
 	CurrentLine,
-	SingleLine(u32),
-	LineRange(u32, u32),
+	SingleLine(DocLine),
+	LineRange(DocLine, DocLine),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -60,8 +60,8 @@ pub enum EditorCommand {
 	Backspace,
 	Scroll(i32),
 	MoveCursor(MoveDirection),
-	ClickCursor(u32, u32),
-	GotoLine(u32),
+	ClickCursor(CursorPosition),
+	GotoLine(DocLine),
 	LoadFile(String),
 	WriteFile,
 	WriteFileAs(String),
@@ -103,6 +103,13 @@ struct ConfirmState {
 	range: SubstituteRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchMatch {
+	line: DocLine,
+	col: VisualCol,
+	byte_len: usize,
+}
+
 fn advance_col(b: u8, line: &mut DocLine, col: &mut VisualCol) {
 	if b == b'\n' {
 		*line += 1;
@@ -114,10 +121,10 @@ fn advance_col(b: u8, line: &mut DocLine, col: &mut VisualCol) {
 	}
 }
 
-fn line_byte_range(doc: &[u8], start_line: u32, end_line: u32) -> (usize, usize) {
-	let mut current_line = 0u32;
+fn line_byte_range(doc: &[u8], start_line: DocLine, end_line: DocLine) -> (usize, usize) {
+	let mut current_line = DocLine::ZERO;
 	let mut byte_start = 0usize;
-	let mut found_start = start_line == 0;
+	let mut found_start = start_line == DocLine::ZERO;
 
 	for (i, &b) in doc.iter().enumerate() {
 		if b == b'\n' {
@@ -144,9 +151,7 @@ fn resolve_byte_range(
 ) -> Option<(usize, usize)> {
 	match range {
 		SubstituteRange::WholeFile => None,
-		SubstituteRange::CurrentLine => {
-			Some(line_byte_range(doc, cursor_line.get(), cursor_line.get()))
-		}
+		SubstituteRange::CurrentLine => Some(line_byte_range(doc, cursor_line, cursor_line)),
 		SubstituteRange::SingleLine(n) => Some(line_byte_range(doc, *n, *n)),
 		SubstituteRange::LineRange(a, b) => Some(line_byte_range(doc, *a, *b)),
 	}
@@ -159,8 +164,7 @@ fn build_regex(pattern: &str, case_insensitive: bool) -> Result<Regex, String> {
 		.map_err(|e| format!("Invalid regex: {}", e))
 }
 
-/// Returns Vec of (line, col, match_byte_len) for each match.
-fn find_all_matches(doc_bytes: &[u8], re: &Regex) -> Vec<(DocLine, VisualCol, usize)> {
+fn find_all_matches(doc_bytes: &[u8], re: &Regex) -> Vec<SearchMatch> {
 	let mut matches = Vec::new();
 	let mut line = DocLine::ZERO;
 	let mut col = VisualCol::ZERO;
@@ -171,7 +175,11 @@ fn find_all_matches(doc_bytes: &[u8], re: &Regex) -> Vec<(DocLine, VisualCol, us
 			advance_col(b, &mut line, &mut col);
 		}
 		let match_len = m.end() - m.start();
-		matches.push((line, col, match_len));
+		matches.push(SearchMatch {
+			line,
+			col,
+			byte_len: match_len,
+		});
 		for &b in &doc_bytes[m.start()..m.end()] {
 			advance_col(b, &mut line, &mut col);
 		}
@@ -475,7 +483,7 @@ impl Engine {
 		// Search state
 		let mut search_pattern: Option<String> = None;
 		let mut search_case_insensitive = false;
-		let mut search_matches: Vec<(DocLine, VisualCol, usize)> = Vec::new();
+		let mut search_matches: Vec<SearchMatch> = Vec::new();
 		let mut search_match_index: Option<usize> = None;
 		let mut search_match_info: Option<String> = None;
 
@@ -540,7 +548,7 @@ impl Engine {
 				EditorCommand::GotoLine(target) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						cursor_abs_line = DocLine::new(target.min(total));
+						cursor_abs_line = DocLine::new(target.get().min(total));
 						cursor_abs_col = VisualCol::ZERO;
 						let target =
 							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
@@ -674,11 +682,11 @@ impl Engine {
 					}
 					needs_render = true;
 				}
-				EditorCommand::ClickCursor(line, col) => {
+				EditorCommand::ClickCursor(target_pos) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						cursor_abs_line = DocLine::new(line.min(total));
-						cursor_abs_col = VisualCol::new(col);
+						cursor_abs_line = DocLine::new(target_pos.line.get().min(total));
+						cursor_abs_col = target_pos.col;
 						let target =
 							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
 						apply_cursor_target(
@@ -848,22 +856,27 @@ impl Engine {
 										let count = matches.len();
 										let idx = matches
 											.iter()
-											.position(|&(l, c, _)| {
-												l > cursor_abs_line
-													|| (l == cursor_abs_line && c >= cursor_abs_col)
+											.position(|m| {
+												m.line > cursor_abs_line
+													|| (m.line == cursor_abs_line
+														&& m.col >= cursor_abs_col)
 											})
 											.unwrap_or(0);
 										search_match_index = Some(idx);
-										let (ml, mc, _) = matches[idx];
-										cursor_abs_line = ml;
-										let target = registry.find_node_at_line_col(rid, ml, mc);
+										let current_match = matches[idx];
+										cursor_abs_line = current_match.line;
+										let target = registry.find_node_at_line_col(
+											rid,
+											current_match.line,
+											current_match.col,
+										);
 										apply_cursor_target(
 											target,
 											&mut cursor_node,
 											&mut cursor_offset,
 											&mut cursor_abs_col,
 										);
-										cursor_abs_col = mc;
+										cursor_abs_col = current_match.col;
 										search_pattern = Some(pattern);
 										search_case_insensitive = false;
 										search_matches = matches;
@@ -900,16 +913,20 @@ impl Engine {
 							let wrapped =
 								search_match_index.is_some_and(|i| i + 1 >= search_matches.len());
 							search_match_index = Some(idx);
-							let (ml, mc, _) = search_matches[idx];
-							cursor_abs_line = ml;
-							let target = registry.find_node_at_line_col(rid, ml, mc);
+							let current_match = search_matches[idx];
+							cursor_abs_line = current_match.line;
+							let target = registry.find_node_at_line_col(
+								rid,
+								current_match.line,
+								current_match.col,
+							);
 							apply_cursor_target(
 								target,
 								&mut cursor_node,
 								&mut cursor_offset,
 								&mut cursor_abs_col,
 							);
-							cursor_abs_col = mc;
+							cursor_abs_col = current_match.col;
 							let info = format!("[{}/{}]", idx + 1, search_matches.len());
 							search_match_info = Some(if wrapped {
 								format!("{} (wrapped)", info)
@@ -931,16 +948,20 @@ impl Engine {
 							};
 							let wrapped = search_match_index.is_some_and(|i| i == 0);
 							search_match_index = Some(idx);
-							let (ml, mc, _) = search_matches[idx];
-							cursor_abs_line = ml;
-							let target = registry.find_node_at_line_col(rid, ml, mc);
+							let current_match = search_matches[idx];
+							cursor_abs_line = current_match.line;
+							let target = registry.find_node_at_line_col(
+								rid,
+								current_match.line,
+								current_match.col,
+							);
 							apply_cursor_target(
 								target,
 								&mut cursor_node,
 								&mut cursor_offset,
 								&mut cursor_abs_col,
 							);
-							cursor_abs_col = mc;
+							cursor_abs_col = current_match.col;
 							let info = format!("[{}/{}]", idx + 1, search_matches.len());
 							search_match_info = Some(if wrapped {
 								format!("{} (wrapped)", info)
@@ -1025,26 +1046,24 @@ impl Engine {
 							Ok(re) => match registry.collect_document_bytes(rid) {
 								Ok(bytes) => {
 									let all_matches = find_all_matches(&bytes, &re);
-									let matches: Vec<(DocLine, VisualCol, usize)> = match &range {
+									let matches: Vec<SearchMatch> = match &range {
 										SubstituteRange::WholeFile => all_matches,
 										SubstituteRange::CurrentLine => all_matches
 											.into_iter()
-											.filter(|&(l, _, _)| l == cursor_abs_line)
+											.filter(|m| m.line == cursor_abs_line)
 											.collect(),
 										SubstituteRange::SingleLine(n) => {
 											let n = *n;
 											all_matches
 												.into_iter()
-												.filter(move |&(l, _, _)| l.get() == n)
+												.filter(move |m| m.line == n)
 												.collect()
 										}
 										SubstituteRange::LineRange(a, b) => {
 											let (a, b) = (*a, *b);
 											all_matches
 												.into_iter()
-												.filter(move |&(l, _, _)| {
-													l.get() >= a && l.get() <= b
-												})
+												.filter(move |m| m.line >= a && m.line <= b)
 												.collect()
 										}
 									};
@@ -1063,16 +1082,20 @@ impl Engine {
 											flags,
 											range,
 										});
-										let (ml, mc, _) = search_matches[0];
-										cursor_abs_line = ml;
-										let target = registry.find_node_at_line_col(rid, ml, mc);
+										let current_match = search_matches[0];
+										cursor_abs_line = current_match.line;
+										let target = registry.find_node_at_line_col(
+											rid,
+											current_match.line,
+											current_match.col,
+										);
 										apply_cursor_target(
 											target,
 											&mut cursor_node,
 											&mut cursor_offset,
 											&mut cursor_abs_col,
 										);
-										cursor_abs_col = mc;
+										cursor_abs_col = current_match.col;
 										mode_override = Some(EditorMode::Confirm);
 										status_message =
 											Some(format!("Replace? [y/n/a/q] (1/{})", total));
@@ -1097,13 +1120,13 @@ impl Engine {
 								// Replace current match, rebuild doc, re-scan from next position
 								if let Ok(bytes) = registry.collect_document_bytes(rid) {
 									let idx = search_match_index.unwrap_or(0);
-									let (ml, mc, _) = search_matches[idx];
+									let current_match = search_matches[idx];
 									// Find byte offset of this match (mc is visual column)
 									let mut byte_off = 0usize;
 									let mut line = DocLine::ZERO;
 									let mut col = VisualCol::ZERO;
 									for &b in bytes.iter() {
-										if line == ml && col == mc {
+										if line == current_match.line && col == current_match.col {
 											break;
 										}
 										advance_col(b, &mut line, &mut col);
@@ -1113,8 +1136,9 @@ impl Engine {
 									let mut new_bytes = Vec::with_capacity(bytes.len());
 									new_bytes.extend_from_slice(&bytes[..byte_off]);
 									new_bytes.extend_from_slice(rep);
-									let (_, _, match_len) = search_matches[idx];
-									new_bytes.extend_from_slice(&bytes[byte_off + match_len..]);
+									new_bytes.extend_from_slice(
+										&bytes[byte_off + current_match.byte_len..],
+									);
 									cs.replacements_done += 1;
 									push_document_rewrite_delta(
 										&mut ledger,
@@ -1131,61 +1155,62 @@ impl Engine {
 									// Re-scan for remaining matches after replacement point, filtered by range
 									let re = build_regex(&pat, cs.flags.case_insensitive).unwrap();
 									let all_new = find_all_matches(&new_bytes, &re);
-									let new_matches: Vec<(DocLine, VisualCol, usize)> =
-										match &cs.range {
-											SubstituteRange::WholeFile => all_new,
-											SubstituteRange::CurrentLine => all_new
+									let new_matches: Vec<SearchMatch> = match &cs.range {
+										SubstituteRange::WholeFile => all_new,
+										SubstituteRange::CurrentLine => all_new
+											.into_iter()
+											.filter(|m| m.line == current_match.line)
+											.collect(),
+										SubstituteRange::SingleLine(n) => {
+											let n = *n;
+											all_new
 												.into_iter()
-												.filter(|&(l, _, _)| l == ml)
-												.collect(),
-											SubstituteRange::SingleLine(n) => {
-												let n = *n;
-												all_new
-													.into_iter()
-													.filter(move |&(l, _, _)| l.get() == n)
-													.collect()
-											}
-											SubstituteRange::LineRange(a, b) => {
-												let (a, b) = (*a, *b);
-												all_new
-													.into_iter()
-													.filter(move |&(l, _, _)| {
-														l.get() >= a && l.get() <= b
-													})
-													.collect()
-											}
-										};
+												.filter(move |m| m.line == n)
+												.collect()
+										}
+										SubstituteRange::LineRange(a, b) => {
+											let (a, b) = (*a, *b);
+											all_new
+												.into_iter()
+												.filter(move |m| m.line >= a && m.line <= b)
+												.collect()
+										}
+									};
 									// Find next match at or after the replacement point
 									let rep_end_line;
 									let rep_end_col;
 									{
-										let mut l = ml;
-										let mut c = mc;
+										let mut l = current_match.line;
+										let mut c = current_match.col;
 										for &b in rep {
 											advance_col(b, &mut l, &mut c);
 										}
 										rep_end_line = l;
 										rep_end_col = c;
 									}
-									let next_idx = new_matches.iter().position(|&(l, c, _)| {
-										l > rep_end_line || (l == rep_end_line && c >= rep_end_col)
+									let next_idx = new_matches.iter().position(|m| {
+										m.line > rep_end_line
+											|| (m.line == rep_end_line && m.col >= rep_end_col)
 									});
 
 									search_matches = new_matches;
 
 									if let Some(ni) = next_idx {
 										search_match_index = Some(ni);
-										let (ml2, mc2, _) = search_matches[ni];
-										cursor_abs_line = ml2;
-										let target =
-											registry.find_node_at_line_col(new_rid, ml2, mc2);
+										let current_match = search_matches[ni];
+										cursor_abs_line = current_match.line;
+										let target = registry.find_node_at_line_col(
+											new_rid,
+											current_match.line,
+											current_match.col,
+										);
 										apply_cursor_target(
 											target,
 											&mut cursor_node,
 											&mut cursor_offset,
 											&mut cursor_abs_col,
 										);
-										cursor_abs_col = mc2;
+										cursor_abs_col = current_match.col;
 										status_message = Some(format!(
 											"Replace? [y/n/a/q] ({}/{})",
 											cs.replacements_done + 1,
@@ -1216,16 +1241,20 @@ impl Engine {
 								let idx = search_match_index.unwrap_or(0);
 								if idx + 1 < search_matches.len() {
 									search_match_index = Some(idx + 1);
-									let (ml, mc, _) = search_matches[idx + 1];
-									cursor_abs_line = ml;
-									let target = registry.find_node_at_line_col(rid, ml, mc);
+									let current_match = search_matches[idx + 1];
+									cursor_abs_line = current_match.line;
+									let target = registry.find_node_at_line_col(
+										rid,
+										current_match.line,
+										current_match.col,
+									);
 									apply_cursor_target(
 										target,
 										&mut cursor_node,
 										&mut cursor_offset,
 										&mut cursor_abs_col,
 									);
-									cursor_abs_col = mc;
+									cursor_abs_col = current_match.col;
 									status_message = Some(format!(
 										"Replace? [y/n/a/q] ({}/{})",
 										idx + 2,
@@ -1242,12 +1271,12 @@ impl Engine {
 								if let Ok(bytes) = registry.collect_document_bytes(rid) {
 									// Replace all remaining from current position
 									let idx = search_match_index.unwrap_or(0);
-									let (ml, mc, _) = search_matches[idx];
+									let current_match = search_matches[idx];
 									let mut byte_off = 0usize;
 									let mut line = DocLine::ZERO;
 									let mut col = VisualCol::ZERO;
 									for &b in bytes.iter() {
-										if line == ml && col == mc {
+										if line == current_match.line && col == current_match.col {
 											break;
 										}
 										advance_col(b, &mut line, &mut col);
