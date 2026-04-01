@@ -917,11 +917,18 @@ impl Engine {
 			}
 
 			if needs_render {
-				let (tokens, total_lines) = if let Some(rid) = root_id {
+				let (virtual_tokens, tokens, total_lines) = if let Some(rid) = root_id {
 					let scroll_y = cursor_abs_line.saturating_sub(20);
-					let tokens = registry.query_viewport(rid, scroll_y, viewport_lines);
+					
+					// 1. Virtual Query (Look-behind 60 lines, Look-ahead 120 lines total)
+					let virtual_start_line = scroll_y.saturating_sub(60);
+					let virtual_line_count = viewport_lines + 120;
+					let virtual_tokens = registry.query_viewport(rid, virtual_start_line, virtual_line_count);
 
-					for token in &tokens {
+					// 2. Visible Query (The actual UI screen)
+					let visible_tokens = registry.query_viewport(rid, scroll_y, viewport_lines);
+
+					for token in &visible_tokens {
 						if !token.is_virtual && token.text.is_empty() {
 							let idx = token.node_id.index();
 							if !registry.dma_in_flight[idx].swap(true, Ordering::Relaxed) {
@@ -932,9 +939,9 @@ impl Engine {
 						}
 					}
 
-					(tokens, registry.get_total_newlines(rid))
+					(virtual_tokens, visible_tokens, registry.get_total_newlines(rid))
 				} else {
-					(Vec::new(), 0)
+					(Vec::new(), Vec::new(), 0)
 				};
 
 				let confirm_prompt = confirm_state
@@ -944,21 +951,24 @@ impl Engine {
 				let mut global_start_byte = 0;
 				let mut highlights = Vec::new();
 
-				if let Some(first_token) = tokens.first() {
-					global_start_byte = first_token.absolute_start_byte;
-
-					if let Some(path) = &file_path {
-						if path.ends_with(".rs") {
-							let mut viewport_buffer = String::new();
-							for token in &tokens {
-								viewport_buffer.push_str(&token.text);
+				if let Some(path) = &file_path {
+					if path.ends_with(".rs") {
+						if let Some(first_v_token) = virtual_tokens.first() {
+							let v_global_start = first_v_token.absolute_start_byte;
+							let mut virtual_buffer = Vec::new();
+							for token in &virtual_tokens {
+								virtual_buffer.extend_from_slice(token.text.as_bytes());
 							}
 							highlights = crate::svp::pipeline::SvpPipeline::process_viewport(
-								global_start_byte,
-								viewport_buffer.as_bytes(),
+								v_global_start,
+								&virtual_buffer,
 							);
 						}
 					}
+				}
+
+				if let Some(first_visible) = tokens.first() {
+					global_start_byte = first_visible.absolute_start_byte;
 				}
 
 				let _ = tx_view.send(Viewport {

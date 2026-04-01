@@ -22,6 +22,11 @@ fn classify_token(kind: SyntaxKind) -> TokenCategory {
 		| SyntaxKind::IF_KW
 		| SyntaxKind::ELSE_KW
 		| SyntaxKind::MATCH_KW
+		| SyntaxKind::WHILE_KW
+		| SyntaxKind::FOR_KW
+		| SyntaxKind::LOOP_KW
+		| SyntaxKind::BREAK_KW
+		| SyntaxKind::CONTINUE_KW
 		| SyntaxKind::RETURN_KW
 		| SyntaxKind::STRUCT_KW
 		| SyntaxKind::ENUM_KW
@@ -29,7 +34,13 @@ fn classify_token(kind: SyntaxKind) -> TokenCategory {
 		| SyntaxKind::IMPL_KW
 		| SyntaxKind::PUB_KW
 		| SyntaxKind::USE_KW
-		| SyntaxKind::MOD_KW => TokenCategory::Keyword,
+		| SyntaxKind::MOD_KW
+		| SyntaxKind::CONST_KW
+		| SyntaxKind::STATIC_KW
+		| SyntaxKind::TYPE_KW
+		| SyntaxKind::ASYNC_KW
+		| SyntaxKind::AWAIT_KW
+		| SyntaxKind::DYN_KW => TokenCategory::Keyword,
 
 		SyntaxKind::STRING | SyntaxKind::BYTE_STRING => TokenCategory::String,
 
