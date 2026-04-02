@@ -32,8 +32,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 			{
 				let buf = f.buffer_mut();
 				if let Some(view) = current_viewport {
-					let scroll_y = view.cursor_abs_pos.line.saturating_sub(20);
-					let max_line_on_screen = scroll_y.get() + max_height.saturating_sub(1) as u32;
+					let scroll_y = view.scroll_y;
+					let viewport_line_count = view.viewport_line_count.max(1);
+					let render_line_count =
+						viewport_line_count.min(max_height.saturating_sub(1) as u32) as u16;
+					let max_line_on_screen = scroll_y + viewport_line_count.saturating_sub(1);
 					let minimap_width = if view.minimap.is_some() && max_width > 40 {
 						14u16.min(max_width.saturating_sub(24))
 					} else {
@@ -55,13 +58,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 						.bg(Color::Rgb(18, 18, 18))
 						.fg(Color::Indexed(242));
 
-					for gy in 0..(max_height - 1) {
+					for gy in 0..render_line_count {
 						for gx in 0..gutter_width {
 							if let Some(cell) = buf.cell_mut((gx, gy)) {
 								cell.set_char(' ').set_style(gutter_style);
 							}
 						}
-						let line_num = scroll_y.get() + gy as u32 + 1;
+						let line_num = scroll_y + gy as u32 + 1;
 						if line_num <= view.total_lines + 1 {
 							let line_str = line_num.to_string();
 							if line_str.len() < gutter_width as usize {
@@ -243,11 +246,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 						}
 					}
 
-					let visual_cursor_y = view
-						.cursor_abs_pos
-						.line
-						.saturating_sub(scroll_y.get())
-						.get() as u16;
+					let visual_cursor_y =
+						view.cursor_abs_pos.line.saturating_sub(scroll_y).get() as u16;
 					let visual_cursor_x = (view.cursor_abs_pos.col.get() as u16)
 						.checked_add(gutter_width)
 						.unwrap_or(text_right as u16);

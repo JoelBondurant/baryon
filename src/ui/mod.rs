@@ -71,6 +71,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 		self.terminal
 			.clear()
 			.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+		let size = self
+			.terminal
+			.size()
+			.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+		let _ = self
+			.tx_cmd
+			.send(EditorCommand::Resize(size.width, size.height));
 		self.apply_cursor_style();
 		let mut initial_draw = true;
 		loop {
@@ -171,6 +178,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 						}
 						Event::Mouse(mouse) => {
 							self.handle_mouse(mouse);
+						}
+						Event::Resize(w, h) => {
+							let _ = self.tx_cmd.send(EditorCommand::Resize(w, h));
+							self.needs_redraw = true;
 						}
 						_ => {}
 					}

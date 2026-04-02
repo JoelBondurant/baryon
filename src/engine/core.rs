@@ -83,7 +83,9 @@ pub struct SubstituteFlags {
 pub enum EditorCommand {
 	InsertChar(char),
 	Backspace,
+	Resize(u16, u16),
 	Scroll(i32),
+	ScrollViewport(i32),
 	MoveCursor(MoveDirection),
 	ClickCursor(CursorPosition),
 	GotoLine(DocLine),
@@ -417,6 +419,54 @@ fn page_motion_step(viewport_lines: u32) -> u32 {
 	} else {
 		1
 	}
+}
+
+fn max_scroll_y(total_lines: u32, viewport_lines: u32) -> u32 {
+	total_lines.saturating_sub(viewport_lines.max(1).saturating_sub(1))
+}
+
+fn clamp_scroll_y(scroll_y: u32, total_lines: u32, viewport_lines: u32) -> u32 {
+	scroll_y.min(max_scroll_y(total_lines, viewport_lines))
+}
+
+fn viewport_bottom_line(scroll_y: u32, total_lines: u32, viewport_lines: u32) -> u32 {
+	clamp_scroll_y(scroll_y, total_lines, viewport_lines)
+		.saturating_add(viewport_lines.max(1).saturating_sub(1))
+		.min(total_lines)
+}
+
+fn pan_scroll_y_to_keep_cursor_visible(
+	scroll_y: u32,
+	cursor_line: DocLine,
+	total_lines: u32,
+	viewport_lines: u32,
+) -> u32 {
+	let viewport_lines = viewport_lines.max(1);
+	let mut scroll_y = clamp_scroll_y(scroll_y, total_lines, viewport_lines);
+	if cursor_line.get() < scroll_y {
+		scroll_y = cursor_line.get();
+	} else if cursor_line.get() >= scroll_y.saturating_add(viewport_lines) {
+		scroll_y = cursor_line
+			.get()
+			.saturating_sub(viewport_lines.saturating_sub(1));
+	}
+	clamp_scroll_y(scroll_y, total_lines, viewport_lines)
+}
+
+fn scroll_viewport(scroll_y: u32, delta: i32, total_lines: u32, viewport_lines: u32) -> u32 {
+	let scroll_y = (scroll_y as i64 + delta as i64).max(0) as u32;
+	clamp_scroll_y(scroll_y, total_lines, viewport_lines)
+}
+
+fn clamp_cursor_line_to_viewport(
+	cursor_line: DocLine,
+	scroll_y: u32,
+	total_lines: u32,
+	viewport_lines: u32,
+) -> DocLine {
+	let top = clamp_scroll_y(scroll_y, total_lines, viewport_lines);
+	let bottom = viewport_bottom_line(top, total_lines, viewport_lines);
+	DocLine::new(cursor_line.get().clamp(top, bottom))
 }
 
 fn resolve_byte_range(
@@ -1683,7 +1733,8 @@ impl Engine {
 
 		let mut cursor_abs_line = DocLine::ZERO;
 		let mut cursor_abs_col = VisualCol::ZERO;
-		let viewport_lines = 50;
+		let mut scroll_y = 0u32;
+		let mut viewport_lines = 50;
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
 
@@ -2222,6 +2273,10 @@ impl Engine {
 						needs_render = true;
 					}
 				}
+				EditorCommand::Resize(_w, h) => {
+					viewport_lines = h.saturating_sub(1) as u32;
+					needs_render = true;
+				}
 				EditorCommand::Scroll(delta) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
@@ -2237,6 +2292,33 @@ impl Engine {
 							&mut cursor_offset,
 							&mut cursor_abs_col,
 						);
+					}
+					needs_render = true;
+				}
+				EditorCommand::ScrollViewport(delta) => {
+					if let Some(rid) = root_id {
+						let total = registry.get_total_newlines(rid);
+						scroll_y = scroll_viewport(scroll_y, delta, total, viewport_lines);
+						let clamped_cursor_line = clamp_cursor_line_to_viewport(
+							cursor_abs_line,
+							scroll_y,
+							total,
+							viewport_lines,
+						);
+						if clamped_cursor_line != cursor_abs_line {
+							cursor_abs_line = clamped_cursor_line;
+							let target = registry.find_node_at_line_col(
+								rid,
+								cursor_abs_line,
+								cursor_abs_col,
+							);
+							apply_cursor_target(
+								target,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_col,
+							);
+						}
 					}
 					needs_render = true;
 				}
@@ -2272,6 +2354,7 @@ impl Engine {
 						cursor_offset = 0;
 						cursor_abs_line = DocLine::ZERO;
 						cursor_abs_col = VisualCol::ZERO;
+						scroll_y = 0;
 						ledger.clear();
 						active_visual = None;
 						semantic_highlights.clear();
@@ -2316,6 +2399,7 @@ impl Engine {
 						cursor_offset = 0;
 						cursor_abs_line = DocLine::ZERO;
 						cursor_abs_col = VisualCol::ZERO;
+						scroll_y = 0;
 						ledger.clear();
 						active_visual = None;
 						semantic_highlights.clear();
@@ -3069,16 +3153,23 @@ impl Engine {
 
 			if needs_render {
 				let (virtual_tokens, tokens, total_lines) = if let Some(rid) = root_id {
-					let scroll_y = cursor_abs_line.saturating_sub(20);
+					let total_lines = registry.get_total_newlines(rid);
+					scroll_y = pan_scroll_y_to_keep_cursor_visible(
+						scroll_y,
+						cursor_abs_line,
+						total_lines,
+						viewport_lines,
+					);
+					let scroll_line = DocLine::new(scroll_y);
 
 					// 1. Virtual Query (Look-behind 60 lines, Look-ahead 120 lines total)
-					let virtual_start_line = scroll_y.saturating_sub(60);
+					let virtual_start_line = scroll_line.saturating_sub(60);
 					let virtual_line_count = viewport_lines + 120;
 					let virtual_tokens =
 						registry.query_viewport(rid, virtual_start_line, virtual_line_count);
 
 					// 2. Visible Query (The actual UI screen)
-					let visible_tokens = registry.query_viewport(rid, scroll_y, viewport_lines);
+					let visible_tokens = registry.query_viewport(rid, scroll_line, viewport_lines);
 
 					for token in &visible_tokens {
 						if !token.is_virtual && token.text.is_empty() {
@@ -3091,12 +3182,9 @@ impl Engine {
 						}
 					}
 
-					(
-						virtual_tokens,
-						visible_tokens,
-						registry.get_total_newlines(rid),
-					)
+					(virtual_tokens, visible_tokens, total_lines)
 				} else {
+					scroll_y = 0;
 					(Vec::new(), Vec::new(), 0)
 				};
 
@@ -3226,7 +3314,7 @@ impl Engine {
 					}
 					_ => Vec::new(),
 				};
-				let viewport_start_line = cursor_abs_line.saturating_sub(20);
+				let viewport_start_line = DocLine::new(scroll_y);
 				let minimap = if let Some(rid) = root_id {
 					let path_changed = last_minimap_path.as_deref() != file_path.as_deref();
 					let state_changed = last_minimap_state != Some(ledger.current_state_id);
@@ -3290,6 +3378,8 @@ impl Engine {
 
 				let _ = tx_view.send(Viewport {
 					tokens,
+					scroll_y,
+					viewport_line_count: viewport_lines,
 					cursor_abs_pos: CursorPosition::new(cursor_abs_line, cursor_abs_col),
 					cursor_abs_byte,
 					cursor_line_start_byte,
@@ -3356,13 +3446,14 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 mod tests {
 	use super::{
 		FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch, VisualKind, apply_deltas_to_document,
-		apply_deltas_to_document_internal, build_search_minimap_bands, delete_to_line_end_delta,
-		document_rewrite_delta, first_non_whitespace_visual_col, line_col_from_doc_byte_sparse,
-		line_end_visual_col, linewise_put_insertion, next_word_end, next_word_start,
-		prev_word_start, rebase_semantic_highlights_after_delta,
-		rebind_document_spans_to_saved_file, resolve_visual_ranges, save_document_atomic,
-		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
-		word_object_delta_at_cursor,
+		apply_deltas_to_document_internal, build_search_minimap_bands,
+		clamp_cursor_line_to_viewport, delete_to_line_end_delta, document_rewrite_delta,
+		first_non_whitespace_visual_col, line_col_from_doc_byte_sparse, line_end_visual_col,
+		linewise_put_insertion, next_word_end, next_word_start,
+		pan_scroll_y_to_keep_cursor_visible, prev_word_start,
+		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
+		resolve_visual_ranges, save_document_atomic, scroll_viewport, smart_home_visual_col,
+		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
@@ -3750,6 +3841,56 @@ mod tests {
 
 		assert!(bands.iter().any(|&band| band > 0));
 		assert_eq!(active, Some((90usize * MINIMAP_BANDS) / 100usize));
+	}
+
+	#[test]
+	fn pan_scroll_y_keeps_visible_cursor_stationary() {
+		assert_eq!(
+			pan_scroll_y_to_keep_cursor_visible(10, DocLine::new(20), 200, 50),
+			10
+		);
+	}
+
+	#[test]
+	fn pan_scroll_y_moves_up_when_cursor_above_view() {
+		assert_eq!(
+			pan_scroll_y_to_keep_cursor_visible(30, DocLine::new(12), 200, 50),
+			12
+		);
+	}
+
+	#[test]
+	fn pan_scroll_y_moves_down_when_cursor_below_view() {
+		assert_eq!(
+			pan_scroll_y_to_keep_cursor_visible(10, DocLine::new(65), 200, 20),
+			46
+		);
+	}
+
+	#[test]
+	fn pan_scroll_y_keeps_cursor_on_last_visible_line_stationary() {
+		assert_eq!(
+			pan_scroll_y_to_keep_cursor_visible(10, DocLine::new(29), 200, 20),
+			10
+		);
+	}
+
+	#[test]
+	fn scroll_viewport_clamps_to_document_bounds() {
+		assert_eq!(scroll_viewport(0, -3, 99, 50), 0);
+		assert_eq!(scroll_viewport(45, 10, 99, 50), 50);
+	}
+
+	#[test]
+	fn clamp_cursor_line_to_viewport_uses_visible_bounds() {
+		assert_eq!(
+			clamp_cursor_line_to_viewport(DocLine::new(7), 10, 99, 20),
+			DocLine::new(10),
+		);
+		assert_eq!(
+			clamp_cursor_line_to_viewport(DocLine::new(40), 10, 99, 20),
+			DocLine::new(29),
+		);
 	}
 
 	#[test]

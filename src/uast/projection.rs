@@ -31,6 +31,8 @@ pub struct NodeByteTarget {
 
 pub struct Viewport {
 	pub tokens: Vec<RenderToken>,
+	pub scroll_y: u32,
+	pub viewport_line_count: u32,
 	pub cursor_abs_pos: CursorPosition,
 	pub cursor_abs_byte: DocByte,
 	pub cursor_line_start_byte: DocByte,
