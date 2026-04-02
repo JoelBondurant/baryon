@@ -62,6 +62,8 @@ pub enum MinimapMode {
 pub struct MinimapSnapshot {
 	pub mode: MinimapMode,
 	pub bands: Vec<u8>,
+	pub search_bands: Vec<u8>,
+	pub active_search_band: Option<usize>,
 	pub total_lines: u32,
 	pub viewport_start_line: DocLine,
 	pub viewport_line_count: u32,

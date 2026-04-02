@@ -842,6 +842,8 @@ fn build_text_minimap_snapshot(
 	MinimapSnapshot {
 		mode: MinimapMode::TextDensity,
 		bands,
+		search_bands: vec![0; MINIMAP_BANDS],
+		active_search_band: None,
 		total_lines: doc_lines,
 		viewport_start_line,
 		viewport_line_count,
@@ -894,11 +896,45 @@ fn build_byte_fallback_minimap_snapshot(
 	MinimapSnapshot {
 		mode: MinimapMode::ByteFallback,
 		bands,
+		search_bands: vec![0; MINIMAP_BANDS],
+		active_search_band: None,
 		total_lines: doc_lines,
 		viewport_start_line,
 		viewport_line_count,
 		cursor_line,
 	}
+}
+
+fn build_search_minimap_bands(
+	search_matches: &[SearchMatch],
+	active_match_index: Option<usize>,
+	total_lines: u32,
+) -> (Vec<u8>, Option<usize>) {
+	let total_lines = total_lines.max(1);
+	let mut bands = vec![0u8; MINIMAP_BANDS];
+	if search_matches.is_empty() {
+		return (bands, None);
+	}
+
+	let stride = (search_matches.len() / 8192).max(1);
+	for (idx, m) in search_matches.iter().enumerate().step_by(stride) {
+		let band = ((m.line.get() as usize) * MINIMAP_BANDS) / total_lines as usize;
+		let band = band.min(MINIMAP_BANDS - 1);
+		let intensity = if Some(idx) == active_match_index {
+			255
+		} else {
+			196
+		};
+		bands[band] = bands[band].max(intensity);
+	}
+
+	let active_search_band = active_match_index
+		.and_then(|idx| search_matches.get(idx))
+		.map(|m| {
+			(((m.line.get() as usize) * MINIMAP_BANDS) / total_lines as usize)
+				.min(MINIMAP_BANDS - 1)
+		});
+	(bands, active_search_band)
 }
 
 fn insert_text_sparse(
@@ -3232,9 +3268,16 @@ impl Engine {
 
 					cached_minimap.as_ref().map(|snapshot| {
 						let mut snapshot = snapshot.clone();
+						let (search_bands, active_search_band) = build_search_minimap_bands(
+							&search_matches,
+							search_match_index,
+							total_lines,
+						);
 						snapshot.viewport_start_line = viewport_start_line;
 						snapshot.viewport_line_count = viewport_lines;
 						snapshot.cursor_line = cursor_abs_line;
+						snapshot.search_bands = search_bands;
+						snapshot.active_search_band = active_search_band;
 						snapshot
 					})
 				} else {
@@ -3312,10 +3355,11 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		FILE_DEVICE_ID, VisualKind, apply_deltas_to_document, apply_deltas_to_document_internal,
-		delete_to_line_end_delta, document_rewrite_delta, first_non_whitespace_visual_col,
-		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion, next_word_end,
-		next_word_start, prev_word_start, rebase_semantic_highlights_after_delta,
+		FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch, VisualKind, apply_deltas_to_document,
+		apply_deltas_to_document_internal, build_search_minimap_bands, delete_to_line_end_delta,
+		document_rewrite_delta, first_non_whitespace_visual_col, line_col_from_doc_byte_sparse,
+		line_end_visual_col, linewise_put_insertion, next_word_end, next_word_start,
+		prev_word_start, rebase_semantic_highlights_after_delta,
 		rebind_document_spans_to_saved_file, resolve_visual_ranges, save_document_atomic,
 		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
 		word_object_delta_at_cursor,
@@ -3686,6 +3730,26 @@ mod tests {
 		let doc = "éx yz";
 		assert_eq!(next_word_end(doc, 0), 2);
 		assert_eq!(next_word_end(doc, 2), 5);
+	}
+
+	#[test]
+	fn search_minimap_bands_track_hits_and_active_match() {
+		let matches = vec![
+			SearchMatch {
+				line: DocLine::new(10),
+				col: VisualCol::ZERO,
+				byte_len: 3,
+			},
+			SearchMatch {
+				line: DocLine::new(90),
+				col: VisualCol::ZERO,
+				byte_len: 3,
+			},
+		];
+		let (bands, active) = build_search_minimap_bands(&matches, Some(1), 100);
+
+		assert!(bands.iter().any(|&band| band > 0));
+		assert_eq!(active, Some((90usize * MINIMAP_BANDS) / 100usize));
 	}
 
 	#[test]

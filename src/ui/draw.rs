@@ -90,8 +90,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 								if let Some(cell) = buf.cell_mut((gx, gy)) {
 									cell.set_char(' ').set_style(
 										Style::default()
-											.bg(Color::Rgb(12, 16, 22))
-											.fg(Color::Rgb(12, 16, 22)),
+											.bg(Color::Rgb(18, 18, 18))
+											.fg(Color::Rgb(18, 18, 18)),
 									);
 								}
 							}
