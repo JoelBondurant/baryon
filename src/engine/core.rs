@@ -1929,11 +1929,12 @@ impl Engine {
 														),
 													);
 													if let Some(new_root) = root_id {
-														let target = registry.find_node_at_line_col(
-															new_root,
-															cursor_abs_line,
-															VisualCol::ZERO,
-														);
+														let target = registry
+															.find_node_at_line_col(
+																new_root,
+																cursor_abs_line,
+																VisualCol::ZERO,
+															);
 														apply_cursor_target(
 															target,
 															&mut cursor_node,
@@ -2096,8 +2097,8 @@ impl Engine {
 									if applied_ok {
 										if let Some(new_rid) = root_id {
 											// Re-scan for remaining matches after replacement point, filtered by range
-											let re =
-												build_regex(&pat, cs.flags.case_insensitive).unwrap();
+											let re = build_regex(&pat, cs.flags.case_insensitive)
+												.unwrap();
 											let all_new = find_all_matches(&new_bytes, &re);
 											let new_matches: Vec<SearchMatch> = match &cs.range {
 												SubstituteRange::WholeFile => all_new,
@@ -2684,17 +2685,17 @@ mod tests {
 	use super::{
 		VisualKind, apply_deltas_to_document, delete_to_line_end_delta, document_rewrite_delta,
 		first_non_whitespace_visual_col, line_end_visual_col, linewise_put_insertion,
-		next_word_end, next_word_start, prev_word_start,
-		rebase_semantic_highlights_after_delta, resolve_visual_ranges, smart_home_visual_col,
-		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
+		next_word_end, next_word_start, prev_word_start, rebase_semantic_highlights_after_delta,
+		resolve_visual_ranges, smart_home_visual_col, step_left_visual_col, step_right_visual_col,
+		word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
 	use crate::engine::undo::{TextDelta, UndoLedger};
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
+	use crate::uast::UastProjection;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
-	use crate::uast::UastProjection;
 
 	fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
 		let registry = UastRegistry::new(32);
