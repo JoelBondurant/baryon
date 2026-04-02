@@ -712,6 +712,24 @@ impl<B: Backend + io::Write> Frontend<B> {
 					.send(EditorCommand::MoveCursor(MoveDirection::Right));
 				self.clear_prefixes();
 			}
+			KeyCode::Char('w') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::NextWord));
+				self.clear_prefixes();
+			}
+			KeyCode::Char('b') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::PrevWord));
+				self.clear_prefixes();
+			}
+			KeyCode::Char('e') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::NextWordEnd));
+				self.clear_prefixes();
+			}
 			KeyCode::Char('0') => {
 				let _ = self.tx_cmd.send(EditorCommand::LineStart);
 				self.clear_prefixes();
@@ -1182,6 +1200,21 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Right));
+			}
+			KeyCode::Char('w') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::NextWord));
+			}
+			KeyCode::Char('b') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::PrevWord));
+			}
+			KeyCode::Char('e') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::NextWordEnd));
 			}
 			KeyCode::Char('0') => {
 				let _ = self.tx_cmd.send(EditorCommand::LineStart);

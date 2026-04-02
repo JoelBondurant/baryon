@@ -45,6 +45,9 @@ pub enum MoveDirection {
 	Down,
 	Left,
 	Right,
+	NextWord,
+	PrevWord,
+	NextWordEnd,
 	Top,
 	Bottom,
 }
@@ -145,6 +148,13 @@ struct SearchMatch {
 	byte_len: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexClass {
+	Whitespace,
+	Keyword,
+	Punctuation,
+}
+
 fn advance_col(b: u8, line: &mut DocLine, col: &mut VisualCol) {
 	if b == b'\n' {
 		*line += 1;
@@ -154,6 +164,141 @@ fn advance_col(b: u8, line: &mut DocLine, col: &mut VisualCol) {
 	} else {
 		*col += 1;
 	}
+}
+
+fn classify_lex_char(ch: char) -> LexClass {
+	match ch {
+		' ' | '\t' | '\n' => LexClass::Whitespace,
+		_ if ch.is_alphanumeric() || ch == '_' => LexClass::Keyword,
+		_ => LexClass::Punctuation,
+	}
+}
+
+fn clamp_to_char_boundary(doc: &str, byte: usize) -> usize {
+	let mut byte = byte.min(doc.len());
+	while byte > 0 && !doc.is_char_boundary(byte) {
+		byte -= 1;
+	}
+	byte
+}
+
+fn char_start_before(doc: &str, byte: usize) -> Option<usize> {
+	let byte = clamp_to_char_boundary(doc, byte);
+	doc[..byte].char_indices().next_back().map(|(idx, _)| idx)
+}
+
+fn char_at(doc: &str, byte: usize) -> Option<char> {
+	let byte = clamp_to_char_boundary(doc, byte);
+	doc[byte..].char_indices().next().map(|(_, ch)| ch)
+}
+
+fn next_char_start(doc: &str, byte: usize) -> Option<usize> {
+	let byte = clamp_to_char_boundary(doc, byte);
+	let ch = char_at(doc, byte)?;
+	Some(byte + ch.len_utf8())
+}
+
+fn next_word_start(doc: &str, current_byte: usize) -> usize {
+	let mut byte = clamp_to_char_boundary(doc, current_byte);
+	if byte >= doc.len() {
+		return doc.len();
+	}
+
+	let start_class = classify_lex_char(char_at(doc, byte).expect("char at valid boundary"));
+	while byte < doc.len() {
+		let ch = char_at(doc, byte).expect("char at valid boundary");
+		if classify_lex_char(ch) != start_class {
+			break;
+		}
+		byte = match next_char_start(doc, byte) {
+			Some(next) => next,
+			None => return doc.len(),
+		};
+	}
+
+	while byte < doc.len() {
+		let ch = char_at(doc, byte).expect("char at valid boundary");
+		if classify_lex_char(ch) != LexClass::Whitespace {
+			break;
+		}
+		byte = match next_char_start(doc, byte) {
+			Some(next) => next,
+			None => return doc.len(),
+		};
+	}
+
+	byte
+}
+
+fn prev_word_start(doc: &str, current_byte: usize) -> usize {
+	let current_byte = clamp_to_char_boundary(doc, current_byte);
+	let Some(mut byte) = char_start_before(doc, current_byte) else {
+		return 0;
+	};
+
+	while let Some(ch) = char_at(doc, byte) {
+		if classify_lex_char(ch) != LexClass::Whitespace {
+			break;
+		}
+		let Some(prev) = char_start_before(doc, byte) else {
+			return 0;
+		};
+		byte = prev;
+	}
+
+	let Some(ch) = char_at(doc, byte) else {
+		return 0;
+	};
+	let target_class = classify_lex_char(ch);
+
+	while let Some(prev) = char_start_before(doc, byte) {
+		let prev_ch = char_at(doc, prev).expect("char at valid boundary");
+		if classify_lex_char(prev_ch) != target_class {
+			break;
+		}
+		byte = prev;
+	}
+
+	byte
+}
+
+fn next_word_end(doc: &str, current_byte: usize) -> usize {
+	let current_byte = clamp_to_char_boundary(doc, current_byte);
+	let Some(mut byte) = next_char_start(doc, current_byte) else {
+		return current_byte.min(doc.len());
+	};
+
+	while byte < doc.len() {
+		let ch = char_at(doc, byte).expect("char at valid boundary");
+		if classify_lex_char(ch) != LexClass::Whitespace {
+			break;
+		}
+		byte = match next_char_start(doc, byte) {
+			Some(next) => next,
+			None => return current_byte.min(doc.len()),
+		};
+	}
+
+	if byte >= doc.len() {
+		return current_byte.min(doc.len());
+	}
+
+	let target_class = classify_lex_char(char_at(doc, byte).expect("char at valid boundary"));
+	let mut last = byte;
+
+	while byte < doc.len() {
+		let ch = char_at(doc, byte).expect("char at valid boundary");
+		if classify_lex_char(ch) != target_class {
+			break;
+		}
+		last = byte;
+		byte = match next_char_start(doc, byte) {
+			Some(next) => next,
+			None => break,
+		};
+	}
+
+	last
 }
 
 fn line_byte_range(doc: &[u8], start_line: DocLine, end_line: DocLine) -> (usize, usize) {
@@ -1023,6 +1168,38 @@ impl Engine {
 									);
 								} else {
 									cursor_abs_col += 1;
+								}
+							}
+							MoveDirection::NextWord
+							| MoveDirection::PrevWord
+							| MoveDirection::NextWordEnd => {
+								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+									if let Ok(doc) = std::str::from_utf8(&bytes) {
+										let cursor_abs_byte = byte_offset_from_line_col(
+											&bytes,
+											cursor_abs_line,
+											cursor_abs_col,
+										)
+										.get() as usize;
+										let target_byte = match dir {
+											MoveDirection::NextWord => {
+												next_word_start(doc, cursor_abs_byte)
+											}
+											MoveDirection::PrevWord => {
+												prev_word_start(doc, cursor_abs_byte)
+											}
+											MoveDirection::NextWordEnd => {
+												next_word_end(doc, cursor_abs_byte)
+											}
+											_ => unreachable!(),
+										};
+										let (line, col) = line_col_from_byte_offset(
+											&bytes,
+											DocByte::new(target_byte as u64),
+										);
+										cursor_abs_line = line;
+										cursor_abs_col = col;
+									}
 								}
 							}
 							MoveDirection::Top => {
@@ -2507,6 +2684,7 @@ mod tests {
 	use super::{
 		VisualKind, apply_deltas_to_document, delete_to_line_end_delta, document_rewrite_delta,
 		first_non_whitespace_visual_col, line_end_visual_col, linewise_put_insertion,
+		next_word_end, next_word_start, prev_word_start,
 		rebase_semantic_highlights_after_delta, resolve_visual_ranges, smart_home_visual_col,
 		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
 	};
@@ -2742,6 +2920,28 @@ mod tests {
 			step_left_visual_col(b" \tfoo\n", DocLine::ZERO, VisualCol::new(4)),
 			VisualCol::new(1),
 		);
+	}
+
+	#[test]
+	fn next_word_start_handles_punctuation_boundaries() {
+		let doc = "foo::bar baz";
+		assert_eq!(next_word_start(doc, 0), 3);
+		assert_eq!(next_word_start(doc, 3), 5);
+		assert_eq!(next_word_start(doc, 5), 9);
+	}
+
+	#[test]
+	fn prev_word_start_respects_utf8_boundaries() {
+		let doc = "éx yz";
+		assert_eq!(prev_word_start(doc, 4), 0);
+		assert_eq!(prev_word_start(doc, 2), 0);
+	}
+
+	#[test]
+	fn next_word_end_respects_utf8_boundaries() {
+		let doc = "éx yz";
+		assert_eq!(next_word_end(doc, 0), 2);
+		assert_eq!(next_word_end(doc, 2), 5);
 	}
 
 	#[test]
