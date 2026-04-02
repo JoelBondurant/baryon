@@ -14,7 +14,7 @@ use ra_ap_syntax::Edition;
 use ra_ap_vfs::{FileId, Vfs, VfsPath, file_set::FileSet};
 use rustc_hash::FxHashMap;
 
-use crate::core::DocByte;
+use crate::core::{DocByte, RequestId, StateId};
 use crate::svp::highlight::{HighlightSpan, TokenCategory};
 
 #[derive(Debug)]
@@ -22,14 +22,14 @@ pub struct SemanticRequest {
 	pub content: String,
 	pub global_offset: DocByte,
 	pub file_path: String,
-	pub state_id: u64,
-	pub request_id: u64,
+	pub state_id: StateId,
+	pub request_id: RequestId,
 }
 
 #[derive(Debug)]
 pub struct SemanticResponse {
-	pub state_id: u64,
-	pub request_id: u64,
+	pub state_id: StateId,
+	pub request_id: RequestId,
 	pub highlights: Vec<HighlightSpan>,
 }
 

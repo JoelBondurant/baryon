@@ -1,4 +1,4 @@
-use crate::core::{DocByte, DocLine, TAB_SIZE, VisualCol};
+use crate::core::{DocByte, DocLine, StateId, TAB_SIZE, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::uast::UastProjection;
 
@@ -7,16 +7,16 @@ pub struct TextDelta {
 	pub global_byte_offset: DocByte,
 	pub deleted_text: String,
 	pub inserted_text: String,
-	pub state_before: u64,
-	pub state_after: u64,
+	pub state_before: StateId,
+	pub state_after: StateId,
 }
 
 pub struct UndoLedger {
 	undo_stack: Vec<TextDelta>,
 	redo_stack: Vec<TextDelta>,
-	pub current_state_id: u64,
-	pub saved_state_id: u64,
-	next_id: u64,
+	pub current_state_id: StateId,
+	pub saved_state_id: StateId,
+	next_state_id: StateId,
 }
 
 impl UndoLedger {
@@ -24,9 +24,9 @@ impl UndoLedger {
 		Self {
 			undo_stack: Vec::new(),
 			redo_stack: Vec::new(),
-			current_state_id: 0,
-			saved_state_id: 0,
-			next_id: 1,
+			current_state_id: StateId::ZERO,
+			saved_state_id: StateId::ZERO,
+			next_state_id: StateId::new(1),
 		}
 	}
 
@@ -34,9 +34,9 @@ impl UndoLedger {
 	/// Sets `state_before`/`state_after` on the delta and advances `current_state_id`.
 	pub fn push(&mut self, mut delta: TextDelta) {
 		delta.state_before = self.current_state_id;
-		delta.state_after = self.next_id;
-		self.current_state_id = self.next_id;
-		self.next_id += 1;
+		delta.state_after = self.next_state_id;
+		self.current_state_id = self.next_state_id;
+		self.next_state_id += 1;
 		self.undo_stack.push(delta);
 		self.redo_stack.clear();
 	}
@@ -44,9 +44,9 @@ impl UndoLedger {
 	pub fn clear(&mut self) {
 		self.undo_stack.clear();
 		self.redo_stack.clear();
-		self.current_state_id = 0;
-		self.saved_state_id = 0;
-		self.next_id = 1;
+		self.current_state_id = StateId::ZERO;
+		self.saved_state_id = StateId::ZERO;
+		self.next_state_id = StateId::new(1);
 	}
 
 	/// Mark the current state as the saved-to-disk state.

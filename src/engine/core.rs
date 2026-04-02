@@ -1,4 +1,4 @@
-use crate::core::{CursorPosition, DocByte, DocLine, TAB_SIZE, VisualCol};
+use crate::core::{CursorPosition, DocByte, DocLine, RequestId, StateId, TAB_SIZE, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::clipboard::ClipboardHandle;
 use crate::engine::undo::{
@@ -339,8 +339,8 @@ fn invert_text_delta(delta: &TextDelta) -> TextDelta {
 		global_byte_offset: delta.global_byte_offset,
 		deleted_text: delta.inserted_text.clone(),
 		inserted_text: delta.deleted_text.clone(),
-		state_before: 0,
-		state_after: 0,
+		state_before: StateId::ZERO,
+		state_after: StateId::ZERO,
 	}
 }
 
@@ -367,8 +367,8 @@ fn push_document_rewrite_delta(
 					global_byte_offset: DocByte::new(global_byte_offset),
 					deleted_text,
 					inserted_text,
-					state_before: 0,
-					state_after: 0,
+					state_before: StateId::ZERO,
+					state_after: StateId::ZERO,
 				},
 			);
 		}
@@ -382,8 +382,8 @@ fn push_document_rewrite_delta(
 			global_byte_offset: DocByte::ZERO,
 			deleted_text: String::from_utf8_lossy(before).into_owned(),
 			inserted_text: String::from_utf8_lossy(after).into_owned(),
-			state_before: 0,
-			state_after: 0,
+			state_before: StateId::ZERO,
+			state_after: StateId::ZERO,
 		},
 	);
 }
@@ -464,11 +464,11 @@ impl Engine {
 		let tx_view = self.tx_view;
 		let reactor = self.reactor;
 		let mut semantic_highlights: Vec<HighlightSpan> = Vec::new();
-		let mut last_semantic_state: u64 = u64::MAX;
+		let mut last_semantic_state: Option<StateId> = None;
 		let mut last_semantic_len: usize = usize::MAX;
 		let mut last_semantic_path: Option<String> = None;
-		let mut next_semantic_request_id: u64 = 1;
-		let mut pending_semantic_request_id: Option<u64> = None;
+		let mut next_semantic_request_id = RequestId::new(1);
+		let mut pending_semantic_request_id: Option<RequestId> = None;
 
 		let mut cursor_abs_line = DocLine::ZERO;
 		let mut cursor_abs_col = VisualCol::ZERO;
@@ -585,8 +585,8 @@ impl Engine {
 								global_byte_offset: global_offset,
 								deleted_text: String::new(),
 								inserted_text: s.to_string(),
-								state_before: 0,
-								state_after: 0,
+								state_before: StateId::ZERO,
+								state_after: StateId::ZERO,
 							},
 						);
 						if c == '\n' {
@@ -638,8 +638,8 @@ impl Engine {
 										global_byte_offset: delete_start,
 										deleted_text: deleted_text.clone(),
 										inserted_text: String::new(),
-										state_before: 0,
-										state_after: 0,
+										state_before: StateId::ZERO,
+										state_after: StateId::ZERO,
 									},
 								);
 							}
@@ -716,7 +716,7 @@ impl Engine {
 						cursor_abs_col = VisualCol::ZERO;
 						ledger.clear();
 						semantic_highlights.clear();
-						last_semantic_state = u64::MAX;
+						last_semantic_state = None;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
 						pending_semantic_request_id = None;
@@ -755,7 +755,7 @@ impl Engine {
 						cursor_abs_col = VisualCol::ZERO;
 						ledger.clear();
 						semantic_highlights.clear();
-						last_semantic_state = u64::MAX;
+						last_semantic_state = None;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
 						pending_semantic_request_id = None;
@@ -1415,8 +1415,8 @@ impl Engine {
 											global_byte_offset: DocByte::new(insert_offset as u64),
 											deleted_text: String::new(),
 											inserted_text,
-											state_before: 0,
-											state_after: 0,
+											state_before: StateId::ZERO,
+											state_after: StateId::ZERO,
 										},
 									);
 
@@ -1576,7 +1576,7 @@ impl Engine {
 									let path_changed =
 										last_semantic_path.as_deref() != Some(path.as_str());
 									if path_changed
-										|| ledger.current_state_id != last_semantic_state
+										|| last_semantic_state != Some(ledger.current_state_id)
 										|| live_bytes.len() != last_semantic_len
 									{
 										// Skip incomplete 0-byte ghost reads on startup.
@@ -1593,7 +1593,7 @@ impl Engine {
 												request_id,
 											});
 											// Lock only after a successful, non-empty send.
-											last_semantic_state = ledger.current_state_id;
+											last_semantic_state = Some(ledger.current_state_id);
 											last_semantic_len = live_bytes.len();
 											last_semantic_path = Some(path.clone());
 											pending_semantic_request_id = Some(request_id);
@@ -1603,21 +1603,21 @@ impl Engine {
 							}
 						} else {
 							semantic_highlights.clear();
-							last_semantic_state = ledger.current_state_id;
+							last_semantic_state = Some(ledger.current_state_id);
 							last_semantic_len = 0;
 							last_semantic_path = Some(path.clone());
 							pending_semantic_request_id = None;
 						}
 					} else {
 						semantic_highlights.clear();
-						last_semantic_state = u64::MAX;
+						last_semantic_state = None;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
 						pending_semantic_request_id = None;
 					}
 				} else {
 					semantic_highlights.clear();
-					last_semantic_state = u64::MAX;
+					last_semantic_state = None;
 					last_semantic_len = usize::MAX;
 					last_semantic_path = None;
 					pending_semantic_request_id = None;
@@ -1709,7 +1709,7 @@ mod tests {
 	use super::{
 		document_rewrite_delta, linewise_put_insertion, rebase_semantic_highlights_after_delta,
 	};
-	use crate::core::{DocByte, DocLine};
+	use crate::core::{DocByte, DocLine, StateId};
 	use crate::engine::undo::TextDelta;
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
 
@@ -1753,8 +1753,8 @@ mod tests {
 				global_byte_offset: DocByte::new(5),
 				deleted_text: "x".to_string(),
 				inserted_text: String::new(),
-				state_before: 0,
-				state_after: 0,
+				state_before: StateId::ZERO,
+				state_after: StateId::ZERO,
 			},
 		);
 
@@ -1780,8 +1780,8 @@ mod tests {
 				global_byte_offset: DocByte::new(5),
 				deleted_text: String::new(),
 				inserted_text: "x".to_string(),
-				state_before: 0,
-				state_after: 0,
+				state_before: StateId::ZERO,
+				state_after: StateId::ZERO,
 			},
 		);
 

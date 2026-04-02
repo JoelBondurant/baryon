@@ -151,6 +151,8 @@ impl_u32_unit!(VisualCol);
 impl_u32_unit!(NodeByteOffset);
 impl_u32_unit!(ScreenRow);
 impl_u64_unit!(DocByte);
+impl_u64_unit!(StateId);
+impl_u64_unit!(RequestId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CursorPosition {
