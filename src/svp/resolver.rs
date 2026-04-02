@@ -147,7 +147,7 @@ impl SvpResolver {
 				ring.submit_and_wait(1).expect("Ring wait failed");
 
 				let mut cq = ring.completion();
-				let mut got_any = false;
+				let mut needs_refresh = false;
 				while let Some(cqe) = cq.next() {
 					let res = cqe.result();
 					let ud = cqe.user_data();
@@ -171,6 +171,7 @@ impl SvpResolver {
 						if was_viewport {
 							let data = buffers[buf_idx][..byte_count].to_vec();
 							registry.hot_swap_virtual_data(node_id, data);
+							needs_refresh = true;
 						}
 
 						registry.dma_in_flight[node_idx].store(false, Ordering::Relaxed);
@@ -186,13 +187,12 @@ impl SvpResolver {
 								);
 							}
 						}
-						got_any = true;
 					} else {
 						registry.dma_in_flight[node_idx].store(false, Ordering::Relaxed);
 					}
 					in_flight -= 1;
 				}
-				if got_any {
+				if needs_refresh {
 					let _ = notifier.send(());
 				}
 			} else {
