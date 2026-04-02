@@ -80,7 +80,7 @@ fn offset_for_visual_col(line_bytes: &[u8], target_col: VisualCol) -> (NodeByteO
 		advance_visual_col(&mut next_col, b);
 
 		if target_col <= next_col {
-			return (NodeByteOffset::new(byte_offset as u32), target_col);
+			return (NodeByteOffset::new(byte_offset as u32), next_col);
 		}
 
 		visual_col = next_col;
@@ -330,7 +330,7 @@ impl UastProjection for UastRegistry {
 #[cfg(test)]
 mod tests {
 	use super::UastProjection;
-	use crate::core::{DocLine, VisualCol};
+	use crate::core::{DocLine, TAB_SIZE, VisualCol};
 	use crate::ecs::UastRegistry;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
@@ -362,6 +362,25 @@ mod tests {
 		(registry, root)
 	}
 
+	fn visual_boundaries_for_line(text: &str) -> Vec<VisualCol> {
+		let mut boundaries = vec![VisualCol::ZERO];
+		let mut col = VisualCol::ZERO;
+
+		for &b in text.as_bytes() {
+			if b == b'\n' {
+				break;
+			}
+			if b == b'\t' {
+				col += TAB_SIZE - (col.get() % TAB_SIZE);
+			} else {
+				col += 1;
+			}
+			boundaries.push(col);
+		}
+
+		boundaries
+	}
+
 	#[test]
 	fn find_node_at_line_col_clamps_to_visual_width_with_tabs() {
 		let (registry, root) = build_document("\t\tlet x = 1;\n");
@@ -372,11 +391,46 @@ mod tests {
 	}
 
 	#[test]
-	fn find_node_at_line_col_preserves_visual_positions_inside_tabs() {
+	fn find_node_at_line_col_only_returns_character_boundaries_for_tabbed_lines() {
 		let (registry, root) = build_document("\tfoo\n");
-		let target = registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(3));
+		let valid_boundaries = visual_boundaries_for_line("\tfoo\n");
 
-		assert_eq!(target.node_byte, crate::core::NodeByteOffset::new(1));
-		assert_eq!(target.visual_col, VisualCol::new(3));
+		for clicked_col in 0..=7 {
+			let target = registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(clicked_col));
+			assert!(
+				valid_boundaries.contains(&target.visual_col),
+				"clicked visual col {} landed at invalid boundary {:?}",
+				clicked_col,
+				target.visual_col,
+			);
+		}
+	}
+
+	#[test]
+	fn find_node_at_line_col_snaps_tab_clicks_to_tab_boundary() {
+		let (registry, root) = build_document("\tfoo\n");
+
+		for clicked_col in 1..=3 {
+			let target =
+				registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(clicked_col));
+			assert_eq!(target.node_byte, crate::core::NodeByteOffset::new(1));
+			assert_eq!(target.visual_col, VisualCol::new(4));
+		}
+	}
+
+	#[test]
+	fn find_node_at_line_col_only_returns_character_boundaries_for_mixed_indent() {
+		let (registry, root) = build_document(" \tfoo\n");
+		let valid_boundaries = visual_boundaries_for_line(" \tfoo\n");
+
+		for clicked_col in 0..=7 {
+			let target = registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(clicked_col));
+			assert!(
+				valid_boundaries.contains(&target.visual_col),
+				"clicked visual col {} landed at invalid boundary {:?}",
+				clicked_col,
+				target.visual_col,
+			);
+		}
 	}
 }

@@ -62,6 +62,12 @@ pub enum EditorCommand {
 	MoveCursor(MoveDirection),
 	ClickCursor(CursorPosition),
 	GotoLine(DocLine),
+	LineStart,
+	FirstNonWhitespace,
+	LineEnd,
+	SmartHome,
+	PageUp,
+	PageDown,
 	LoadFile(String),
 	WriteFile,
 	WriteFileAs(String),
@@ -142,6 +148,88 @@ fn line_byte_range(doc: &[u8], start_line: DocLine, end_line: DocLine) -> (usize
 		byte_start = doc.len();
 	}
 	(byte_start, doc.len())
+}
+
+fn line_content_slice(doc: &[u8], target_line: DocLine) -> &[u8] {
+	let (start, end) = line_byte_range(doc, target_line, target_line);
+	let line = &doc[start..end];
+	if line.ends_with(b"\n") {
+		&line[..line.len().saturating_sub(1)]
+	} else {
+		line
+	}
+}
+
+fn advance_visual_col_only(col: &mut VisualCol, b: u8) {
+	if b == b'\t' {
+		*col += TAB_SIZE - (col.get() % TAB_SIZE);
+	} else if b != b'\n' {
+		*col += 1;
+	}
+}
+
+fn line_end_visual_col(doc: &[u8], target_line: DocLine) -> VisualCol {
+	let mut col = VisualCol::ZERO;
+	for &b in line_content_slice(doc, target_line) {
+		advance_visual_col_only(&mut col, b);
+	}
+	col
+}
+
+fn first_non_whitespace_visual_col(doc: &[u8], target_line: DocLine) -> VisualCol {
+	let mut col = VisualCol::ZERO;
+	for &b in line_content_slice(doc, target_line) {
+		match b {
+			b' ' | b'\t' => advance_visual_col_only(&mut col, b),
+			_ => return col,
+		}
+	}
+
+	VisualCol::ZERO
+}
+
+fn smart_home_visual_col(doc: &[u8], target_line: DocLine, current_col: VisualCol) -> VisualCol {
+	let first_non_whitespace = first_non_whitespace_visual_col(doc, target_line);
+	if current_col == first_non_whitespace {
+		VisualCol::ZERO
+	} else {
+		first_non_whitespace
+	}
+}
+
+fn step_left_visual_col(doc: &[u8], target_line: DocLine, current_col: VisualCol) -> VisualCol {
+	let mut col = VisualCol::ZERO;
+
+	for &b in line_content_slice(doc, target_line) {
+		let char_start = col;
+		advance_visual_col_only(&mut col, b);
+		if current_col <= col {
+			return char_start;
+		}
+	}
+
+	VisualCol::ZERO
+}
+
+fn step_right_visual_col(doc: &[u8], target_line: DocLine, current_col: VisualCol) -> VisualCol {
+	let mut col = VisualCol::ZERO;
+
+	for &b in line_content_slice(doc, target_line) {
+		advance_visual_col_only(&mut col, b);
+		if current_col < col {
+			return col;
+		}
+	}
+
+	col
+}
+
+fn page_motion_step(viewport_lines: u32) -> u32 {
+	if viewport_lines > 1 {
+		viewport_lines - 1
+	} else {
+		1
+	}
 }
 
 fn resolve_byte_range(
@@ -522,9 +610,27 @@ impl Engine {
 								}
 							}
 							MoveDirection::Left => {
-								cursor_abs_col = cursor_abs_col.saturating_sub(1)
+								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+									cursor_abs_col = step_left_visual_col(
+										&bytes,
+										cursor_abs_line,
+										cursor_abs_col,
+									);
+								} else {
+									cursor_abs_col = cursor_abs_col.saturating_sub(1);
+								}
 							}
-							MoveDirection::Right => cursor_abs_col += 1,
+							MoveDirection::Right => {
+								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+									cursor_abs_col = step_right_visual_col(
+										&bytes,
+										cursor_abs_line,
+										cursor_abs_col,
+									);
+								} else {
+									cursor_abs_col += 1;
+								}
+							}
 							MoveDirection::Top => {
 								cursor_abs_line = DocLine::ZERO;
 								cursor_abs_col = VisualCol::ZERO;
@@ -550,6 +656,69 @@ impl Engine {
 						let total = registry.get_total_newlines(rid);
 						cursor_abs_line = DocLine::new(target.get().min(total));
 						cursor_abs_col = VisualCol::ZERO;
+						let target =
+							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
+						apply_cursor_target(
+							target,
+							&mut cursor_node,
+							&mut cursor_offset,
+							&mut cursor_abs_col,
+						);
+						needs_render = true;
+					}
+				}
+				line_motion @ (EditorCommand::LineStart
+				| EditorCommand::FirstNonWhitespace
+				| EditorCommand::LineEnd
+				| EditorCommand::SmartHome) => {
+					if let Some(rid) = root_id {
+						if let Ok(bytes) = registry.collect_document_bytes(rid) {
+							let target_col = match line_motion {
+								EditorCommand::LineStart => VisualCol::ZERO,
+								EditorCommand::FirstNonWhitespace => {
+									first_non_whitespace_visual_col(&bytes, cursor_abs_line)
+								}
+								EditorCommand::LineEnd => {
+									line_end_visual_col(&bytes, cursor_abs_line)
+								}
+								EditorCommand::SmartHome => {
+									smart_home_visual_col(&bytes, cursor_abs_line, cursor_abs_col)
+								}
+								_ => unreachable!(),
+							};
+							let target =
+								registry.find_node_at_line_col(rid, cursor_abs_line, target_col);
+							apply_cursor_target(
+								target,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_col,
+							);
+							needs_render = true;
+						}
+					}
+				}
+				EditorCommand::PageUp => {
+					if let Some(rid) = root_id {
+						cursor_abs_line =
+							cursor_abs_line.saturating_sub(page_motion_step(viewport_lines));
+						let target =
+							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
+						apply_cursor_target(
+							target,
+							&mut cursor_node,
+							&mut cursor_offset,
+							&mut cursor_abs_col,
+						);
+						needs_render = true;
+					}
+				}
+				EditorCommand::PageDown => {
+					if let Some(rid) = root_id {
+						let total = registry.get_total_newlines(rid);
+						let target_line =
+							cursor_abs_line.saturating_add(page_motion_step(viewport_lines));
+						cursor_abs_line = DocLine::new(target_line.get().min(total));
 						let target =
 							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
 						apply_cursor_target(
@@ -1707,9 +1876,11 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		document_rewrite_delta, linewise_put_insertion, rebase_semantic_highlights_after_delta,
+		document_rewrite_delta, first_non_whitespace_visual_col, line_end_visual_col,
+		linewise_put_insertion, rebase_semantic_highlights_after_delta, smart_home_visual_col,
+		step_left_visual_col, step_right_visual_col,
 	};
-	use crate::core::{DocByte, DocLine, StateId};
+	use crate::core::{DocByte, DocLine, StateId, VisualCol};
 	use crate::engine::undo::TextDelta;
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
 
@@ -1738,6 +1909,71 @@ mod tests {
 		assert_eq!(insert_offset, 0);
 		assert_eq!(inserted_text, "beta\n");
 		assert_eq!(target_cursor_line, DocLine::ZERO);
+	}
+
+	#[test]
+	fn line_end_visual_col_expands_tabs() {
+		assert_eq!(
+			line_end_visual_col(b"\tfoo\n", DocLine::ZERO),
+			VisualCol::new(7),
+		);
+		assert_eq!(
+			line_end_visual_col(b"\t\tlet x = 1;\n", DocLine::ZERO),
+			VisualCol::new(18),
+		);
+	}
+
+	#[test]
+	fn first_non_whitespace_visual_col_is_tab_aware() {
+		assert_eq!(
+			first_non_whitespace_visual_col(b" \t\tfoo\n", DocLine::ZERO),
+			VisualCol::new(8),
+		);
+		assert_eq!(
+			first_non_whitespace_visual_col(b"    \n", DocLine::ZERO),
+			VisualCol::ZERO,
+		);
+	}
+
+	#[test]
+	fn smart_home_toggles_between_indent_and_line_start() {
+		let doc = b"\t  foo\n";
+		assert_eq!(
+			smart_home_visual_col(doc, DocLine::ZERO, VisualCol::new(10)),
+			VisualCol::new(6),
+		);
+		assert_eq!(
+			smart_home_visual_col(doc, DocLine::ZERO, VisualCol::new(6)),
+			VisualCol::ZERO,
+		);
+		assert_eq!(
+			smart_home_visual_col(doc, DocLine::ZERO, VisualCol::ZERO),
+			VisualCol::new(6),
+		);
+	}
+
+	#[test]
+	fn step_right_visual_col_jumps_across_tabs() {
+		assert_eq!(
+			step_right_visual_col(b"\tfoo\n", DocLine::ZERO, VisualCol::ZERO),
+			VisualCol::new(4),
+		);
+		assert_eq!(
+			step_right_visual_col(b" \tfoo\n", DocLine::ZERO, VisualCol::new(1)),
+			VisualCol::new(4),
+		);
+	}
+
+	#[test]
+	fn step_left_visual_col_jumps_back_across_tabs() {
+		assert_eq!(
+			step_left_visual_col(b"\tfoo\n", DocLine::ZERO, VisualCol::new(4)),
+			VisualCol::ZERO,
+		);
+		assert_eq!(
+			step_left_visual_col(b" \tfoo\n", DocLine::ZERO, VisualCol::new(4)),
+			VisualCol::new(1),
+		);
 	}
 
 	#[test]

@@ -645,6 +645,18 @@ impl<B: Backend + io::Write> Frontend<B> {
 					.send(EditorCommand::MoveCursor(MoveDirection::Right));
 				self.clear_prefixes();
 			}
+			KeyCode::Char('0') => {
+				let _ = self.tx_cmd.send(EditorCommand::LineStart);
+				self.clear_prefixes();
+			}
+			KeyCode::Char('^') => {
+				let _ = self.tx_cmd.send(EditorCommand::FirstNonWhitespace);
+				self.clear_prefixes();
+			}
+			KeyCode::Char('$') => {
+				let _ = self.tx_cmd.send(EditorCommand::LineEnd);
+				self.clear_prefixes();
+			}
 			KeyCode::Char('g') => {
 				if self.g_prefix {
 					let _ = self
@@ -729,6 +741,22 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Right));
+				self.clear_prefixes();
+			}
+			KeyCode::Home => {
+				let _ = self.tx_cmd.send(EditorCommand::SmartHome);
+				self.clear_prefixes();
+			}
+			KeyCode::End => {
+				let _ = self.tx_cmd.send(EditorCommand::LineEnd);
+				self.clear_prefixes();
+			}
+			KeyCode::PageUp => {
+				let _ = self.tx_cmd.send(EditorCommand::PageUp);
+				self.clear_prefixes();
+			}
+			KeyCode::PageDown => {
+				let _ = self.tx_cmd.send(EditorCommand::PageDown);
 				self.clear_prefixes();
 			}
 			KeyCode::Esc => {
@@ -869,6 +897,18 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Right));
+			}
+			KeyCode::Home => {
+				let _ = self.tx_cmd.send(EditorCommand::SmartHome);
+			}
+			KeyCode::End => {
+				let _ = self.tx_cmd.send(EditorCommand::LineEnd);
+			}
+			KeyCode::PageUp => {
+				let _ = self.tx_cmd.send(EditorCommand::PageUp);
+			}
+			KeyCode::PageDown => {
+				let _ = self.tx_cmd.send(EditorCommand::PageDown);
 			}
 			KeyCode::Char(c) => {
 				let _ = self.tx_cmd.send(EditorCommand::InsertChar(c));
