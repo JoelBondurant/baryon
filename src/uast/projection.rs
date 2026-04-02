@@ -21,6 +21,14 @@ pub struct NodeCursorTarget {
 	pub visual_col: VisualCol,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NodeByteTarget {
+	pub node_id: NodeId,
+	pub node_start_byte: DocByte,
+	pub node_end_byte: DocByte,
+	pub node_byte: NodeByteOffset,
+}
+
 pub struct Viewport {
 	pub tokens: Vec<RenderToken>,
 	pub cursor_abs_pos: CursorPosition,
@@ -103,6 +111,7 @@ pub trait UastProjection {
 		target_line: DocLine,
 		target_col: VisualCol,
 	) -> NodeCursorTarget;
+	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget;
 	fn collect_document_bytes(&self, root: NodeId) -> Result<Vec<u8>, &'static str>;
 }
 
@@ -325,12 +334,63 @@ impl UastProjection for UastRegistry {
 
 		Ok(result)
 	}
+
+	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget {
+		let root_len = unsafe { (*self.metrics[root.index()].get()).byte_length as u64 };
+		let clamped_target = target_byte.get().min(root_len);
+		let mut curr = Some(root);
+		let mut byte_accumulator = DocByte::ZERO;
+		let mut last_leaf: Option<NodeByteTarget> = None;
+
+		while let Some(node) = curr {
+			let idx = node.index();
+			let m = unsafe { &*self.metrics[idx].get() };
+			let node_start = byte_accumulator;
+			let node_end = node_start.saturating_add(m.byte_length as u64);
+
+			if clamped_target < node_end.get()
+				|| (clamped_target == root_len && node_end.get() == root_len)
+			{
+				if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
+					curr = Some(child);
+					continue;
+				}
+
+				let local_offset = clamped_target.saturating_sub(node_start.get()) as u32;
+				return NodeByteTarget {
+					node_id: node,
+					node_start_byte: node_start,
+					node_end_byte: node_end,
+					node_byte: NodeByteOffset::new(local_offset.min(m.byte_length)),
+				};
+			}
+
+			if unsafe { (*self.edges[idx].get()).first_child.is_none() } {
+				last_leaf = Some(NodeByteTarget {
+					node_id: node,
+					node_start_byte: node_start,
+					node_end_byte: node_end,
+					node_byte: NodeByteOffset::new(m.byte_length),
+				});
+			}
+
+			byte_accumulator = node_end;
+			curr = unsafe { (*self.edges[idx].get()).next_sibling };
+		}
+
+		last_leaf.unwrap_or(NodeByteTarget {
+			node_id: root,
+			node_start_byte: DocByte::ZERO,
+			node_end_byte: DocByte::ZERO,
+			node_byte: NodeByteOffset::ZERO,
+		})
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::UastProjection;
-	use crate::core::{DocLine, TAB_SIZE, VisualCol};
+	use crate::core::{DocByte, DocLine, TAB_SIZE, VisualCol};
 	use crate::ecs::UastRegistry;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
@@ -358,6 +418,39 @@ mod tests {
 		chunk.append_local_child(root, leaf);
 		unsafe {
 			*registry.virtual_data[leaf.index()].get() = Some(text.as_bytes().to_vec());
+		}
+		(registry, root)
+	}
+
+	fn build_document_with_leaves(chunks: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
+		let mut chunk = registry
+			.reserve_chunk((chunks.len() + 1) as u32)
+			.expect("OOM");
+		let full_text: String = chunks.concat();
+		let newlines = full_text.bytes().filter(|&b| b == b'\n').count() as u32;
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: full_text.len() as u32,
+				newlines,
+			},
+		);
+		for part in chunks {
+			let bytes = part.as_bytes();
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				None,
+				SpanMetrics {
+					byte_length: bytes.len() as u32,
+					newlines: bytes.iter().filter(|&&b| b == b'\n').count() as u32,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			unsafe {
+				*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
+			}
 		}
 		(registry, root)
 	}
@@ -396,7 +489,8 @@ mod tests {
 		let valid_boundaries = visual_boundaries_for_line("\tfoo\n");
 
 		for clicked_col in 0..=7 {
-			let target = registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(clicked_col));
+			let target =
+				registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(clicked_col));
 			assert!(
 				valid_boundaries.contains(&target.visual_col),
 				"clicked visual col {} landed at invalid boundary {:?}",
@@ -424,7 +518,8 @@ mod tests {
 		let valid_boundaries = visual_boundaries_for_line(" \tfoo\n");
 
 		for clicked_col in 0..=7 {
-			let target = registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(clicked_col));
+			let target =
+				registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(clicked_col));
 			assert!(
 				valid_boundaries.contains(&target.visual_col),
 				"clicked visual col {} landed at invalid boundary {:?}",
@@ -432,5 +527,28 @@ mod tests {
 				target.visual_col,
 			);
 		}
+	}
+
+	#[test]
+	fn find_node_at_doc_byte_tracks_leaf_start_and_local_offset() {
+		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
+
+		let at_start_of_second = registry.find_node_at_doc_byte(root, DocByte::new(5));
+		assert_eq!(at_start_of_second.node_start_byte, DocByte::new(5));
+		assert_eq!(at_start_of_second.node_end_byte, DocByte::new(9));
+		assert_eq!(
+			at_start_of_second.node_byte,
+			crate::core::NodeByteOffset::ZERO
+		);
+
+		let inside_third = registry.find_node_at_doc_byte(root, DocByte::new(11));
+		assert_eq!(inside_third.node_start_byte, DocByte::new(9));
+		assert_eq!(inside_third.node_end_byte, DocByte::new(14));
+		assert_eq!(inside_third.node_byte, crate::core::NodeByteOffset::new(2),);
+
+		let eof = registry.find_node_at_doc_byte(root, DocByte::new(14));
+		assert_eq!(eof.node_start_byte, DocByte::new(9));
+		assert_eq!(eof.node_end_byte, DocByte::new(14));
+		assert_eq!(eof.node_byte, crate::core::NodeByteOffset::new(5));
 	}
 }

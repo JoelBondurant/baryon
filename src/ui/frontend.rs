@@ -18,6 +18,12 @@ use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[derive(Clone, Copy)]
+enum PendingOperator {
+	Delete,
+	Change,
+}
+
 pub struct Frontend<B: Backend + io::Write> {
 	terminal: Terminal<B>,
 	tx_cmd: mpsc::Sender<EditorCommand>,
@@ -27,6 +33,8 @@ pub struct Frontend<B: Backend + io::Write> {
 	command_buffer: String,
 	g_prefix: bool,
 	y_prefix: bool,
+	pending_operator: Option<PendingOperator>,
+	awaiting_inner_word: bool,
 	pending_register: Option<char>,
 	status_message: Option<String>,
 	needs_redraw: bool,
@@ -48,6 +56,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 			command_buffer: String::new(),
 			g_prefix: false,
 			y_prefix: false,
+			pending_operator: None,
+			awaiting_inner_word: false,
 			pending_register: None,
 			status_message: None,
 			needs_redraw: false,
@@ -580,7 +590,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 	fn clear_prefixes(&mut self) {
 		self.g_prefix = false;
 		self.y_prefix = false;
+		self.pending_operator = None;
+		self.awaiting_inner_word = false;
 		self.pending_register = None;
+	}
+
+	fn clear_operator_pending(&mut self) {
+		self.pending_operator = None;
+		self.awaiting_inner_word = false;
 	}
 
 	fn handle_normal_key(
@@ -600,6 +617,27 @@ impl<B: Backend + io::Write> Frontend<B> {
 			} else {
 				self.clear_prefixes();
 				return false;
+			}
+		}
+
+		if let Some(operator) = self.pending_operator {
+			if self.awaiting_inner_word {
+				if let KeyCode::Char('w') = code {
+					let command = match operator {
+						PendingOperator::Delete => EditorCommand::DeleteInnerWord,
+						PendingOperator::Change => EditorCommand::ChangeInnerWord,
+					};
+					let _ = self.tx_cmd.send(command);
+					self.clear_prefixes();
+					return false;
+				}
+
+				self.clear_operator_pending();
+			} else if let KeyCode::Char('i') = code {
+				self.awaiting_inner_word = true;
+				return false;
+			} else {
+				self.clear_operator_pending();
 			}
 		}
 
@@ -673,6 +711,18 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::MoveCursor(MoveDirection::Bottom));
+				self.clear_prefixes();
+			}
+			KeyCode::Char('d') => {
+				self.clear_prefixes();
+				self.pending_operator = Some(PendingOperator::Delete);
+			}
+			KeyCode::Char('c') => {
+				self.clear_prefixes();
+				self.pending_operator = Some(PendingOperator::Change);
+			}
+			KeyCode::Char('D') => {
+				let _ = self.tx_cmd.send(EditorCommand::DeleteToLineEnd);
 				self.clear_prefixes();
 			}
 			KeyCode::Char('y') => {

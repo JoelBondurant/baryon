@@ -7,7 +7,8 @@ use crate::engine::undo::{
 use crate::svp::highlight::HighlightSpan;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest};
 use crate::svp::{RequestPriority, SvpResolver, ingest_svp_file};
-use crate::uast::{NodeCursorTarget, UastMutation, UastProjection, Viewport};
+use crate::uast::{NodeByteTarget, NodeCursorTarget, UastMutation, UastProjection, Viewport};
+use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 use std::collections::HashMap;
@@ -68,6 +69,9 @@ pub enum EditorCommand {
 	SmartHome,
 	PageUp,
 	PageDown,
+	DeleteInnerWord,
+	ChangeInnerWord,
+	DeleteToLineEnd,
 	LoadFile(String),
 	WriteFile,
 	WriteFileAs(String),
@@ -516,6 +520,239 @@ fn apply_cursor_target(
 	*cursor_abs_col = target.visual_col;
 }
 
+struct ParseWindow {
+	text: String,
+	global_start_byte: DocByte,
+	cursor_local_byte: u32,
+}
+
+fn is_structural_word_token(kind: SyntaxKind) -> bool {
+	kind == SyntaxKind::IDENT || kind.is_keyword(Edition::Edition2024) || kind.is_literal()
+}
+
+fn seek_structural_token(mut token: SyntaxToken, direction: Direction) -> Option<SyntaxToken> {
+	loop {
+		if is_structural_word_token(token.kind()) {
+			return Some(token);
+		}
+
+		if token.kind() == SyntaxKind::WHITESPACE || token.kind().is_punct() {
+			token = match direction {
+				Direction::Next => token.next_token()?,
+				Direction::Prev => token.prev_token()?,
+			};
+			continue;
+		}
+
+		return None;
+	}
+}
+
+fn select_structural_token_at_offset(
+	syntax: &ra_ap_syntax::SyntaxNode,
+	offset: TextSize,
+) -> Option<SyntaxToken> {
+	let left = syntax.token_at_offset(offset).left_biased();
+	let right = syntax.token_at_offset(offset).right_biased();
+
+	match (left, right) {
+		(None, None) => None,
+		(Some(token), None) | (None, Some(token)) => {
+			if is_structural_word_token(token.kind()) {
+				Some(token)
+			} else {
+				seek_structural_token(token.clone(), Direction::Next)
+					.or_else(|| seek_structural_token(token, Direction::Prev))
+			}
+		}
+		(Some(left), Some(right)) if left == right => {
+			if is_structural_word_token(left.kind()) {
+				Some(left)
+			} else {
+				seek_structural_token(left.clone(), Direction::Next)
+					.or_else(|| seek_structural_token(left, Direction::Prev))
+			}
+		}
+		(Some(left), Some(right)) => {
+			if is_structural_word_token(right.kind()) {
+				return Some(right);
+			}
+
+			if right.kind() == SyntaxKind::WHITESPACE {
+				if let Some(found) = seek_structural_token(right.clone(), Direction::Next) {
+					return Some(found);
+				}
+			}
+
+			if is_structural_word_token(left.kind()) {
+				return Some(left);
+			}
+
+			if right.kind().is_punct() {
+				if let Some(found) = seek_structural_token(right, Direction::Next) {
+					return Some(found);
+				}
+			}
+
+			seek_structural_token(left, Direction::Prev)
+		}
+	}
+}
+
+fn resolve_loaded_node_text(registry: &UastRegistry, node: NodeId) -> Result<String, String> {
+	let text = registry.resolve_physical_bytes(node);
+	let byte_len = unsafe { (*registry.metrics[node.index()].get()).byte_length as usize };
+	if text.is_empty() && byte_len > 0 {
+		return Err("File still loading, cannot resolve structural token".to_string());
+	}
+	Ok(text)
+}
+
+fn build_parse_window_around_leaf(
+	registry: &UastRegistry,
+	leaf: NodeByteTarget,
+) -> Result<ParseWindow, String> {
+	let mut text = String::new();
+	let mut global_start_byte = leaf.node_start_byte;
+	let mut cursor_local_byte = leaf.node_byte.get() as usize;
+
+	if let Some(prev) = registry.get_prev_sibling(leaf.node_id) {
+		let prev_text = resolve_loaded_node_text(registry, prev)?;
+		let prev_len = unsafe { (*registry.metrics[prev.index()].get()).byte_length as u64 };
+		cursor_local_byte += prev_text.len();
+		global_start_byte = global_start_byte.saturating_sub(prev_len);
+		text.push_str(&prev_text);
+	}
+
+	let current_text = resolve_loaded_node_text(registry, leaf.node_id)?;
+	text.push_str(&current_text);
+
+	if let Some(next) = registry.get_next_sibling(leaf.node_id) {
+		let next_text = resolve_loaded_node_text(registry, next)?;
+		text.push_str(&next_text);
+	}
+
+	Ok(ParseWindow {
+		text,
+		global_start_byte,
+		cursor_local_byte: cursor_local_byte as u32,
+	})
+}
+
+fn word_object_delta_at_cursor(
+	registry: &UastRegistry,
+	root: NodeId,
+	cursor_abs_byte_offset: DocByte,
+) -> Result<Option<TextDelta>, String> {
+	let leaf = registry.find_node_at_doc_byte(root, cursor_abs_byte_offset);
+	let parse_window = build_parse_window_around_leaf(registry, leaf)?;
+	let parse = SourceFile::parse(&parse_window.text, Edition::Edition2024);
+	let syntax = parse.tree().syntax().clone();
+	let offset = TextSize::from(parse_window.cursor_local_byte);
+
+	let Some(token) = select_structural_token_at_offset(&syntax, offset) else {
+		return Ok(None);
+	};
+
+	let range = token.text_range();
+	let start = parse_window
+		.global_start_byte
+		.saturating_add(u64::from(u32::from(range.start())));
+	let end = parse_window
+		.global_start_byte
+		.saturating_add(u64::from(u32::from(range.end())));
+
+	if end <= start {
+		return Ok(None);
+	}
+
+	Ok(Some(TextDelta {
+		global_byte_offset: start,
+		deleted_text: token.text().to_string(),
+		inserted_text: String::new(),
+		state_before: StateId::ZERO,
+		state_after: StateId::ZERO,
+	}))
+}
+
+fn delete_to_line_end_delta(
+	doc: &[u8],
+	cursor_line: DocLine,
+	cursor_col: VisualCol,
+) -> Option<TextDelta> {
+	let cursor_abs_byte_offset = byte_offset_from_line_col(doc, cursor_line, cursor_col);
+	let delete_start = cursor_abs_byte_offset.get() as usize;
+	let (line_start, line_end_with_newline) = line_byte_range(doc, cursor_line, cursor_line);
+	let line_end = if line_end_with_newline > line_start && doc[line_end_with_newline - 1] == b'\n'
+	{
+		line_end_with_newline - 1
+	} else {
+		line_end_with_newline
+	};
+
+	if delete_start >= line_end {
+		return None;
+	}
+
+	Some(TextDelta {
+		global_byte_offset: cursor_abs_byte_offset,
+		deleted_text: String::from_utf8_lossy(&doc[delete_start..line_end]).into_owned(),
+		inserted_text: String::new(),
+		state_before: StateId::ZERO,
+		state_after: StateId::ZERO,
+	})
+}
+
+fn apply_delta_to_document(
+	registry: &UastRegistry,
+	root_id: &mut Option<NodeId>,
+	cursor_node: &mut NodeId,
+	cursor_offset: &mut u32,
+	cursor_abs_line: &mut DocLine,
+	cursor_abs_col: &mut VisualCol,
+	ledger: &mut UndoLedger,
+	semantic_highlights: &mut Vec<HighlightSpan>,
+	delta: TextDelta,
+) -> Result<(), String> {
+	let rid = (*root_id).ok_or_else(|| "No file loaded".to_string())?;
+	let bytes = registry
+		.collect_document_bytes(rid)
+		.map_err(|msg| msg.to_string())?;
+	let start = delta.global_byte_offset.get() as usize;
+	let end = start.saturating_add(delta.deleted_text.len());
+
+	if end > bytes.len() {
+		return Err("Edit range exceeded document bounds".to_string());
+	}
+
+	if bytes[start..end] != delta.deleted_text.as_bytes()[..] {
+		return Err("Edit range no longer matches live document".to_string());
+	}
+
+	let mut new_bytes =
+		Vec::with_capacity(bytes.len() - delta.deleted_text.len() + delta.inserted_text.len());
+	new_bytes.extend_from_slice(&bytes[..start]);
+	new_bytes.extend_from_slice(delta.inserted_text.as_bytes());
+	new_bytes.extend_from_slice(&bytes[end..]);
+
+	let cursor_byte_after_edit = delta
+		.global_byte_offset
+		.saturating_add(delta.inserted_text.len() as u64);
+
+	push_delta_and_rebase(ledger, semantic_highlights, delta);
+	let (new_root, new_leaf) = create_document_from_bytes(registry, &new_bytes);
+	*root_id = Some(new_root);
+	*cursor_node = new_leaf;
+	*cursor_offset = 0;
+
+	let (line, col) = line_col_from_byte_offset(&new_bytes, cursor_byte_after_edit);
+	*cursor_abs_line = line;
+	let target = registry.find_node_at_line_col(new_root, line, col);
+	apply_cursor_target(target, cursor_node, cursor_offset, cursor_abs_col);
+
+	Ok(())
+}
+
 pub struct Engine {
 	registry: Arc<UastRegistry>,
 	resolver: Arc<SvpResolver>,
@@ -728,6 +965,85 @@ impl Engine {
 							&mut cursor_abs_col,
 						);
 						needs_render = true;
+					}
+				}
+				word_cmd @ (EditorCommand::DeleteInnerWord | EditorCommand::ChangeInnerWord) => {
+					if let Some(rid) = root_id {
+						if let Ok(bytes) = registry.collect_document_bytes(rid) {
+							let cursor_abs_byte_offset =
+								byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col);
+							match word_object_delta_at_cursor(
+								&registry,
+								rid,
+								cursor_abs_byte_offset,
+							) {
+								Ok(Some(delta)) => {
+									match apply_delta_to_document(
+										&registry,
+										&mut root_id,
+										&mut cursor_node,
+										&mut cursor_offset,
+										&mut cursor_abs_line,
+										&mut cursor_abs_col,
+										&mut ledger,
+										&mut semantic_highlights,
+										delta,
+									) {
+										Ok(()) => {
+											if matches!(word_cmd, EditorCommand::ChangeInnerWord) {
+												mode_override = Some(EditorMode::Insert);
+											}
+										}
+										Err(msg) => status_message = Some(msg),
+									}
+								}
+								Ok(None) => {
+									status_message =
+										Some("No structural word at cursor".to_string())
+								}
+								Err(msg) => status_message = Some(msg),
+							}
+							needs_render = true;
+						} else {
+							status_message = Some(
+								"File still loading, cannot resolve structural token".to_string(),
+							);
+							needs_render = true;
+						}
+					}
+				}
+				EditorCommand::DeleteToLineEnd => {
+					if let Some(rid) = root_id {
+						match registry.collect_document_bytes(rid) {
+							Ok(bytes) => {
+								if let Some(delta) = delete_to_line_end_delta(
+									&bytes,
+									cursor_abs_line,
+									cursor_abs_col,
+								) {
+									if let Err(msg) = apply_delta_to_document(
+										&registry,
+										&mut root_id,
+										&mut cursor_node,
+										&mut cursor_offset,
+										&mut cursor_abs_line,
+										&mut cursor_abs_col,
+										&mut ledger,
+										&mut semantic_highlights,
+										delta,
+									) {
+										status_message = Some(msg);
+									}
+								} else {
+									status_message = Some("Already at end of line".to_string());
+								}
+								needs_render = true;
+							}
+							Err(msg) => {
+								status_message = Some(msg.to_string());
+								needs_render = true;
+							}
+						}
 					}
 				}
 				EditorCommand::InsertChar(c) => {
@@ -1876,13 +2192,44 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		document_rewrite_delta, first_non_whitespace_visual_col, line_end_visual_col,
-		linewise_put_insertion, rebase_semantic_highlights_after_delta, smart_home_visual_col,
-		step_left_visual_col, step_right_visual_col,
+		delete_to_line_end_delta, document_rewrite_delta, first_non_whitespace_visual_col,
+		line_end_visual_col, linewise_put_insertion, rebase_semantic_highlights_after_delta,
+		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
+		word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, StateId, VisualCol};
+	use crate::ecs::UastRegistry;
 	use crate::engine::undo::TextDelta;
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
+	use crate::uast::kind::SemanticKind;
+	use crate::uast::metrics::SpanMetrics;
+
+	fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let newlines = text.bytes().filter(|&b| b == b'\n').count() as u32;
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: text.len() as u32,
+				newlines,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: text.len() as u32,
+				newlines,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+		unsafe {
+			*registry.virtual_data[leaf.index()].get() = Some(text.as_bytes().to_vec());
+		}
+		(registry, root)
+	}
 
 	#[test]
 	fn rewrite_delta_tracks_changed_middle_span() {
@@ -1950,6 +2297,40 @@ mod tests {
 			smart_home_visual_col(doc, DocLine::ZERO, VisualCol::ZERO),
 			VisualCol::new(6),
 		);
+	}
+
+	#[test]
+	fn word_object_delta_uses_ast_identifier_boundaries() {
+		let (registry, root) = build_document("let alpha = beta;\n");
+		let delta = word_object_delta_at_cursor(&registry, root, DocByte::new(5))
+			.expect("word lookup should succeed")
+			.expect("expected a word delta");
+
+		assert_eq!(delta.global_byte_offset, DocByte::new(4));
+		assert_eq!(delta.deleted_text, "alpha");
+		assert_eq!(delta.inserted_text, "");
+	}
+
+	#[test]
+	fn word_object_delta_falls_forward_from_whitespace() {
+		let (registry, root) = build_document("let alpha beta\n");
+		let delta = word_object_delta_at_cursor(&registry, root, DocByte::new(9))
+			.expect("word lookup should succeed")
+			.expect("expected a word delta");
+
+		assert_eq!(delta.global_byte_offset, DocByte::new(10));
+		assert_eq!(delta.deleted_text, "beta");
+	}
+
+	#[test]
+	fn delete_to_line_end_delta_stops_before_newline() {
+		let delta =
+			delete_to_line_end_delta(b"alpha beta\nomega\n", DocLine::ZERO, VisualCol::new(6))
+				.expect("expected delete-to-eol delta");
+
+		assert_eq!(delta.global_byte_offset, DocByte::new(6));
+		assert_eq!(delta.deleted_text, "beta");
+		assert_eq!(delta.inserted_text, "");
 	}
 
 	#[test]

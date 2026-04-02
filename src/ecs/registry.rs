@@ -153,4 +153,8 @@ impl UastRegistry {
 			curr = next?;
 		}
 	}
+
+	pub fn get_next_sibling(&self, node: NodeId) -> Option<NodeId> {
+		unsafe { (*self.edges[node.index()].get()).next_sibling }
+	}
 }
