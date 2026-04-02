@@ -2,6 +2,17 @@
 name = "baryon"
 version = "0.1.0"
 edition = "2024"
+resolver = "3"
+authors = ["Joel Bondurant"]
+description = "Baryon, a text editor."
+
+[package.metadata.deb]
+maintainer = "Joel Bondurant"
+copyright = "2026, Joel Bondurant"
+license-file = ["LICENSE", "0"]
+assets = [
+	["target/release/baryon", "/usr/bin/baryon", "755"],
+]
 
 [dependencies]
 arboard = "3.6.1"
@@ -25,3 +36,11 @@ rayon = "1.11.0"
 regex-automata = { version = "0.4.14", default-features = true, features = ["meta", "perf"] }
 rustc-hash = "2.1.2"
 triomphe = "0.1.15"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = 0
