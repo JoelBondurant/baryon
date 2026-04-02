@@ -7,7 +7,7 @@ use crate::engine::undo::{
 use crate::svp::highlight::HighlightSpan;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest};
 use crate::svp::{RequestPriority, SvpResolver, ingest_svp_file};
-use crate::uast::{NodeByteTarget, NodeCursorTarget, UastMutation, UastProjection, Viewport};
+use crate::uast::{NodeByteTarget, NodeCursorTarget, UastProjection, Viewport};
 use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -23,6 +23,14 @@ pub enum EditorMode {
 	Command,
 	Search,
 	Confirm,
+	Visual { anchor: DocByte, kind: VisualKind },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualKind {
+	Char,
+	Line,
+	Block,
 }
 
 pub enum ConfirmAction {
@@ -72,6 +80,23 @@ pub enum EditorCommand {
 	DeleteInnerWord,
 	ChangeInnerWord,
 	DeleteToLineEnd,
+	SetVisualSelection {
+		anchor: DocByte,
+		kind: VisualKind,
+	},
+	ClearVisualSelection,
+	VisualYank {
+		anchor: DocByte,
+		kind: VisualKind,
+	},
+	VisualDelete {
+		anchor: DocByte,
+		kind: VisualKind,
+	},
+	VisualChange {
+		anchor: DocByte,
+		kind: VisualKind,
+	},
 	LoadFile(String),
 	WriteFile,
 	WriteFileAs(String),
@@ -417,13 +442,13 @@ fn rebase_semantic_highlights_after_delta(
 	});
 }
 
-fn push_delta_and_rebase(
-	ledger: &mut UndoLedger,
+fn rebase_semantic_highlights_after_deltas(
 	semantic_highlights: &mut Vec<HighlightSpan>,
-	delta: TextDelta,
+	deltas: &[TextDelta],
 ) {
-	rebase_semantic_highlights_after_delta(semantic_highlights, &delta);
-	ledger.push(delta);
+	for delta in deltas {
+		rebase_semantic_highlights_after_delta(semantic_highlights, delta);
+	}
 }
 
 fn invert_text_delta(delta: &TextDelta) -> TextDelta {
@@ -436,14 +461,18 @@ fn invert_text_delta(delta: &TextDelta) -> TextDelta {
 	}
 }
 
-fn push_document_rewrite_delta(
-	ledger: &mut UndoLedger,
+fn rebase_semantic_highlights_after_undo_group(
 	semantic_highlights: &mut Vec<HighlightSpan>,
-	before: &[u8],
-	after: &[u8],
+	deltas: &[TextDelta],
 ) {
+	for delta in deltas.iter().rev() {
+		rebase_semantic_highlights_after_delta(semantic_highlights, &invert_text_delta(delta));
+	}
+}
+
+fn document_rewrite_text_delta(before: &[u8], after: &[u8]) -> Option<TextDelta> {
 	if before == after {
-		return;
+		return None;
 	}
 
 	if let (Ok(before_text), Ok(after_text)) =
@@ -452,32 +481,24 @@ fn push_document_rewrite_delta(
 		if let Some((global_byte_offset, deleted_text, inserted_text)) =
 			document_rewrite_delta(before_text, after_text)
 		{
-			push_delta_and_rebase(
-				ledger,
-				semantic_highlights,
-				TextDelta {
-					global_byte_offset: DocByte::new(global_byte_offset),
-					deleted_text,
-					inserted_text,
-					state_before: StateId::ZERO,
-					state_after: StateId::ZERO,
-				},
-			);
+			return Some(TextDelta {
+				global_byte_offset: DocByte::new(global_byte_offset),
+				deleted_text,
+				inserted_text,
+				state_before: StateId::ZERO,
+				state_after: StateId::ZERO,
+			});
 		}
-		return;
+		return None;
 	}
 
-	push_delta_and_rebase(
-		ledger,
-		semantic_highlights,
-		TextDelta {
-			global_byte_offset: DocByte::ZERO,
-			deleted_text: String::from_utf8_lossy(before).into_owned(),
-			inserted_text: String::from_utf8_lossy(after).into_owned(),
-			state_before: StateId::ZERO,
-			state_after: StateId::ZERO,
-		},
-	);
+	Some(TextDelta {
+		global_byte_offset: DocByte::ZERO,
+		deleted_text: String::from_utf8_lossy(before).into_owned(),
+		inserted_text: String::from_utf8_lossy(after).into_owned(),
+		state_before: StateId::ZERO,
+		state_after: StateId::ZERO,
+	})
 }
 
 fn linewise_put_insertion(
@@ -703,7 +724,126 @@ fn delete_to_line_end_delta(
 	})
 }
 
-fn apply_delta_to_document(
+fn clamp_visual_byte(byte: DocByte, buffer: &[u8]) -> Option<DocByte> {
+	if buffer.is_empty() {
+		None
+	} else {
+		Some(DocByte::new(
+			byte.get().min(buffer.len().saturating_sub(1) as u64),
+		))
+	}
+}
+
+pub fn resolve_visual_ranges(
+	anchor: DocByte,
+	cursor: DocByte,
+	kind: VisualKind,
+	buffer: &[u8],
+) -> Vec<(DocByte, DocByte)> {
+	let Some(anchor) = clamp_visual_byte(anchor, buffer) else {
+		return Vec::new();
+	};
+	let Some(cursor) = clamp_visual_byte(cursor, buffer) else {
+		return Vec::new();
+	};
+
+	let start = DocByte::new(anchor.get().min(cursor.get()));
+	let end = DocByte::new(anchor.get().max(cursor.get()));
+
+	match kind {
+		VisualKind::Char => vec![(start, end)],
+		VisualKind::Line => {
+			let mut expanded_start = start.get() as usize;
+			while expanded_start > 0 && buffer[expanded_start - 1] != b'\n' {
+				expanded_start -= 1;
+			}
+
+			let mut expanded_end = end.get() as usize;
+			while expanded_end + 1 < buffer.len() && buffer[expanded_end] != b'\n' {
+				expanded_end += 1;
+			}
+
+			vec![(
+				DocByte::new(expanded_start as u64),
+				DocByte::new(expanded_end as u64),
+			)]
+		}
+		VisualKind::Block => {
+			let (anchor_line, anchor_col) = line_col_from_byte_offset(buffer, anchor);
+			let (cursor_line, cursor_col) = line_col_from_byte_offset(buffer, cursor);
+			let min_line = anchor_line.get().min(cursor_line.get());
+			let max_line = anchor_line.get().max(cursor_line.get());
+			let min_col = VisualCol::new(anchor_col.get().min(cursor_col.get()));
+			let max_col = VisualCol::new(anchor_col.get().max(cursor_col.get()));
+			let mut ranges = Vec::new();
+
+			for line in min_line..=max_line {
+				let line = DocLine::new(line);
+				let (line_start, line_end_with_break) = line_byte_range(buffer, line, line);
+				let line_content_end = if line_end_with_break > line_start
+					&& buffer[line_end_with_break - 1] == b'\n'
+				{
+					line_end_with_break - 1
+				} else {
+					line_end_with_break
+				};
+
+				if line_content_end <= line_start {
+					continue;
+				}
+
+				let start_byte = byte_offset_from_line_col(buffer, line, min_col).get() as usize;
+				if start_byte >= line_content_end {
+					continue;
+				}
+
+				let raw_end_byte = byte_offset_from_line_col(buffer, line, max_col).get() as usize;
+				let end_byte = if raw_end_byte >= line_content_end {
+					line_content_end - 1
+				} else {
+					raw_end_byte
+				};
+
+				if start_byte <= end_byte {
+					ranges.push((
+						DocByte::new(start_byte as u64),
+						DocByte::new(end_byte as u64),
+					));
+				}
+			}
+
+			ranges
+		}
+	}
+}
+
+fn visual_range_end_exclusive(end_inclusive: DocByte, buffer_len: usize) -> usize {
+	(end_inclusive.get() as usize)
+		.saturating_add(1)
+		.min(buffer_len)
+}
+
+fn extract_visual_text(ranges: &[(DocByte, DocByte)], buffer: &[u8]) -> String {
+	let mut text = String::new();
+
+	for (idx, (start, end)) in ranges.iter().enumerate() {
+		let start_idx = start.get() as usize;
+		let end_idx = visual_range_end_exclusive(*end, buffer.len());
+		if start_idx >= end_idx {
+			continue;
+		}
+
+		if idx > 0 && !text.ends_with('\n') {
+			text.push('\n');
+		}
+
+		text.push_str(&String::from_utf8_lossy(&buffer[start_idx..end_idx]));
+	}
+
+	text
+}
+
+fn apply_deltas_to_document(
 	registry: &UastRegistry,
 	root_id: &mut Option<NodeId>,
 	cursor_node: &mut NodeId,
@@ -712,42 +852,58 @@ fn apply_delta_to_document(
 	cursor_abs_col: &mut VisualCol,
 	ledger: &mut UndoLedger,
 	semantic_highlights: &mut Vec<HighlightSpan>,
-	delta: TextDelta,
+	deltas: Vec<TextDelta>,
 ) -> Result<(), String> {
+	if deltas.is_empty() {
+		return Ok(());
+	}
+
 	let rid = (*root_id).ok_or_else(|| "No file loaded".to_string())?;
-	let bytes = registry
+	let mut current_bytes = registry
 		.collect_document_bytes(rid)
 		.map_err(|msg| msg.to_string())?;
-	let start = delta.global_byte_offset.get() as usize;
-	let end = start.saturating_add(delta.deleted_text.len());
+	let mut current_root = rid;
+	let mut current_leaf = *cursor_node;
 
-	if end > bytes.len() {
-		return Err("Edit range exceeded document bounds".to_string());
+	for delta in &deltas {
+		let start = delta.global_byte_offset.get() as usize;
+		let end = start.saturating_add(delta.deleted_text.len());
+
+		if end > current_bytes.len() {
+			return Err("Edit range exceeded document bounds".to_string());
+		}
+
+		if current_bytes[start..end] != delta.deleted_text.as_bytes()[..] {
+			return Err("Edit range no longer matches live document".to_string());
+		}
+
+		let mut new_bytes = Vec::with_capacity(
+			current_bytes.len() - delta.deleted_text.len() + delta.inserted_text.len(),
+		);
+		new_bytes.extend_from_slice(&current_bytes[..start]);
+		new_bytes.extend_from_slice(delta.inserted_text.as_bytes());
+		new_bytes.extend_from_slice(&current_bytes[end..]);
+
+		let (new_root, new_leaf) = create_document_from_bytes(registry, &new_bytes);
+		current_bytes = new_bytes;
+		current_root = new_root;
+		current_leaf = new_leaf;
 	}
 
-	if bytes[start..end] != delta.deleted_text.as_bytes()[..] {
-		return Err("Edit range no longer matches live document".to_string());
-	}
-
-	let mut new_bytes =
-		Vec::with_capacity(bytes.len() - delta.deleted_text.len() + delta.inserted_text.len());
-	new_bytes.extend_from_slice(&bytes[..start]);
-	new_bytes.extend_from_slice(delta.inserted_text.as_bytes());
-	new_bytes.extend_from_slice(&bytes[end..]);
-
-	let cursor_byte_after_edit = delta
+	let last_delta = deltas.last().expect("non-empty delta group");
+	let cursor_byte_after_edit = last_delta
 		.global_byte_offset
-		.saturating_add(delta.inserted_text.len() as u64);
+		.saturating_add(last_delta.inserted_text.len() as u64);
 
-	push_delta_and_rebase(ledger, semantic_highlights, delta);
-	let (new_root, new_leaf) = create_document_from_bytes(registry, &new_bytes);
-	*root_id = Some(new_root);
-	*cursor_node = new_leaf;
+	rebase_semantic_highlights_after_deltas(semantic_highlights, &deltas);
+	ledger.push_group(deltas);
+	*root_id = Some(current_root);
+	*cursor_node = current_leaf;
 	*cursor_offset = 0;
 
-	let (line, col) = line_col_from_byte_offset(&new_bytes, cursor_byte_after_edit);
+	let (line, col) = line_col_from_byte_offset(&current_bytes, cursor_byte_after_edit);
 	*cursor_abs_line = line;
-	let target = registry.find_node_at_line_col(new_root, line, col);
+	let target = registry.find_node_at_line_col(current_root, line, col);
 	apply_cursor_target(target, cursor_node, cursor_offset, cursor_abs_col);
 
 	Ok(())
@@ -804,6 +960,7 @@ impl Engine {
 		let mut status_message: Option<String> = None;
 		let mut pending_quit = false;
 		let mut mode_override: Option<EditorMode> = None;
+		let mut active_visual: Option<(DocByte, VisualKind)> = None;
 
 		// Search state
 		let mut search_pattern: Option<String> = None;
@@ -967,6 +1124,118 @@ impl Engine {
 						needs_render = true;
 					}
 				}
+				EditorCommand::SetVisualSelection { anchor, kind } => {
+					active_visual = Some((anchor, kind));
+					needs_render = true;
+				}
+				EditorCommand::ClearVisualSelection => {
+					active_visual = None;
+					needs_render = true;
+				}
+				EditorCommand::VisualYank { anchor, kind } => {
+					if let Some(rid) = root_id {
+						match registry.collect_document_bytes(rid) {
+							Ok(bytes) => {
+								let cursor_abs_byte = byte_offset_from_line_col(
+									&bytes,
+									cursor_abs_line,
+									cursor_abs_col,
+								);
+								let ranges =
+									resolve_visual_ranges(anchor, cursor_abs_byte, kind, &bytes);
+								if ranges.is_empty() {
+									status_message = Some("Nothing selected".to_string());
+								} else {
+									let selected_text = extract_visual_text(&ranges, &bytes);
+									registers.insert('"', selected_text.clone());
+									clipboard.set_text(&selected_text);
+									status_message =
+										Some(format!("{} bytes yanked", selected_text.len()));
+								}
+								active_visual = None;
+								needs_render = true;
+							}
+							Err(msg) => {
+								status_message = Some(msg.to_string());
+								active_visual = None;
+								needs_render = true;
+							}
+						}
+					}
+				}
+				visual_delete_cmd @ (EditorCommand::VisualDelete { anchor, kind }
+				| EditorCommand::VisualChange { anchor, kind }) => {
+					if let Some(rid) = root_id {
+						match registry.collect_document_bytes(rid) {
+							Ok(bytes) => {
+								let cursor_abs_byte = byte_offset_from_line_col(
+									&bytes,
+									cursor_abs_line,
+									cursor_abs_col,
+								);
+								let ranges =
+									resolve_visual_ranges(anchor, cursor_abs_byte, kind, &bytes);
+								if ranges.is_empty() {
+									status_message = Some("Nothing selected".to_string());
+								} else {
+									let selected_text = extract_visual_text(&ranges, &bytes);
+									registers.insert('"', selected_text);
+									let mut deltas = Vec::with_capacity(ranges.len());
+									for (start, end) in ranges.iter().rev() {
+										let start_idx = start.get() as usize;
+										let end_idx = visual_range_end_exclusive(*end, bytes.len());
+										if start_idx >= end_idx {
+											continue;
+										}
+
+										let delta = TextDelta {
+											global_byte_offset: *start,
+											deleted_text: String::from_utf8_lossy(
+												&bytes[start_idx..end_idx],
+											)
+											.into_owned(),
+											inserted_text: String::new(),
+											state_before: StateId::ZERO,
+											state_after: StateId::ZERO,
+										};
+										deltas.push(delta);
+									}
+
+									if !deltas.is_empty() {
+										match apply_deltas_to_document(
+											&registry,
+											&mut root_id,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_line,
+											&mut cursor_abs_col,
+											&mut ledger,
+											&mut semantic_highlights,
+											deltas,
+										) {
+											Ok(()) => {
+												if matches!(
+													visual_delete_cmd,
+													EditorCommand::VisualChange { .. }
+												) {
+													mode_override = Some(EditorMode::Insert);
+												}
+											}
+											Err(msg) => status_message = Some(msg),
+										}
+									}
+								}
+								active_visual = None;
+								needs_render = true;
+							}
+							Err(msg) => {
+								status_message = Some(msg.to_string());
+								active_visual = None;
+								needs_render = true;
+							}
+						}
+					}
+				}
 				word_cmd @ (EditorCommand::DeleteInnerWord | EditorCommand::ChangeInnerWord) => {
 					if let Some(rid) = root_id {
 						if let Ok(bytes) = registry.collect_document_bytes(rid) {
@@ -978,7 +1247,7 @@ impl Engine {
 								cursor_abs_byte_offset,
 							) {
 								Ok(Some(delta)) => {
-									match apply_delta_to_document(
+									match apply_deltas_to_document(
 										&registry,
 										&mut root_id,
 										&mut cursor_node,
@@ -987,7 +1256,7 @@ impl Engine {
 										&mut cursor_abs_col,
 										&mut ledger,
 										&mut semantic_highlights,
-										delta,
+										vec![delta],
 									) {
 										Ok(()) => {
 											if matches!(word_cmd, EditorCommand::ChangeInnerWord) {
@@ -1021,7 +1290,7 @@ impl Engine {
 									cursor_abs_line,
 									cursor_abs_col,
 								) {
-									if let Err(msg) = apply_delta_to_document(
+									if let Err(msg) = apply_deltas_to_document(
 										&registry,
 										&mut root_id,
 										&mut cursor_node,
@@ -1030,7 +1299,7 @@ impl Engine {
 										&mut cursor_abs_col,
 										&mut ledger,
 										&mut semantic_highlights,
-										delta,
+										vec![delta],
 									) {
 										status_message = Some(msg);
 									}
@@ -1048,37 +1317,30 @@ impl Engine {
 				}
 				EditorCommand::InsertChar(c) => {
 					if let Some(rid) = root_id {
-						// Compute global byte offset at cursor for the delta.
-						let global_offset = if let Ok(bytes) = registry.collect_document_bytes(rid)
-						{
-							byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col)
-						} else {
-							DocByte::ZERO
-						};
-
-						let mut buf = [0; 4];
-						let s = c.encode_utf8(&mut buf);
-						let (new_node, new_offset) =
-							registry.insert_text(cursor_node, cursor_offset, s.as_bytes());
-						cursor_node = new_node;
-						cursor_offset = new_offset;
-
-						push_delta_and_rebase(
-							&mut ledger,
-							&mut semantic_highlights,
-							TextDelta {
-								global_byte_offset: global_offset,
-								deleted_text: String::new(),
-								inserted_text: s.to_string(),
-								state_before: StateId::ZERO,
-								state_after: StateId::ZERO,
-							},
-						);
-						if c == '\n' {
-							cursor_abs_line += 1;
-							cursor_abs_col = VisualCol::ZERO;
-						} else {
-							cursor_abs_col += 1;
+						if let Ok(bytes) = registry.collect_document_bytes(rid) {
+							let global_offset =
+								byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col);
+							let mut buf = [0; 4];
+							let s = c.encode_utf8(&mut buf);
+							if let Err(msg) = apply_deltas_to_document(
+								&registry,
+								&mut root_id,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_line,
+								&mut cursor_abs_col,
+								&mut ledger,
+								&mut semantic_highlights,
+								vec![TextDelta {
+									global_byte_offset: global_offset,
+									deleted_text: String::new(),
+									inserted_text: s.to_string(),
+									state_before: StateId::ZERO,
+									state_after: StateId::ZERO,
+								}],
+							) {
+								status_message = Some(msg);
+							}
 						}
 						needs_render = true;
 					}
@@ -1110,40 +1372,26 @@ impl Engine {
 									(String::new(), global_offset.saturating_sub(1))
 								};
 
-							let (new_node, new_offset) =
-								registry.delete_backwards(cursor_node, cursor_offset);
-							cursor_node = new_node;
-							cursor_offset = new_offset;
-
 							if !deleted_text.is_empty() {
-								push_delta_and_rebase(
+								if let Err(msg) = apply_deltas_to_document(
+									&registry,
+									&mut root_id,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_line,
+									&mut cursor_abs_col,
 									&mut ledger,
 									&mut semantic_highlights,
-									TextDelta {
+									vec![TextDelta {
 										global_byte_offset: delete_start,
-										deleted_text: deleted_text.clone(),
+										deleted_text,
 										inserted_text: String::new(),
 										state_before: StateId::ZERO,
 										state_after: StateId::ZERO,
-									},
-								);
-							}
-
-							// Update cursor position after backspace.
-							if deleted_text == "\n" {
-								if cursor_abs_line > DocLine::ZERO {
-									cursor_abs_line -= 1;
-									// Recompute col: walk to the new byte offset.
-									if let Ok(bytes) =
-										registry.collect_document_bytes(root_id.unwrap_or(rid))
-									{
-										let (_, col) =
-											line_col_from_byte_offset(&bytes, delete_start);
-										cursor_abs_col = col;
-									}
+									}],
+								) {
+									status_message = Some(msg);
 								}
-							} else {
-								cursor_abs_col = cursor_abs_col.saturating_sub(1);
 							}
 							needs_render = true;
 						}
@@ -1200,6 +1448,7 @@ impl Engine {
 						cursor_abs_line = DocLine::ZERO;
 						cursor_abs_col = VisualCol::ZERO;
 						ledger.clear();
+						active_visual = None;
 						semantic_highlights.clear();
 						last_semantic_state = None;
 						last_semantic_len = usize::MAX;
@@ -1239,6 +1488,7 @@ impl Engine {
 						cursor_abs_line = DocLine::ZERO;
 						cursor_abs_col = VisualCol::ZERO;
 						ledger.clear();
+						active_visual = None;
 						semantic_highlights.clear();
 						last_semantic_state = None;
 						last_semantic_len = usize::MAX;
@@ -1478,35 +1728,52 @@ impl Engine {
 									if count == 0 {
 										status_message = Some("Pattern not found".to_string());
 									} else {
-										push_document_rewrite_delta(
-											&mut ledger,
-											&mut semantic_highlights,
-											&bytes,
-											&new_bytes,
-										);
-										let (new_root, _) =
-											create_document_from_bytes(&registry, &new_bytes);
-										root_id = Some(new_root);
-										cursor_abs_line = DocLine::new(cursor_abs_line.get().min(
-											new_bytes.iter().filter(|&&b| b == b'\n').count()
-												as u32,
-										));
-										let target = registry.find_node_at_line_col(
-											new_root,
-											cursor_abs_line,
-											VisualCol::ZERO,
-										);
-										apply_cursor_target(
-											target,
-											&mut cursor_node,
-											&mut cursor_offset,
-											&mut cursor_abs_col,
-										);
+										if let Some(delta) =
+											document_rewrite_text_delta(&bytes, &new_bytes)
+										{
+											match apply_deltas_to_document(
+												&registry,
+												&mut root_id,
+												&mut cursor_node,
+												&mut cursor_offset,
+												&mut cursor_abs_line,
+												&mut cursor_abs_col,
+												&mut ledger,
+												&mut semantic_highlights,
+												vec![delta],
+											) {
+												Ok(()) => {
+													cursor_abs_line = DocLine::new(
+														cursor_abs_line.get().min(
+															new_bytes
+																.iter()
+																.filter(|&&b| b == b'\n')
+																.count() as u32,
+														),
+													);
+													if let Some(new_root) = root_id {
+														let target = registry.find_node_at_line_col(
+															new_root,
+															cursor_abs_line,
+															VisualCol::ZERO,
+														);
+														apply_cursor_target(
+															target,
+															&mut cursor_node,
+															&mut cursor_offset,
+															&mut cursor_abs_col,
+														);
+													}
 
-										search_matches.clear();
-										search_match_index = None;
-										search_match_info = None;
-										status_message = Some(format!("{} substitution(s)", count));
+													search_matches.clear();
+													search_match_index = None;
+													search_match_info = None;
+													status_message =
+														Some(format!("{} substitution(s)", count));
+												}
+												Err(msg) => status_message = Some(msg),
+											}
+										}
 									}
 								}
 								Err(msg) => {
@@ -1625,100 +1892,118 @@ impl Engine {
 										&bytes[byte_off + current_match.byte_len..],
 									);
 									cs.replacements_done += 1;
-									push_document_rewrite_delta(
-										&mut ledger,
-										&mut semantic_highlights,
-										&bytes,
-										&new_bytes,
-									);
-
-									let (new_root, _) =
-										create_document_from_bytes(&registry, &new_bytes);
-									root_id = Some(new_root);
-									let new_rid = new_root;
-
-									// Re-scan for remaining matches after replacement point, filtered by range
-									let re = build_regex(&pat, cs.flags.case_insensitive).unwrap();
-									let all_new = find_all_matches(&new_bytes, &re);
-									let new_matches: Vec<SearchMatch> = match &cs.range {
-										SubstituteRange::WholeFile => all_new,
-										SubstituteRange::CurrentLine => all_new
-											.into_iter()
-											.filter(|m| m.line == current_match.line)
-											.collect(),
-										SubstituteRange::SingleLine(n) => {
-											let n = *n;
-											all_new
-												.into_iter()
-												.filter(move |m| m.line == n)
-												.collect()
-										}
-										SubstituteRange::LineRange(a, b) => {
-											let (a, b) = (*a, *b);
-											all_new
-												.into_iter()
-												.filter(move |m| m.line >= a && m.line <= b)
-												.collect()
-										}
-									};
-									// Find next match at or after the replacement point
-									let rep_end_line;
-									let rep_end_col;
+									let applied_ok = if let Some(delta) =
+										document_rewrite_text_delta(&bytes, &new_bytes)
 									{
-										let mut l = current_match.line;
-										let mut c = current_match.col;
-										for &b in rep {
-											advance_col(b, &mut l, &mut c);
+										match apply_deltas_to_document(
+											&registry,
+											&mut root_id,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_line,
+											&mut cursor_abs_col,
+											&mut ledger,
+											&mut semantic_highlights,
+											vec![delta],
+										) {
+											Ok(()) => true,
+											Err(msg) => {
+												status_message = Some(msg);
+												false
+											}
 										}
-										rep_end_line = l;
-										rep_end_col = c;
-									}
-									let next_idx = new_matches.iter().position(|m| {
-										m.line > rep_end_line
-											|| (m.line == rep_end_line && m.col >= rep_end_col)
-									});
-
-									search_matches = new_matches;
-
-									if let Some(ni) = next_idx {
-										search_match_index = Some(ni);
-										let current_match = search_matches[ni];
-										cursor_abs_line = current_match.line;
-										let target = registry.find_node_at_line_col(
-											new_rid,
-											current_match.line,
-											current_match.col,
-										);
-										apply_cursor_target(
-											target,
-											&mut cursor_node,
-											&mut cursor_offset,
-											&mut cursor_abs_col,
-										);
-										cursor_abs_col = current_match.col;
-										status_message = Some(format!(
-											"Replace? [y/n/a/q] ({}/{})",
-											cs.replacements_done + 1,
-											cs.total_matches
-										));
 									} else {
-										status_message = Some(format!(
-											"{} substitution(s)",
-											cs.replacements_done
-										));
-										mode_override = Some(EditorMode::Normal);
-										confirm_state = None;
-										let target = registry.find_node_at_line_col(
-											new_rid,
-											cursor_abs_line,
-											cursor_abs_col,
-										);
-										apply_cursor_target(
-											target,
-											&mut cursor_node,
-											&mut cursor_offset,
-											&mut cursor_abs_col,
-										);
+										true
+									};
+
+									if applied_ok {
+										if let Some(new_rid) = root_id {
+											// Re-scan for remaining matches after replacement point, filtered by range
+											let re =
+												build_regex(&pat, cs.flags.case_insensitive).unwrap();
+											let all_new = find_all_matches(&new_bytes, &re);
+											let new_matches: Vec<SearchMatch> = match &cs.range {
+												SubstituteRange::WholeFile => all_new,
+												SubstituteRange::CurrentLine => all_new
+													.into_iter()
+													.filter(|m| m.line == current_match.line)
+													.collect(),
+												SubstituteRange::SingleLine(n) => {
+													let n = *n;
+													all_new
+														.into_iter()
+														.filter(move |m| m.line == n)
+														.collect()
+												}
+												SubstituteRange::LineRange(a, b) => {
+													let (a, b) = (*a, *b);
+													all_new
+														.into_iter()
+														.filter(move |m| m.line >= a && m.line <= b)
+														.collect()
+												}
+											};
+											// Find next match at or after the replacement point
+											let rep_end_line;
+											let rep_end_col;
+											{
+												let mut l = current_match.line;
+												let mut c = current_match.col;
+												for &b in rep {
+													advance_col(b, &mut l, &mut c);
+												}
+												rep_end_line = l;
+												rep_end_col = c;
+											}
+											let next_idx = new_matches.iter().position(|m| {
+												m.line > rep_end_line
+													|| (m.line == rep_end_line
+														&& m.col >= rep_end_col)
+											});
+
+											search_matches = new_matches;
+
+											if let Some(ni) = next_idx {
+												search_match_index = Some(ni);
+												let current_match = search_matches[ni];
+												cursor_abs_line = current_match.line;
+												let target = registry.find_node_at_line_col(
+													new_rid,
+													current_match.line,
+													current_match.col,
+												);
+												apply_cursor_target(
+													target,
+													&mut cursor_node,
+													&mut cursor_offset,
+													&mut cursor_abs_col,
+												);
+												cursor_abs_col = current_match.col;
+												status_message = Some(format!(
+													"Replace? [y/n/a/q] ({}/{})",
+													cs.replacements_done + 1,
+													cs.total_matches
+												));
+											} else {
+												status_message = Some(format!(
+													"{} substitution(s)",
+													cs.replacements_done
+												));
+												mode_override = Some(EditorMode::Normal);
+												confirm_state = None;
+												let target = registry.find_node_at_line_col(
+													new_rid,
+													cursor_abs_line,
+													cursor_abs_col,
+												);
+												apply_cursor_target(
+													target,
+													&mut cursor_node,
+													&mut cursor_offset,
+													&mut cursor_abs_col,
+												);
+											}
+										}
 									}
 								}
 							}
@@ -1779,30 +2064,42 @@ impl Engine {
 									new_bytes.extend_from_slice(&bytes[..byte_off]);
 									new_bytes.extend_from_slice(&replaced);
 									cs.replacements_done += count;
-									push_document_rewrite_delta(
-										&mut ledger,
-										&mut semantic_highlights,
-										&bytes,
-										&new_bytes,
-									);
-
-									let (new_root, _new_leaf) =
-										create_document_from_bytes(&registry, &new_bytes);
-									root_id = Some(new_root);
-
-									let target = registry.find_node_at_line_col(
-										new_root,
-										cursor_abs_line,
-										cursor_abs_col,
-									);
-									apply_cursor_target(
-										target,
-										&mut cursor_node,
-										&mut cursor_offset,
-										&mut cursor_abs_col,
-									);
-									status_message =
-										Some(format!("{} substitution(s)", cs.replacements_done));
+									if let Some(delta) =
+										document_rewrite_text_delta(&bytes, &new_bytes)
+									{
+										match apply_deltas_to_document(
+											&registry,
+											&mut root_id,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_line,
+											&mut cursor_abs_col,
+											&mut ledger,
+											&mut semantic_highlights,
+											vec![delta],
+										) {
+											Ok(()) => {
+												if let Some(new_root) = root_id {
+													let target = registry.find_node_at_line_col(
+														new_root,
+														cursor_abs_line,
+														cursor_abs_col,
+													);
+													apply_cursor_target(
+														target,
+														&mut cursor_node,
+														&mut cursor_offset,
+														&mut cursor_abs_col,
+													);
+												}
+												status_message = Some(format!(
+													"{} substitution(s)",
+													cs.replacements_done
+												));
+											}
+											Err(msg) => status_message = Some(msg),
+										}
+									}
 								}
 								mode_override = Some(EditorMode::Normal);
 								search_matches.clear();
@@ -1885,44 +2182,40 @@ impl Engine {
 									// Insert after current line (Vim 'p' for line-wise yank).
 									let (insert_offset, inserted_text, target_cursor_line) =
 										linewise_put_insertion(&bytes, cursor_abs_line, &text);
-
-									// Build new document through delta + ledger.
-									let mut new_bytes =
-										Vec::with_capacity(bytes.len() + inserted_text.len());
-									new_bytes.extend_from_slice(&bytes[..insert_offset]);
-									new_bytes.extend_from_slice(inserted_text.as_bytes());
-									new_bytes.extend_from_slice(&bytes[insert_offset..]);
-
-									push_delta_and_rebase(
+									if let Err(msg) = apply_deltas_to_document(
+										&registry,
+										&mut root_id,
+										&mut cursor_node,
+										&mut cursor_offset,
+										&mut cursor_abs_line,
+										&mut cursor_abs_col,
 										&mut ledger,
 										&mut semantic_highlights,
-										TextDelta {
+										vec![TextDelta {
 											global_byte_offset: DocByte::new(insert_offset as u64),
 											deleted_text: String::new(),
 											inserted_text,
 											state_before: StateId::ZERO,
 											state_after: StateId::ZERO,
-										},
-									);
-
-									let (new_root, _) =
-										create_document_from_bytes(&registry, &new_bytes);
-									root_id = Some(new_root);
-
-									// Place cursor on the first line of pasted text.
-									cursor_abs_line = target_cursor_line;
-									cursor_abs_col = VisualCol::ZERO;
-									let target = registry.find_node_at_line_col(
-										new_root,
-										cursor_abs_line,
-										cursor_abs_col,
-									);
-									apply_cursor_target(
-										target,
-										&mut cursor_node,
-										&mut cursor_offset,
-										&mut cursor_abs_col,
-									);
+										}],
+									) {
+										status_message = Some(msg);
+									} else if let Some(new_root) = root_id {
+										// Place cursor on the first line of pasted text.
+										cursor_abs_line = target_cursor_line;
+										cursor_abs_col = VisualCol::ZERO;
+										let target = registry.find_node_at_line_col(
+											new_root,
+											cursor_abs_line,
+											cursor_abs_col,
+										);
+										apply_cursor_target(
+											target,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_col,
+										);
+									}
 									needs_render = true;
 								}
 							}
@@ -1934,12 +2227,12 @@ impl Engine {
 				}
 				EditorCommand::Undo => {
 					if let Some(rid) = root_id {
-						if let Some((new_root, new_leaf, cursor_byte, _, delta)) =
+						if let Some((new_root, new_leaf, cursor_byte, _, deltas)) =
 							ledger.undo(&registry, rid)
 						{
-							rebase_semantic_highlights_after_delta(
+							rebase_semantic_highlights_after_undo_group(
 								&mut semantic_highlights,
-								&invert_text_delta(&delta),
+								&deltas,
 							);
 							root_id = Some(new_root);
 							cursor_node = new_leaf;
@@ -1964,12 +2257,12 @@ impl Engine {
 				}
 				EditorCommand::Redo => {
 					if let Some(rid) = root_id {
-						if let Some((new_root, new_leaf, cursor_byte, _, delta)) =
+						if let Some((new_root, new_leaf, cursor_byte, _, deltas)) =
 							ledger.redo(&registry, rid)
 						{
-							rebase_semantic_highlights_after_delta(
+							rebase_semantic_highlights_after_deltas(
 								&mut semantic_highlights,
-								&delta,
+								&deltas,
 							);
 							root_id = Some(new_root);
 							cursor_node = new_leaf;
@@ -2126,15 +2419,34 @@ impl Engine {
 					global_start_byte = first_visible.absolute_start_byte;
 				}
 
+				let current_doc_bytes =
+					root_id.and_then(|rid| registry.collect_document_bytes(rid).ok());
+				let cursor_abs_byte = current_doc_bytes
+					.as_ref()
+					.map(|bytes| byte_offset_from_line_col(bytes, cursor_abs_line, cursor_abs_col))
+					.unwrap_or(DocByte::ZERO);
+				let cursor_line_start_byte = current_doc_bytes
+					.as_ref()
+					.map(|bytes| byte_offset_from_line_col(bytes, cursor_abs_line, VisualCol::ZERO))
+					.unwrap_or(DocByte::ZERO);
+				let selection_ranges = match (active_visual, current_doc_bytes.as_ref()) {
+					(Some((anchor, kind)), Some(bytes)) => {
+						resolve_visual_ranges(anchor, cursor_abs_byte, kind, bytes)
+					}
+					_ => Vec::new(),
+				};
+
 				let _ = tx_view.send(Viewport {
 					tokens,
 					cursor_abs_pos: CursorPosition::new(cursor_abs_line, cursor_abs_col),
+					cursor_abs_byte,
+					cursor_line_start_byte,
 					total_lines,
 					status_message: status_message.take(),
 					should_quit: pending_quit,
 					file_name: file_path.clone(),
-					file_size: root_id
-						.and_then(|rid| registry.collect_document_bytes(rid).ok())
+					file_size: current_doc_bytes
+						.as_ref()
 						.map(|b| b.len() as u64)
 						.unwrap_or(0),
 					is_dirty: ledger.is_dirty(),
@@ -2145,6 +2457,7 @@ impl Engine {
 					mode_override: mode_override.take(),
 					global_start_byte,
 					highlights,
+					selection_ranges,
 					yank_flash,
 				});
 
@@ -2192,20 +2505,21 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		delete_to_line_end_delta, document_rewrite_delta, first_non_whitespace_visual_col,
-		line_end_visual_col, linewise_put_insertion, rebase_semantic_highlights_after_delta,
-		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
-		word_object_delta_at_cursor,
+		VisualKind, apply_deltas_to_document, delete_to_line_end_delta, document_rewrite_delta,
+		first_non_whitespace_visual_col, line_end_visual_col, linewise_put_insertion,
+		rebase_semantic_highlights_after_delta, resolve_visual_ranges, smart_home_visual_col,
+		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
-	use crate::engine::undo::TextDelta;
+	use crate::engine::undo::{TextDelta, UndoLedger};
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
+	use crate::uast::UastProjection;
 
 	fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
-		let registry = UastRegistry::new(8);
+		let registry = UastRegistry::new(32);
 		let mut chunk = registry.reserve_chunk(2).expect("OOM");
 		let newlines = text.bytes().filter(|&b| b == b'\n').count() as u32;
 		let root = chunk.spawn_node(
@@ -2300,6 +2614,79 @@ mod tests {
 	}
 
 	#[test]
+	fn resolve_visual_ranges_returns_disjoint_char_range() {
+		assert_eq!(
+			resolve_visual_ranges(
+				DocByte::new(8),
+				DocByte::new(3),
+				VisualKind::Char,
+				b"alpha beta\n",
+			),
+			vec![(DocByte::new(3), DocByte::new(8))]
+		);
+	}
+
+	#[test]
+	fn resolve_visual_ranges_expands_line_mode_to_full_lines() {
+		assert_eq!(
+			resolve_visual_ranges(
+				DocByte::new(4),
+				DocByte::new(7),
+				VisualKind::Line,
+				b"aa\nbb\ncc\n",
+			),
+			vec![(DocByte::new(3), DocByte::new(8))]
+		);
+	}
+
+	#[test]
+	fn resolve_visual_ranges_handles_line_mode_at_eof() {
+		assert_eq!(
+			resolve_visual_ranges(
+				DocByte::new(6),
+				DocByte::new(9),
+				VisualKind::Line,
+				b"alpha\nbeta",
+			),
+			vec![(DocByte::new(6), DocByte::new(9))]
+		);
+	}
+
+	#[test]
+	fn resolve_visual_ranges_builds_block_matrix_across_lines() {
+		assert_eq!(
+			resolve_visual_ranges(
+				DocByte::new(1),
+				DocByte::new(12),
+				VisualKind::Block,
+				b"abcd\nefgh\nijkl\n",
+			),
+			vec![
+				(DocByte::new(1), DocByte::new(2)),
+				(DocByte::new(6), DocByte::new(7)),
+				(DocByte::new(11), DocByte::new(12)),
+			]
+		);
+	}
+
+	#[test]
+	fn resolve_visual_ranges_clamps_and_skips_short_lines_in_block_mode() {
+		assert_eq!(
+			resolve_visual_ranges(
+				DocByte::new(2),
+				DocByte::new(17),
+				VisualKind::Block,
+				b"abcdef\nabc\nz\nabcdef\n",
+			),
+			vec![
+				(DocByte::new(2), DocByte::new(4)),
+				(DocByte::new(9), DocByte::new(9)),
+				(DocByte::new(15), DocByte::new(17)),
+			]
+		);
+	}
+
+	#[test]
 	fn word_object_delta_uses_ast_identifier_boundaries() {
 		let (registry, root) = build_document("let alpha = beta;\n");
 		let delta = word_object_delta_at_cursor(&registry, root, DocByte::new(5))
@@ -2355,6 +2742,86 @@ mod tests {
 			step_left_visual_col(b" \tfoo\n", DocLine::ZERO, VisualCol::new(4)),
 			VisualCol::new(1),
 		);
+	}
+
+	#[test]
+	fn grouped_deltas_undo_as_a_single_transaction() {
+		let (registry, root) = build_document("abcd\nefgh\nijkl\n");
+		let mut root_id = Some(root);
+		let mut cursor_node = registry
+			.find_node_at_line_col(root, DocLine::ZERO, VisualCol::ZERO)
+			.node_id;
+		let mut cursor_offset = 0;
+		let mut cursor_abs_line = DocLine::ZERO;
+		let mut cursor_abs_col = VisualCol::ZERO;
+		let mut ledger = UndoLedger::new();
+		let mut semantic_highlights = Vec::new();
+
+		apply_deltas_to_document(
+			&registry,
+			&mut root_id,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+			&mut ledger,
+			&mut semantic_highlights,
+			vec![
+				TextDelta {
+					global_byte_offset: DocByte::new(12),
+					deleted_text: "kl".to_string(),
+					inserted_text: String::new(),
+					state_before: StateId::ZERO,
+					state_after: StateId::ZERO,
+				},
+				TextDelta {
+					global_byte_offset: DocByte::new(7),
+					deleted_text: "gh".to_string(),
+					inserted_text: String::new(),
+					state_before: StateId::ZERO,
+					state_after: StateId::ZERO,
+				},
+				TextDelta {
+					global_byte_offset: DocByte::new(2),
+					deleted_text: "cd".to_string(),
+					inserted_text: String::new(),
+					state_before: StateId::ZERO,
+					state_after: StateId::ZERO,
+				},
+			],
+		)
+		.expect("grouped delete should apply");
+
+		assert_eq!(ledger.current_state_id, StateId::new(1));
+		let bytes = registry
+			.collect_document_bytes(root_id.expect("mutated root"))
+			.expect("collect mutated bytes");
+		assert_eq!(String::from_utf8(bytes).expect("utf8"), "ab\nef\nij\n");
+		assert_eq!(cursor_abs_line, DocLine::ZERO);
+		assert_eq!(cursor_abs_col, VisualCol::new(2));
+
+		let (undo_root, _, _, _, undo_group) = ledger
+			.undo(&registry, root_id.expect("mutated root for undo"))
+			.expect("single undo should restore whole group");
+		assert_eq!(undo_group.len(), 3);
+		assert_eq!(ledger.current_state_id, StateId::ZERO);
+		let restored = registry
+			.collect_document_bytes(undo_root)
+			.expect("collect restored bytes");
+		assert_eq!(
+			String::from_utf8(restored).expect("utf8"),
+			"abcd\nefgh\nijkl\n"
+		);
+
+		let (redo_root, _, _, _, redo_group) = ledger
+			.redo(&registry, undo_root)
+			.expect("single redo should reapply whole group");
+		assert_eq!(redo_group.len(), 3);
+		assert_eq!(ledger.current_state_id, StateId::new(1));
+		let redone = registry
+			.collect_document_bytes(redo_root)
+			.expect("collect redone bytes");
+		assert_eq!(String::from_utf8(redone).expect("utf8"), "ab\nef\nij\n");
 	}
 
 	#[test]

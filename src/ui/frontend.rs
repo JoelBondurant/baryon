@@ -1,6 +1,7 @@
 use crate::core::{CursorPosition, DocLine, TAB_SIZE, VisualCol};
 use crate::engine::{
 	ConfirmAction, EditorCommand, EditorMode, MoveDirection, SubstituteFlags, SubstituteRange,
+	VisualKind,
 };
 use crate::uast::kind::SemanticKind;
 use crate::uast::projection::Viewport;
@@ -156,6 +157,15 @@ impl<B: Backend + io::Write> Frontend<B> {
 										break;
 									}
 								}
+								EditorMode::Visual { .. } => {
+									if self.handle_visual_key(
+										key.code,
+										key.modifiers,
+										&mut should_quit,
+									) {
+										break;
+									}
+								}
 							}
 						}
 						Event::Mouse(mouse) => {
@@ -227,6 +237,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let render_height = (max_height as usize).saturating_sub(1);
 
 				let search_pat = view.search_pattern.as_deref().unwrap_or("");
+				let selection_bg = Color::Rgb(62, 68, 82);
 
 				let projector =
 					crate::svp::projector::HighlightProjector::new(view.highlights.clone());
@@ -284,6 +295,19 @@ impl<B: Backend + io::Write> Frontend<B> {
 							}
 						}
 
+						let char_len = c.len_utf8();
+						let char_start_byte = current_global_byte;
+						let char_end_byte = current_global_byte
+							.saturating_add(char_len as u64)
+							.saturating_sub(1);
+						let in_selection = view
+							.selection_ranges
+							.iter()
+							.any(|(start, end)| *start <= char_end_byte && *end >= char_start_byte);
+						if in_selection {
+							style = style.bg(selection_bg);
+						}
+
 						// Yank flash override: gold highlight over the yanked byte range.
 						if let Some((flash_start, flash_end)) = view.yank_flash {
 							if current_global_byte >= flash_start && current_global_byte < flash_end
@@ -295,7 +319,6 @@ impl<B: Backend + io::Write> Frontend<B> {
 						}
 
 						// Peek ahead to detect trailing spaces (space before \n or end of token).
-						let char_len = c.len_utf8();
 						let is_trailing_space = c == ' ' && {
 							let rest = &text.as_bytes()[byte_idx + char_len..];
 							rest.is_empty() || rest[0] == b'\n'
@@ -419,6 +442,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 					EditorMode::Command => "CMD",
 					EditorMode::Search => "FIND",
 					EditorMode::Confirm => "Y/N",
+					EditorMode::Visual { kind, .. } => match kind {
+						VisualKind::Char => "VIS",
+						VisualKind::Line => "VIS-LN",
+						VisualKind::Block => "VIS-BL",
+					},
 				};
 				let mode_style = bar_bg.fg(Color::Rgb(0, 0, 0)).bg(match current_mode {
 					EditorMode::Normal => Color::Rgb(130, 170, 255),
@@ -426,6 +454,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 					EditorMode::Command => Color::Rgb(255, 180, 100),
 					EditorMode::Search => Color::Rgb(200, 160, 255),
 					EditorMode::Confirm => Color::Rgb(255, 120, 120),
+					EditorMode::Visual { .. } => Color::Rgb(120, 200, 200),
 				});
 
 				let mut x = 0usize;
@@ -456,7 +485,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 					.map(|v| (v.file_name.as_deref(), v.file_size, v.is_dirty))
 					.unwrap_or((None, 0, false));
 
-				if *current_mode == EditorMode::Command {
+				if matches!(current_mode, EditorMode::Command) {
 					let cmd_text = format!(":{}", command_buffer);
 					for c in cmd_text.chars() {
 						if x >= w {
@@ -467,7 +496,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 						}
 						x += 1;
 					}
-				} else if *current_mode == EditorMode::Search {
+				} else if matches!(current_mode, EditorMode::Search) {
 					let search_text = format!("/{}", search_buffer);
 					for c in search_text.chars() {
 						if x >= w {
@@ -478,7 +507,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 						}
 						x += 1;
 					}
-				} else if *current_mode == EditorMode::Confirm {
+				} else if matches!(current_mode, EditorMode::Confirm) {
 					let prompt = current_viewport
 						.as_ref()
 						.and_then(|v| v.confirm_prompt.as_deref())
@@ -724,6 +753,42 @@ impl<B: Backend + io::Write> Frontend<B> {
 			KeyCode::Char('D') => {
 				let _ = self.tx_cmd.send(EditorCommand::DeleteToLineEnd);
 				self.clear_prefixes();
+			}
+			KeyCode::Char('v') if modifiers.contains(event::KeyModifiers::CONTROL) => {
+				if let Some(view) = &self.current_viewport {
+					let anchor = view.cursor_abs_byte;
+					let kind = VisualKind::Block;
+					self.current_mode = EditorMode::Visual { anchor, kind };
+					let _ = self
+						.tx_cmd
+						.send(EditorCommand::SetVisualSelection { anchor, kind });
+					self.clear_prefixes();
+					self.apply_cursor_style();
+				}
+			}
+			KeyCode::Char('v') => {
+				if let Some(view) = &self.current_viewport {
+					let anchor = view.cursor_abs_byte;
+					let kind = VisualKind::Char;
+					self.current_mode = EditorMode::Visual { anchor, kind };
+					let _ = self
+						.tx_cmd
+						.send(EditorCommand::SetVisualSelection { anchor, kind });
+					self.clear_prefixes();
+					self.apply_cursor_style();
+				}
+			}
+			KeyCode::Char('V') => {
+				if let Some(view) = &self.current_viewport {
+					let anchor = view.cursor_line_start_byte;
+					let kind = VisualKind::Line;
+					self.current_mode = EditorMode::Visual { anchor, kind };
+					let _ = self
+						.tx_cmd
+						.send(EditorCommand::SetVisualSelection { anchor, kind });
+					self.clear_prefixes();
+					self.apply_cursor_style();
+				}
 			}
 			KeyCode::Char('y') => {
 				if self.y_prefix {
@@ -1043,6 +1108,113 @@ impl<B: Backend + io::Write> Frontend<B> {
 		false
 	}
 
+	fn handle_visual_key(
+		&mut self,
+		code: KeyCode,
+		modifiers: event::KeyModifiers,
+		should_quit: &mut bool,
+	) -> bool {
+		let (anchor, kind) = match self.current_mode {
+			EditorMode::Visual { anchor, kind } => (anchor, kind),
+			_ => return false,
+		};
+
+		if self.g_prefix {
+			if let KeyCode::Char('g') = code {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Top));
+			}
+			self.g_prefix = false;
+			return false;
+		}
+
+		match code {
+			KeyCode::Char('z') if modifiers.contains(event::KeyModifiers::CONTROL) => {
+				let _ = self.tx_cmd.send(EditorCommand::Quit);
+				*should_quit = true;
+				return true;
+			}
+			KeyCode::Esc => {
+				self.clear_prefixes();
+				self.current_mode = EditorMode::Normal;
+				let _ = self.tx_cmd.send(EditorCommand::ClearVisualSelection);
+				self.apply_cursor_style();
+			}
+			KeyCode::Char('y') => {
+				self.clear_prefixes();
+				let _ = self.tx_cmd.send(EditorCommand::VisualYank { anchor, kind });
+				self.current_mode = EditorMode::Normal;
+				self.apply_cursor_style();
+			}
+			KeyCode::Char('d') => {
+				self.clear_prefixes();
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::VisualDelete { anchor, kind });
+				self.current_mode = EditorMode::Normal;
+				self.apply_cursor_style();
+			}
+			KeyCode::Char('c') => {
+				self.clear_prefixes();
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::VisualChange { anchor, kind });
+				self.current_mode = EditorMode::Normal;
+				self.apply_cursor_style();
+			}
+			KeyCode::Char('h') | KeyCode::Left => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Left));
+			}
+			KeyCode::Char('j') | KeyCode::Down => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Down));
+			}
+			KeyCode::Char('k') | KeyCode::Up => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Up));
+			}
+			KeyCode::Char('l') | KeyCode::Right => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Right));
+			}
+			KeyCode::Char('0') => {
+				let _ = self.tx_cmd.send(EditorCommand::LineStart);
+			}
+			KeyCode::Char('^') => {
+				let _ = self.tx_cmd.send(EditorCommand::FirstNonWhitespace);
+			}
+			KeyCode::Char('$') | KeyCode::End => {
+				let _ = self.tx_cmd.send(EditorCommand::LineEnd);
+			}
+			KeyCode::Home => {
+				let _ = self.tx_cmd.send(EditorCommand::SmartHome);
+			}
+			KeyCode::PageUp => {
+				let _ = self.tx_cmd.send(EditorCommand::PageUp);
+			}
+			KeyCode::PageDown => {
+				let _ = self.tx_cmd.send(EditorCommand::PageDown);
+			}
+			KeyCode::Char('g') => {
+				self.g_prefix = true;
+			}
+			KeyCode::Char('G') => {
+				let _ = self
+					.tx_cmd
+					.send(EditorCommand::MoveCursor(MoveDirection::Bottom));
+			}
+			_ => {}
+		}
+
+		false
+	}
+
 	fn handle_mouse(&mut self, mouse: event::MouseEvent) {
 		match mouse.kind {
 			MouseEventKind::ScrollUp => {
@@ -1089,9 +1261,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 	fn apply_cursor_style(&mut self) {
 		let style = match self.current_mode {
-			EditorMode::Normal | EditorMode::Command | EditorMode::Search | EditorMode::Confirm => {
-				SetCursorStyle::SteadyBlock
-			}
+			EditorMode::Normal
+			| EditorMode::Command
+			| EditorMode::Search
+			| EditorMode::Confirm
+			| EditorMode::Visual { .. } => SetCursorStyle::SteadyBlock,
 			EditorMode::Insert => SetCursorStyle::SteadyBar,
 		};
 		let _ = execute!(self.terminal.backend_mut(), style);

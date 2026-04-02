@@ -12,8 +12,8 @@ pub struct TextDelta {
 }
 
 pub struct UndoLedger {
-	undo_stack: Vec<TextDelta>,
-	redo_stack: Vec<TextDelta>,
+	undo_stack: Vec<Vec<TextDelta>>,
+	redo_stack: Vec<Vec<TextDelta>>,
 	pub current_state_id: StateId,
 	pub saved_state_id: StateId,
 	next_state_id: StateId,
@@ -30,14 +30,24 @@ impl UndoLedger {
 		}
 	}
 
-	/// Allocate a new state ID for a forward mutation.
-	/// Sets `state_before`/`state_after` on the delta and advances `current_state_id`.
-	pub fn push(&mut self, mut delta: TextDelta) {
-		delta.state_before = self.current_state_id;
-		delta.state_after = self.next_state_id;
-		self.current_state_id = self.next_state_id;
+	/// Allocate a single new state ID for a forward transaction group.
+	/// Sets `state_before`/`state_after` on every delta in the group and advances
+	/// `current_state_id` once for the whole transaction.
+	pub fn push_group(&mut self, mut deltas: Vec<TextDelta>) {
+		if deltas.is_empty() {
+			return;
+		}
+
+		let state_before = self.current_state_id;
+		let state_after = self.next_state_id;
+		for delta in &mut deltas {
+			delta.state_before = state_before;
+			delta.state_after = state_after;
+		}
+
+		self.current_state_id = state_after;
 		self.next_state_id += 1;
-		self.undo_stack.push(delta);
+		self.undo_stack.push(deltas);
 		self.redo_stack.clear();
 	}
 
@@ -65,29 +75,29 @@ impl UndoLedger {
 		&mut self,
 		registry: &UastRegistry,
 		root: NodeId,
-	) -> Option<(NodeId, NodeId, DocByte, u64, TextDelta)> {
-		let delta = self.undo_stack.pop()?;
+	) -> Option<(NodeId, NodeId, DocByte, u64, Vec<TextDelta>)> {
+		let deltas = self.undo_stack.pop()?;
 		let bytes = registry.collect_document_bytes(root).ok()?;
-
-		let offset = delta.global_byte_offset.get() as usize;
-		let insert_len = delta.inserted_text.len();
-		let mut new_bytes = Vec::with_capacity(bytes.len() - insert_len + delta.deleted_text.len());
-
-		// Inverse: remove what was inserted, re-insert what was deleted.
-		new_bytes.extend_from_slice(&bytes[..offset]);
-		new_bytes.extend_from_slice(delta.deleted_text.as_bytes());
-		new_bytes.extend_from_slice(&bytes[offset + insert_len..]);
-
+		let mut new_bytes = bytes;
+		for delta in deltas.iter().rev() {
+			splice_document_bytes(
+				&mut new_bytes,
+				delta.global_byte_offset,
+				delta.inserted_text.as_bytes(),
+				delta.deleted_text.as_bytes(),
+			)?;
+		}
 		let new_size = new_bytes.len() as u64;
 		let (new_root, new_leaf) = create_document(registry, &new_bytes);
-		let cursor_byte = delta
+		let last_delta = deltas.last()?;
+		let cursor_byte = last_delta
 			.global_byte_offset
-			.saturating_add(delta.deleted_text.len() as u64);
+			.saturating_add(last_delta.deleted_text.len() as u64);
 
-		self.current_state_id = delta.state_before;
-		let cache_delta = delta.clone();
-		self.redo_stack.push(delta);
-		Some((new_root, new_leaf, cursor_byte, new_size, cache_delta))
+		self.current_state_id = last_delta.state_before;
+		let cache_deltas = deltas.clone();
+		self.redo_stack.push(deltas);
+		Some((new_root, new_leaf, cursor_byte, new_size, cache_deltas))
 	}
 
 	/// Pop the most recent undone delta, re-apply it forward,
@@ -96,31 +106,50 @@ impl UndoLedger {
 		&mut self,
 		registry: &UastRegistry,
 		root: NodeId,
-	) -> Option<(NodeId, NodeId, DocByte, u64, TextDelta)> {
-		let delta = self.redo_stack.pop()?;
+	) -> Option<(NodeId, NodeId, DocByte, u64, Vec<TextDelta>)> {
+		let deltas = self.redo_stack.pop()?;
 		let bytes = registry.collect_document_bytes(root).ok()?;
-
-		let offset = delta.global_byte_offset.get() as usize;
-		let delete_len = delta.deleted_text.len();
-		let mut new_bytes =
-			Vec::with_capacity(bytes.len() - delete_len + delta.inserted_text.len());
-
-		// Forward: remove deleted_text, insert inserted_text.
-		new_bytes.extend_from_slice(&bytes[..offset]);
-		new_bytes.extend_from_slice(delta.inserted_text.as_bytes());
-		new_bytes.extend_from_slice(&bytes[offset + delete_len..]);
-
+		let mut new_bytes = bytes;
+		for delta in &deltas {
+			splice_document_bytes(
+				&mut new_bytes,
+				delta.global_byte_offset,
+				delta.deleted_text.as_bytes(),
+				delta.inserted_text.as_bytes(),
+			)?;
+		}
 		let new_size = new_bytes.len() as u64;
 		let (new_root, new_leaf) = create_document(registry, &new_bytes);
-		let cursor_byte = delta
+		let last_delta = deltas.last()?;
+		let cursor_byte = last_delta
 			.global_byte_offset
-			.saturating_add(delta.inserted_text.len() as u64);
+			.saturating_add(last_delta.inserted_text.len() as u64);
 
-		self.current_state_id = delta.state_after;
-		let cache_delta = delta.clone();
-		self.undo_stack.push(delta);
-		Some((new_root, new_leaf, cursor_byte, new_size, cache_delta))
+		self.current_state_id = last_delta.state_after;
+		let cache_deltas = deltas.clone();
+		self.undo_stack.push(deltas);
+		Some((new_root, new_leaf, cursor_byte, new_size, cache_deltas))
 	}
+}
+
+fn splice_document_bytes(
+	bytes: &mut Vec<u8>,
+	global_byte_offset: DocByte,
+	expected_deleted: &[u8],
+	inserted: &[u8],
+) -> Option<()> {
+	let start = global_byte_offset.get() as usize;
+	let end = start.checked_add(expected_deleted.len())?;
+	if end > bytes.len() || bytes[start..end] != expected_deleted[..] {
+		return None;
+	}
+
+	let mut new_bytes = Vec::with_capacity(bytes.len() - expected_deleted.len() + inserted.len());
+	new_bytes.extend_from_slice(&bytes[..start]);
+	new_bytes.extend_from_slice(inserted);
+	new_bytes.extend_from_slice(&bytes[end..]);
+	*bytes = new_bytes;
+	Some(())
 }
 
 /// Reconstruct a single-leaf document from raw bytes.

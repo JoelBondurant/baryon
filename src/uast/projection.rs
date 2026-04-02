@@ -32,6 +32,8 @@ pub struct NodeByteTarget {
 pub struct Viewport {
 	pub tokens: Vec<RenderToken>,
 	pub cursor_abs_pos: CursorPosition,
+	pub cursor_abs_byte: DocByte,
+	pub cursor_line_start_byte: DocByte,
 	pub total_lines: u32,
 	pub status_message: Option<String>,
 	pub should_quit: bool,
@@ -45,6 +47,7 @@ pub struct Viewport {
 	pub mode_override: Option<crate::engine::EditorMode>,
 	pub global_start_byte: DocByte,
 	pub highlights: Vec<HighlightSpan>,
+	pub selection_ranges: Vec<(DocByte, DocByte)>,
 	pub yank_flash: Option<(DocByte, DocByte)>,
 }
 
