@@ -49,6 +49,23 @@ pub struct Viewport {
 	pub highlights: Vec<HighlightSpan>,
 	pub selection_ranges: Vec<(DocByte, DocByte)>,
 	pub yank_flash: Option<(DocByte, DocByte)>,
+	pub minimap: Option<MinimapSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinimapMode {
+	TextDensity,
+	ByteFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinimapSnapshot {
+	pub mode: MinimapMode,
+	pub bands: Vec<u8>,
+	pub total_lines: u32,
+	pub viewport_start_line: DocLine,
+	pub viewport_line_count: u32,
+	pub cursor_line: DocLine,
 }
 
 fn advance_visual_col(col: &mut VisualCol, byte: u8) {

@@ -7,6 +7,7 @@ edition = "2024"
 arboard = "3.6.1"
 crossbeam-queue = "0.3.12"
 crossterm = "0.29.0"
+image = { version = "0.25.10", default-features = false }
 io-uring = "0.7.11"
 libc = "0.2.184"
 memchr = "2.8.0"
@@ -19,6 +20,7 @@ ra_ap_project_model = "0.0.326"
 ra_ap_syntax = "0.0.326"
 ra_ap_vfs = "0.0.326"
 ratatui = "0.30.0"
+ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 rayon = "1.11.0"
 regex-automata = { version = "0.4.14", default-features = true, features = ["meta", "perf"] }
 rustc-hash = "2.1.2"

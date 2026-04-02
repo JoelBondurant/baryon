@@ -11,9 +11,12 @@ use std::time::Duration;
 mod command;
 mod draw;
 mod insert;
+mod minimap;
 mod mouse;
 mod normal;
 mod visual;
+
+use minimap::MinimapController;
 
 #[derive(Clone, Copy)]
 enum PendingOperator {
@@ -36,6 +39,7 @@ pub struct Frontend<B: Backend + io::Write> {
 	status_message: Option<String>,
 	needs_redraw: bool,
 	search_buffer: String,
+	minimap: MinimapController,
 }
 
 impl<B: Backend + io::Write> Frontend<B> {
@@ -59,6 +63,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			status_message: None,
 			needs_redraw: false,
 			search_buffer: String::new(),
+			minimap: MinimapController::new(),
 		}
 	}
 

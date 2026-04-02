@@ -9,7 +9,10 @@ use crate::engine::undo::{
 use crate::svp::highlight::HighlightSpan;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest};
 use crate::svp::{RequestPriority, SvpPointer, SvpResolver, ingest_svp_file};
-use crate::uast::{NodeByteTarget, NodeCursorTarget, UastMutation, UastProjection, Viewport};
+use crate::uast::{
+	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, UastMutation, UastProjection,
+	Viewport,
+};
 use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -23,6 +26,8 @@ use std::sync::mpsc;
 
 const FILE_DEVICE_ID: u16 = 0x42;
 const MAX_SEMANTIC_BYTES: u64 = 1_048_576;
+const MAX_MINIMAP_TEXT_BYTES: u64 = 1_048_576;
+const MINIMAP_BANDS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorMode {
@@ -791,6 +796,111 @@ fn read_loaded_document(registry: &UastRegistry, root: NodeId) -> Result<Vec<u8>
 		.map_err(|msg| msg.to_string())
 }
 
+fn normalize_line_density(byte_len: usize) -> u8 {
+	let capped = byte_len.min(160) as u32;
+	((capped * 255) / 160) as u8
+}
+
+fn build_text_minimap_snapshot(
+	bytes: &[u8],
+	viewport_start_line: DocLine,
+	viewport_line_count: u32,
+	cursor_line: DocLine,
+) -> MinimapSnapshot {
+	let doc_lines = memchr::memchr_iter(b'\n', bytes).count() as u32 + 1;
+	let mut sums = vec![0u32; MINIMAP_BANDS];
+	let mut counts = vec![0u32; MINIMAP_BANDS];
+	let mut total_lines = 0u32;
+	let mut current_len = 0usize;
+
+	for &b in bytes {
+		if b == b'\n' {
+			let band = ((total_lines as usize) * MINIMAP_BANDS) / doc_lines.max(1) as usize;
+			sums[band.min(MINIMAP_BANDS - 1)] += normalize_line_density(current_len) as u32;
+			counts[band.min(MINIMAP_BANDS - 1)] += 1;
+			total_lines += 1;
+			current_len = 0;
+		} else {
+			current_len += 1;
+		}
+	}
+
+	let final_band = ((total_lines as usize) * MINIMAP_BANDS) / doc_lines as usize;
+	sums[final_band.min(MINIMAP_BANDS - 1)] += normalize_line_density(current_len) as u32;
+	counts[final_band.min(MINIMAP_BANDS - 1)] += 1;
+
+	let bands = sums
+		.into_iter()
+		.zip(counts)
+		.map(
+			|(sum, count)| {
+				if count == 0 { 0 } else { (sum / count) as u8 }
+			},
+		)
+		.collect();
+
+	MinimapSnapshot {
+		mode: MinimapMode::TextDensity,
+		bands,
+		total_lines: doc_lines,
+		viewport_start_line,
+		viewport_line_count,
+		cursor_line,
+	}
+}
+
+fn build_byte_fallback_minimap_snapshot(
+	registry: &UastRegistry,
+	root: NodeId,
+	viewport_start_line: DocLine,
+	viewport_line_count: u32,
+	cursor_line: DocLine,
+) -> MinimapSnapshot {
+	let file_size = registry.get_total_bytes(root).max(1);
+	let doc_lines = registry.get_total_newlines(root).saturating_add(1).max(1);
+	let mut bands = vec![0u8; MINIMAP_BANDS];
+	let mut visit = registry.get_first_child(root);
+	let mut cumulative_bytes = 0u64;
+
+	while let Some(node) = visit {
+		let idx = node.index();
+		let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
+		if has_children {
+			visit = registry.get_first_child(node);
+			continue;
+		}
+
+		let metrics = unsafe { &*registry.metrics[idx].get() };
+		let start_band = ((cumulative_bytes as usize) * MINIMAP_BANDS) / file_size as usize;
+		let end_byte = cumulative_bytes.saturating_add(metrics.byte_length as u64);
+		let mut end_band = ((end_byte as usize) * MINIMAP_BANDS) / file_size as usize;
+		if end_band <= start_band {
+			end_band = start_band + 1;
+		}
+		let avg_line_bytes = if metrics.newlines == 0 {
+			metrics.byte_length as usize
+		} else {
+			(metrics.byte_length as usize) / (metrics.newlines as usize + 1)
+		};
+		let density = normalize_line_density(avg_line_bytes).max(24);
+		for band in start_band.min(MINIMAP_BANDS - 1)..end_band.min(MINIMAP_BANDS) {
+			bands[band] = bands[band].max(density);
+		}
+
+		cumulative_bytes = end_byte;
+		visit = registry.get_next_node_in_walk(node);
+	}
+
+	MinimapSnapshot {
+		mode: MinimapMode::ByteFallback,
+		bands,
+		total_lines: doc_lines,
+		viewport_start_line,
+		viewport_line_count,
+		cursor_line,
+	}
+}
+
 fn insert_text_sparse(
 	registry: &UastRegistry,
 	root: NodeId,
@@ -807,11 +917,7 @@ fn insert_text_sparse(
 	}
 
 	let target = registry.find_node_at_doc_byte(root, byte_offset);
-	Ok(registry.insert_text(
-		target.node_id,
-		target.node_byte.get(),
-		text.as_bytes(),
-	))
+	Ok(registry.insert_text(target.node_id, target.node_byte.get(), text.as_bytes()))
 }
 
 fn delete_text_sparse(
@@ -844,10 +950,8 @@ fn delete_text_sparse(
 		registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte);
 	while current_byte > byte_offset {
 		let previous_byte = current_byte;
-		let (new_node, new_offset) = registry.delete_backwards(
-			target.node_id,
-			target.node_byte.get(),
-		);
+		let (new_node, new_offset) =
+			registry.delete_backwards(target.node_id, target.node_byte.get());
 		target.node_id = new_node;
 		target.node_byte = NodeByteOffset::new(new_offset);
 		current_byte = registry.doc_byte_for_node_offset(root, new_node, target.node_byte);
@@ -1434,12 +1538,7 @@ fn apply_deltas_to_document_internal(
 
 	for delta in &deltas {
 		if !delta.deleted_text.is_empty() {
-			delete_text_sparse(
-				registry,
-				rid,
-				delta.global_byte_offset,
-				&delta.deleted_text,
-			)?;
+			delete_text_sparse(registry, rid, delta.global_byte_offset, &delta.deleted_text)?;
 		}
 		if !delta.inserted_text.is_empty() {
 			insert_text_sparse(
@@ -1541,6 +1640,10 @@ impl Engine {
 		let mut last_semantic_path: Option<String> = None;
 		let mut next_semantic_request_id = RequestId::new(1);
 		let mut pending_semantic_request_id: Option<RequestId> = None;
+		let mut cached_minimap: Option<MinimapSnapshot> = None;
+		let mut last_minimap_state: Option<StateId> = None;
+		let mut last_minimap_total_lines: u32 = u32::MAX;
+		let mut last_minimap_path: Option<String> = None;
 
 		let mut cursor_abs_line = DocLine::ZERO;
 		let mut cursor_abs_col = VisualCol::ZERO;
@@ -2140,6 +2243,10 @@ impl Engine {
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
 						pending_semantic_request_id = None;
+						cached_minimap = None;
+						last_minimap_state = None;
+						last_minimap_total_lines = u32::MAX;
+						last_minimap_path = None;
 						needs_render = true;
 					} else {
 						// New file — create empty document
@@ -2180,6 +2287,10 @@ impl Engine {
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
 						pending_semantic_request_id = None;
+						cached_minimap = None;
+						last_minimap_state = None;
+						last_minimap_total_lines = u32::MAX;
+						last_minimap_path = None;
 						needs_render = true;
 					}
 				}
@@ -2405,8 +2516,12 @@ impl Engine {
 								Ok(bytes) => {
 									let byte_range =
 										resolve_byte_range(&range, &bytes, cursor_abs_line);
-									let deltas =
-										substitute_text_deltas(&bytes, &re, &replacement, byte_range);
+									let deltas = substitute_text_deltas(
+										&bytes,
+										&re,
+										&replacement,
+										byte_range,
+									);
 									let count = deltas.len() as u32;
 									if count == 0 {
 										status_message = Some("Pattern not found".to_string());
@@ -2568,7 +2683,8 @@ impl Engine {
 
 									if applied_ok {
 										if let Some(new_rid) = root_id {
-											let Ok(new_bytes) = read_loaded_document(&registry, new_rid)
+											let Ok(new_bytes) =
+												read_loaded_document(&registry, new_rid)
 											else {
 												status_message = Some(
 													"Failed to reload document after substitution"
@@ -3074,6 +3190,60 @@ impl Engine {
 					}
 					_ => Vec::new(),
 				};
+				let viewport_start_line = cursor_abs_line.saturating_sub(20);
+				let minimap = if let Some(rid) = root_id {
+					let path_changed = last_minimap_path.as_deref() != file_path.as_deref();
+					let state_changed = last_minimap_state != Some(ledger.current_state_id);
+					let total_lines_changed = last_minimap_total_lines != total_lines;
+					if cached_minimap.is_none()
+						|| path_changed || state_changed
+						|| total_lines_changed
+					{
+						cached_minimap =
+							Some(if file_size > 0 && file_size <= MAX_MINIMAP_TEXT_BYTES {
+								match read_loaded_document(&registry, rid) {
+									Ok(bytes) => build_text_minimap_snapshot(
+										&bytes,
+										viewport_start_line,
+										viewport_lines,
+										cursor_abs_line,
+									),
+									Err(_) => build_byte_fallback_minimap_snapshot(
+										&registry,
+										rid,
+										viewport_start_line,
+										viewport_lines,
+										cursor_abs_line,
+									),
+								}
+							} else {
+								build_byte_fallback_minimap_snapshot(
+									&registry,
+									rid,
+									viewport_start_line,
+									viewport_lines,
+									cursor_abs_line,
+								)
+							});
+						last_minimap_state = Some(ledger.current_state_id);
+						last_minimap_total_lines = total_lines;
+						last_minimap_path = file_path.clone();
+					}
+
+					cached_minimap.as_ref().map(|snapshot| {
+						let mut snapshot = snapshot.clone();
+						snapshot.viewport_start_line = viewport_start_line;
+						snapshot.viewport_line_count = viewport_lines;
+						snapshot.cursor_line = cursor_abs_line;
+						snapshot
+					})
+				} else {
+					cached_minimap = None;
+					last_minimap_state = None;
+					last_minimap_total_lines = u32::MAX;
+					last_minimap_path = None;
+					None
+				};
 
 				let _ = tx_view.send(Viewport {
 					tokens,
@@ -3095,6 +3265,7 @@ impl Engine {
 					highlights,
 					selection_ranges,
 					yank_flash,
+					minimap,
 				});
 
 				if pending_quit {
@@ -3141,13 +3312,13 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		FILE_DEVICE_ID, VisualKind, apply_deltas_to_document,
-		apply_deltas_to_document_internal, delete_to_line_end_delta, document_rewrite_delta,
-		first_non_whitespace_visual_col, line_col_from_doc_byte_sparse, line_end_visual_col,
-		linewise_put_insertion, next_word_end, next_word_start, prev_word_start,
-		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
-		resolve_visual_ranges, save_document_atomic, smart_home_visual_col,
-		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
+		FILE_DEVICE_ID, VisualKind, apply_deltas_to_document, apply_deltas_to_document_internal,
+		delete_to_line_end_delta, document_rewrite_delta, first_non_whitespace_visual_col,
+		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion, next_word_end,
+		next_word_start, prev_word_start, rebase_semantic_highlights_after_delta,
+		rebind_document_spans_to_saved_file, resolve_visual_ranges, save_document_atomic,
+		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
+		word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
@@ -3577,8 +3748,9 @@ mod tests {
 		assert_eq!(cursor_abs_line, DocLine::ZERO);
 		assert_eq!(cursor_abs_col, VisualCol::new(2));
 
-		let (undo_group, undo_cursor_byte) =
-			ledger.undo().expect("single undo should restore whole group");
+		let (undo_group, undo_cursor_byte) = ledger
+			.undo()
+			.expect("single undo should restore whole group");
 		assert_eq!(undo_group.len(), 3);
 		assert_eq!(ledger.current_state_id, StateId::ZERO);
 		apply_deltas_to_document_internal(
@@ -3608,8 +3780,9 @@ mod tests {
 			"abcd\nefgh\nijkl\n"
 		);
 
-		let (redo_group, redo_cursor_byte) =
-			ledger.redo().expect("single redo should reapply whole group");
+		let (redo_group, redo_cursor_byte) = ledger
+			.redo()
+			.expect("single redo should reapply whole group");
 		assert_eq!(redo_group.len(), 3);
 		assert_eq!(ledger.current_state_id, StateId::new(1));
 		apply_deltas_to_document_internal(

@@ -5,6 +5,7 @@ use crate::svp::projector::{HighlightProjector, WHITESPACE_COLOR};
 use crate::uast::kind::SemanticKind;
 use ratatui::{
 	backend::Backend,
+	layout::Rect,
 	style::{Color, Style},
 };
 use regex_automata::meta::Regex;
@@ -19,203 +20,263 @@ impl<B: Backend + io::Write> Frontend<B> {
 		let command_buffer = &self.command_buffer;
 		let search_buffer = &self.search_buffer;
 		let g_prefix = self.g_prefix;
+		self.minimap.poll();
+		let minimap = &mut self.minimap;
 
 		self.terminal.draw(|f| {
 			let mut cursor_to_set = None;
-			let buf = f.buffer_mut();
-			let max_width = buf.area.width;
-			let max_height = buf.area.height;
+			let mut pending_minimap_area: Option<Rect> = None;
+			let max_width = f.area().width;
+			let max_height = f.area().height;
 
-			if let Some(view) = current_viewport {
-				let scroll_y = view.cursor_abs_pos.line.saturating_sub(20);
-				let max_line_on_screen = scroll_y.get() + max_height.saturating_sub(1) as u32;
-
-				let digits = max_line_on_screen.max(1).ilog10() + 1;
-				let gutter_width: u16 = digits as u16 + 1;
-				let gutter_style = Style::default()
-					.bg(Color::Rgb(18, 18, 18))
-					.fg(Color::Indexed(242));
-
-				for gy in 0..(max_height - 1) {
-					for gx in 0..gutter_width {
-						if let Some(cell) = buf.cell_mut((gx, gy)) {
-							cell.set_char(' ').set_style(gutter_style);
-						}
-					}
-					let line_num = scroll_y.get() + gy as u32 + 1;
-					if line_num <= view.total_lines + 1 {
-						let line_str = line_num.to_string();
-						if line_str.len() < gutter_width as usize {
-							let start_x = (gutter_width - 1).saturating_sub(line_str.len() as u16);
-							for (i, c) in line_str.chars().enumerate() {
-								if let Some(cell) = buf.cell_mut((start_x + i as u16, gy)) {
-									cell.set_char(c);
-								}
-							}
-						}
-					}
-				}
-
-				let mut x: usize = gutter_width as usize;
-				let mut y: usize = 0;
-				let render_height = (max_height as usize).saturating_sub(1);
-
-				let search_pat = view.search_pattern.as_deref().unwrap_or("");
-				let selection_bg = Color::Rgb(62, 68, 82);
-				let projector = HighlightProjector::new(view.highlights.clone());
-				let mut current_global_byte = view.global_start_byte;
-
-				for token in &view.tokens {
-					let base_style = match token.kind {
-						SemanticKind::Token => Style::default().fg(Color::Indexed(253)),
-						_ => Style::default().fg(Color::Indexed(253)),
-					};
-					let virtual_style = base_style;
-					let text = if token.text.is_empty() {
-						"[DMA PENDING...]"
+			{
+				let buf = f.buffer_mut();
+				if let Some(view) = current_viewport {
+					let scroll_y = view.cursor_abs_pos.line.saturating_sub(20);
+					let max_line_on_screen = scroll_y.get() + max_height.saturating_sub(1) as u32;
+					let minimap_width = if view.minimap.is_some() && max_width > 40 {
+						14u16.min(max_width.saturating_sub(24))
 					} else {
-						&token.text
+						0
+					};
+					let separator_width = if minimap_width > 0 { 1 } else { 0 };
+					let text_right =
+						max_width.saturating_sub(minimap_width + separator_width) as usize;
+					let minimap_area = Rect {
+						x: max_width.saturating_sub(minimap_width),
+						y: 0,
+						width: minimap_width,
+						height: max_height.saturating_sub(1),
 					};
 
-					let highlight_style = Style::default()
-						.bg(Color::Rgb(180, 140, 50))
-						.fg(Color::Black);
-					let search_ci = view.search_case_insensitive;
-					let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
-					if !search_pat.is_empty() && !token.text.is_empty() {
-						let tbytes = text.as_bytes();
-						if let Ok(re) = Regex::builder()
-							.syntax(syntax::Config::new().case_insensitive(search_ci))
-							.build(search_pat)
-						{
-							for m in re.find_iter(tbytes) {
-								highlight_ranges.push((m.start(), m.end()));
+					let digits = max_line_on_screen.max(1).ilog10() + 1;
+					let gutter_width: u16 = digits as u16 + 1;
+					let gutter_style = Style::default()
+						.bg(Color::Rgb(18, 18, 18))
+						.fg(Color::Indexed(242));
+
+					for gy in 0..(max_height - 1) {
+						for gx in 0..gutter_width {
+							if let Some(cell) = buf.cell_mut((gx, gy)) {
+								cell.set_char(' ').set_style(gutter_style);
+							}
+						}
+						let line_num = scroll_y.get() + gy as u32 + 1;
+						if line_num <= view.total_lines + 1 {
+							let line_str = line_num.to_string();
+							if line_str.len() < gutter_width as usize {
+								let start_x =
+									(gutter_width - 1).saturating_sub(line_str.len() as u16);
+								for (i, c) in line_str.chars().enumerate() {
+									if let Some(cell) = buf.cell_mut((start_x + i as u16, gy)) {
+										cell.set_char(c);
+									}
+								}
 							}
 						}
 					}
 
-					let mut byte_idx = 0usize;
-					for c in text.chars() {
-						let in_highlight = highlight_ranges
-							.iter()
-							.any(|&(s, e)| byte_idx >= s && byte_idx < e);
+					if minimap_width > 0 {
+						let separator_x = max_width.saturating_sub(minimap_width + separator_width);
+						for gy in 0..max_height.saturating_sub(1) {
+							if let Some(cell) = buf.cell_mut((separator_x, gy)) {
+								cell.set_char(' ').set_style(
+									Style::default()
+										.bg(Color::Rgb(16, 20, 28))
+										.fg(Color::Rgb(16, 20, 28)),
+								);
+							}
+							for gx in minimap_area.x..(minimap_area.x + minimap_area.width) {
+								if let Some(cell) = buf.cell_mut((gx, gy)) {
+									cell.set_char(' ').set_style(
+										Style::default()
+											.bg(Color::Rgb(12, 16, 22))
+											.fg(Color::Rgb(12, 16, 22)),
+									);
+								}
+							}
+						}
+					}
 
-						let mut style = if in_highlight {
-							highlight_style
+					let mut x: usize = gutter_width as usize;
+					let mut y: usize = 0;
+					let render_height = (max_height as usize).saturating_sub(1);
+
+					let search_pat = view.search_pattern.as_deref().unwrap_or("");
+					let selection_bg = Color::Rgb(62, 68, 82);
+					let projector = HighlightProjector::new(view.highlights.clone());
+					let mut current_global_byte = view.global_start_byte;
+
+					for token in &view.tokens {
+						let base_style = match token.kind {
+							SemanticKind::Token => Style::default().fg(Color::Indexed(253)),
+							_ => Style::default().fg(Color::Indexed(253)),
+						};
+						let virtual_style = base_style;
+						let text = if token.text.is_empty() {
+							"[DMA PENDING...]"
 						} else {
-							virtual_style
+							&token.text
 						};
-						if !in_highlight && !token.text.is_empty() {
-							if let Some(fg) = projector.style_for_byte(current_global_byte) {
-								style = style.fg(fg);
-							}
-						}
 
-						let char_len = c.len_utf8();
-						let char_start_byte = current_global_byte;
-						let char_end_byte = current_global_byte
-							.saturating_add(char_len as u64)
-							.saturating_sub(1);
-						let in_selection = view
-							.selection_ranges
-							.iter()
-							.any(|(start, end)| *start <= char_end_byte && *end >= char_start_byte);
-						if in_selection {
-							style = style.bg(selection_bg);
-						}
-
-						if let Some((flash_start, flash_end)) = view.yank_flash {
-							if current_global_byte >= flash_start && current_global_byte < flash_end
+						let highlight_style = Style::default()
+							.bg(Color::Rgb(180, 140, 50))
+							.fg(Color::Black);
+						let search_ci = view.search_case_insensitive;
+						let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
+						if !search_pat.is_empty() && !token.text.is_empty() {
+							let tbytes = text.as_bytes();
+							if let Ok(re) = Regex::builder()
+								.syntax(syntax::Config::new().case_insensitive(search_ci))
+								.build(search_pat)
 							{
-								style = Style::default()
-									.bg(Color::Rgb(229, 192, 123))
-									.fg(Color::Black);
+								for m in re.find_iter(tbytes) {
+									highlight_ranges.push((m.start(), m.end()));
+								}
 							}
 						}
 
-						let is_trailing_space = c == ' ' && {
-							let rest = &text.as_bytes()[byte_idx + char_len..];
-							rest.is_empty() || rest[0] == b'\n'
-						};
+						let mut byte_idx = 0usize;
+						for c in text.chars() {
+							let in_highlight = highlight_ranges
+								.iter()
+								.any(|&(s, e)| byte_idx >= s && byte_idx < e);
 
-						byte_idx += char_len;
-						current_global_byte = current_global_byte.saturating_add(char_len as u64);
-
-						if y >= render_height {
-							break;
-						}
-
-						let ws_style = style.fg(WHITESPACE_COLOR);
-
-						if c == '\n' {
-							if x < max_width as usize {
-								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-									cell.set_char('\u{00AC}').set_style(ws_style);
+							let mut style = if in_highlight {
+								highlight_style
+							} else {
+								virtual_style
+							};
+							if !in_highlight && !token.text.is_empty() {
+								if let Some(fg) = projector.style_for_byte(current_global_byte) {
+									style = style.fg(fg);
 								}
 							}
-							y += 1;
-							x = gutter_width as usize;
-						} else if c == '\t' {
-							let col = x - gutter_width as usize;
-							let spaces_to_add = TAB_SIZE as usize - (col % TAB_SIZE as usize);
-							if x < max_width as usize {
-								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-									cell.set_char('\u{25B8}').set_style(ws_style);
+
+							let char_len = c.len_utf8();
+							let char_start_byte = current_global_byte;
+							let char_end_byte = current_global_byte
+								.saturating_add(char_len as u64)
+								.saturating_sub(1);
+							let in_selection = view.selection_ranges.iter().any(|(start, end)| {
+								*start <= char_end_byte && *end >= char_start_byte
+							});
+							if in_selection {
+								style = style.bg(selection_bg);
+							}
+
+							if let Some((flash_start, flash_end)) = view.yank_flash {
+								if current_global_byte >= flash_start
+									&& current_global_byte < flash_end
+								{
+									style = Style::default()
+										.bg(Color::Rgb(229, 192, 123))
+										.fg(Color::Black);
 								}
 							}
-							x += 1;
-							for _ in 1..spaces_to_add {
-								if x < max_width as usize {
+
+							let is_trailing_space = c == ' ' && {
+								let rest = &text.as_bytes()[byte_idx + char_len..];
+								rest.is_empty() || rest[0] == b'\n'
+							};
+
+							byte_idx += char_len;
+							current_global_byte =
+								current_global_byte.saturating_add(char_len as u64);
+
+							if y >= render_height {
+								break;
+							}
+
+							let ws_style = style.fg(WHITESPACE_COLOR);
+
+							if c == '\n' {
+								if x < text_right {
 									if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-										cell.set_char(' ').set_style(ws_style);
+										cell.set_char('\u{00AC}').set_style(ws_style);
+									}
+								}
+								y += 1;
+								x = gutter_width as usize;
+							} else if c == '\t' {
+								let col = x - gutter_width as usize;
+								let spaces_to_add = TAB_SIZE as usize - (col % TAB_SIZE as usize);
+								if x < text_right {
+									if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+										cell.set_char('\u{25B8}').set_style(ws_style);
+									}
+								}
+								x += 1;
+								for _ in 1..spaces_to_add {
+									if x < text_right {
+										if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+											cell.set_char(' ').set_style(ws_style);
+										}
+									}
+									x += 1;
+								}
+							} else if is_trailing_space {
+								if x < text_right {
+									if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+										cell.set_char('~').set_style(ws_style);
+									}
+								}
+								x += 1;
+							} else if c == ' ' {
+								if x < text_right {
+									if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+										cell.set_char('\u{2423}').set_style(ws_style);
+									}
+								}
+								x += 1;
+							} else {
+								if x < text_right {
+									if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+										cell.set_char(c).set_style(style);
 									}
 								}
 								x += 1;
 							}
-						} else if is_trailing_space {
-							if x < max_width as usize {
-								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-									cell.set_char('~').set_style(ws_style);
-								}
-							}
-							x += 1;
-						} else if c == ' ' {
-							if x < max_width as usize {
-								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-									cell.set_char('\u{2423}').set_style(ws_style);
-								}
-							}
-							x += 1;
-						} else {
-							if x < max_width as usize {
-								if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-									cell.set_char(c).set_style(style);
-								}
-							}
-							x += 1;
+						}
+						if y >= render_height {
+							break;
 						}
 					}
-					if y >= render_height {
-						break;
+
+					let visual_cursor_y = view
+						.cursor_abs_pos
+						.line
+						.saturating_sub(scroll_y.get())
+						.get() as u16;
+					let visual_cursor_x = (view.cursor_abs_pos.col.get() as u16)
+						.checked_add(gutter_width)
+						.unwrap_or(text_right as u16);
+					if visual_cursor_y < max_height - 1 && visual_cursor_x < text_right as u16 {
+						cursor_to_set = Some((visual_cursor_x, visual_cursor_y));
+					}
+
+					if view.minimap.is_some() && minimap_area.width > 0 && minimap_area.height > 0 {
+						pending_minimap_area = Some(minimap_area);
 					}
 				}
+			}
 
-				let visual_cursor_y = view
-					.cursor_abs_pos
-					.line
-					.saturating_sub(scroll_y.get())
-					.get() as u16;
-				let visual_cursor_x = (view.cursor_abs_pos.col.get() as u16)
-					.checked_add(gutter_width)
-					.unwrap_or(max_width);
-				if visual_cursor_y < max_height - 1 && visual_cursor_x < max_width {
-					cursor_to_set = Some((visual_cursor_x, visual_cursor_y));
-				}
+			if let (Some(view), Some(minimap_area), Some(snapshot)) = (
+				current_viewport,
+				pending_minimap_area,
+				current_viewport
+					.as_ref()
+					.and_then(|view| view.minimap.as_ref()),
+			) {
+				let _ = view;
+				minimap.request(snapshot, minimap_area);
+				minimap.render(f, minimap_area);
 			}
 
 			let bar_y = max_height.saturating_sub(1);
 			let bar_bg = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::White);
 			let w = max_width as usize;
+			let buf = f.buffer_mut();
 
 			for sx in 0..max_width {
 				if let Some(cell) = buf.cell_mut((sx, bar_y)) {

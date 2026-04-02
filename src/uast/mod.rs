@@ -13,6 +13,9 @@ pub use kind::SemanticKind;
 pub use metrics::SpanMetrics;
 pub use mutation::UastMutation;
 #[allow(unused_imports)]
-pub use projection::{NodeByteTarget, NodeCursorTarget, RenderToken, UastProjection, Viewport};
+pub use projection::{
+	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, RenderToken, UastProjection,
+	Viewport,
+};
 #[allow(unused_imports)]
 pub use topology::TreeEdges;
