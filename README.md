@@ -1,40 +1,83 @@
-## Baryon Architecture
+# Baryon
 
-### 1. Directory Structure
-```text
-src/
-├── core/           # Common types and primitives
-├── ecs/            # Layer 0: Storage & Concurrency boundaries
-├── svp/            # Layer 1: Physical I/O (DMA, io_uring)
-├── uast/           # Layer 2: Logical Topology & Metrics
-├── engine/         # Layer 3: Background Orchestration
-├── ui/             # Layer 4: TUI & Rendering
-├── app.rs          # Application lifecycle
-└── main.rs         # Entry point
+Baryon is an experimental modal terminal editor built around a sparse virtual projection pipeline. The project is currently focused on making large text navigation, byte-accurate editing, and Rust-aware highlighting behave correctly under real editing pressure.
+
+At this stage, Baryon is best thought of as a working editor prototype rather than a complete Vim or NeoVim replacement. It already supports everyday buffer editing, search, substitute, undo/redo, mouse-driven cursor placement, and Rust lexical plus semantic colorization.
+
+## Current State
+
+- Modal TUI frontend built with `ratatui` and `crossterm`
+- File open/save flows via CLI argument and ex-style commands
+- Normal, Insert, Command, Search, and Confirm modes
+- Vim-like navigation with `h`, `j`, `k`, `l`, `gg`, `G`, arrow keys, mouse clicks, and wheel scroll
+- Insert and backspace editing with undo on `u` and redo on `Ctrl-r`
+- Search with `/pattern`, then `n` and `N`
+- Substitute commands for current line, explicit ranges, and whole-file replacement
+- Linewise yank/put with unnamed register, named registers, and system clipboard support
+- Rust lexical highlighting plus asynchronous semantic highlighting
+- Regression tests around tab-aware cursor math, undo/highlight state, document rewrites, and EOF paste behavior
+
+## Running
+
+```bash
+cargo run -- path/to/file.rs
 ```
 
-### 2. Pillar Assignments
+If no path is provided, Baryon starts without loading an initial file.
 
-#### Pillar 1: ECS (`src/ecs/`)
-- **NodeId**: Move to `src/ecs/id.rs`.
-- **UastRegistry**: Move to `src/ecs/registry.rs`.
-- **RegistryChunk**: Move to `src/ecs/chunk.rs`.
-- *Why*: This is the raw "Storage Layer". It shouldn't know about disks or trees.
+Useful development commands:
 
-#### Pillar 2: SVP (`src/svp/`)
-- **SvpPointer**: Move to `src/svp/pointer.rs`.
-- **SvpResolver**: Move to `src/svp/resolver.rs`.
-- **Ingestion**: Move `ingest_svp_file` to `src/svp/ingest.rs`.
-- *Why*: This is the "Physical Layer". It maps hardware blocks to ECS indices.
+```bash
+cargo test
+cargo check
+```
 
-#### Pillar 3: UAST (`src/uast/`)
-- **Topology**: Move `TreeEdges` and LCRS logic to `src/uast/topology.rs`.
-- **Metrics**: Move `SpanMetrics` and `metrics_inflated` logic to `src/uast/metrics.rs`.
-- **Viewport**: Move `query_viewport`, `RenderToken`, and `Viewport` to `src/uast/projection.rs`.
-- **Semantics**: Move `SemanticKind` to `src/uast/kind.rs`.
-- *Why*: This is the "Logical Layer". It interprets the ECS indices as a structured tree.
+## Editor Commands
 
-#### Pillar 4: Orchestration (`src/engine/` & `src/app.rs`)
-- **Engine**: Encapsulate the background thread and `EditorCommand` into an `Engine` struct.
-- **UI**: Encapsulate Ratatui logic, Gutter calculation, and Input handling into a `Frontend` struct.
-- **App**: Create a top-level `App` struct that initializes the channels and pillars.
+Normal mode:
+
+- `i` enters insert mode
+- `u` undo
+- `Ctrl-r` redo
+- `yy` yank current line
+- `p` put yanked text below the current line
+- `"` selects a register prefix, for example `"ayy`, `"ap`, `"+yy`, `"+p`
+- `/` starts search
+- `:` opens the command line
+
+Command mode:
+
+- `:w` write current file
+- `:w path` write to a new path
+- `:x` or `:wq` write and quit
+- `:q` quit
+- `:e path` open another file
+- `:42` jump to line 42
+- `:s/foo/bar/` substitute on the current line
+- `:%s/foo/bar/g` substitute across the whole file
+- `:1,20s/foo/bar/c` ranged substitute with confirmation
+
+## Architecture
+
+The project is organized as a layered editor pipeline rather than a monolithic text buffer:
+
+- `src/core/`: shared primitives such as typed coordinates and path helpers
+- `src/ecs/`: raw node storage, chunk allocation, and registry-level data access
+- `src/svp/`: sparse virtual projection infrastructure, ingestion, resolver work, parsing, highlighting, and semantic analysis
+- `src/uast/`: logical tree topology, metrics, mutation helpers, and viewport projection
+- `src/engine/`: background command loop, undo ledger, search/substitute logic, clipboard integration, and semantic highlight orchestration
+- `src/ui/`: terminal frontend, input handling, rendering, and mouse interaction
+- `src/app.rs`: thread wiring, channel setup, and terminal lifecycle
+
+Recent work has been focused on hardening the boundaries between coordinate spaces such as document bytes, document lines, visual columns, and async editor state IDs. That has directly reduced bugs around undo, syntax coloring, tab handling, and mouse/cursor alignment.
+
+## Limitations
+
+- Rust is the only language with semantic highlighting today
+- The editing model is intentionally narrower than Vim or NeoVim
+- Features like splits, multiple visible buffers, macros, and a full operator/text-object grammar are not implemented
+- The codebase is still evolving quickly, especially around typed coordinate boundaries and render/highlight plumbing
+
+## Platform Notes
+
+Baryon currently targets a Linux-style terminal workflow and includes `io_uring` in its storage/ingestion layer. It is being developed primarily as a systems-oriented editor experiment, so the implementation is optimized for clarity of internal boundaries more than broad platform polish at this stage.
