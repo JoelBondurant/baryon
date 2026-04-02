@@ -1,4 +1,6 @@
-use crate::core::{CursorPosition, DocByte, DocLine, RequestId, StateId, TAB_SIZE, VisualCol};
+use crate::core::{
+	CursorPosition, DocByte, DocLine, NodeByteOffset, RequestId, StateId, TAB_SIZE, VisualCol,
+};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::clipboard::ClipboardHandle;
 use crate::engine::undo::{
@@ -2597,20 +2599,34 @@ impl Engine {
 					global_start_byte = first_visible.absolute_start_byte;
 				}
 
-				let current_doc_bytes =
-					root_id.and_then(|rid| registry.collect_document_bytes(rid).ok());
-				let cursor_abs_byte = current_doc_bytes
-					.as_ref()
-					.map(|bytes| byte_offset_from_line_col(bytes, cursor_abs_line, cursor_abs_col))
-					.unwrap_or(DocByte::ZERO);
-				let cursor_line_start_byte = current_doc_bytes
-					.as_ref()
-					.map(|bytes| byte_offset_from_line_col(bytes, cursor_abs_line, VisualCol::ZERO))
-					.unwrap_or(DocByte::ZERO);
-				let selection_ranges = match (active_visual, current_doc_bytes.as_ref()) {
-					(Some((anchor, kind)), Some(bytes)) => {
-						resolve_visual_ranges(anchor, cursor_abs_byte, kind, bytes)
-					}
+				let (cursor_abs_byte, cursor_line_start_byte, file_size) =
+					if let Some(rid) = root_id {
+						let cursor_abs_byte = registry.doc_byte_for_node_offset(
+							rid,
+							cursor_node,
+							NodeByteOffset::new(cursor_offset),
+						);
+						let line_start_target =
+							registry.find_node_at_line_col(rid, cursor_abs_line, VisualCol::ZERO);
+						let cursor_line_start_byte = registry.doc_byte_for_node_offset(
+							rid,
+							line_start_target.node_id,
+							line_start_target.node_byte,
+						);
+						(
+							cursor_abs_byte,
+							cursor_line_start_byte,
+							registry.get_total_bytes(rid),
+						)
+					} else {
+						(DocByte::ZERO, DocByte::ZERO, 0)
+					};
+				let selection_ranges = match (active_visual, root_id) {
+					(Some((anchor, kind)), Some(rid)) => registry
+						.collect_document_bytes(rid)
+						.ok()
+						.map(|bytes| resolve_visual_ranges(anchor, cursor_abs_byte, kind, &bytes))
+						.unwrap_or_default(),
 					_ => Vec::new(),
 				};
 
@@ -2623,10 +2639,7 @@ impl Engine {
 					status_message: status_message.take(),
 					should_quit: pending_quit,
 					file_name: file_path.clone(),
-					file_size: current_doc_bytes
-						.as_ref()
-						.map(|b| b.len() as u64)
-						.unwrap_or(0),
+					file_size,
 					is_dirty: ledger.is_dirty(),
 					search_pattern: search_pattern.clone(),
 					search_case_insensitive,

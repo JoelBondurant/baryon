@@ -138,6 +138,10 @@ impl UastRegistry {
 		unsafe { (*self.metrics[node.index()].get()).newlines }
 	}
 
+	pub fn get_total_bytes(&self, node: NodeId) -> u64 {
+		unsafe { (*self.metrics[node.index()].get()).byte_length as u64 }
+	}
+
 	pub fn get_prev_sibling(&self, node: NodeId) -> Option<NodeId> {
 		let parent = unsafe { (*self.edges[node.index()].get()).parent }?;
 		let first_child = unsafe { (*self.edges[parent.index()].get()).first_child }?;

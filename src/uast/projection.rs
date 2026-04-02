@@ -115,6 +115,12 @@ pub trait UastProjection {
 		target_col: VisualCol,
 	) -> NodeCursorTarget;
 	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget;
+	fn doc_byte_for_node_offset(
+		&self,
+		root: NodeId,
+		node: NodeId,
+		node_offset: NodeByteOffset,
+	) -> DocByte;
 	fn collect_document_bytes(&self, root: NodeId) -> Result<Vec<u8>, &'static str>;
 }
 
@@ -338,6 +344,37 @@ impl UastProjection for UastRegistry {
 		Ok(result)
 	}
 
+	fn doc_byte_for_node_offset(
+		&self,
+		root: NodeId,
+		node: NodeId,
+		node_offset: NodeByteOffset,
+	) -> DocByte {
+		let mut absolute = DocByte::new(node_offset.get() as u64);
+		let mut curr = node;
+
+		while curr != root {
+			let Some(parent) = (unsafe { (*self.edges[curr.index()].get()).parent }) else {
+				break;
+			};
+
+			let mut sibling = unsafe { (*self.edges[parent.index()].get()).first_child };
+			while let Some(candidate) = sibling {
+				if candidate == curr {
+					break;
+				}
+
+				let sibling_len = unsafe { (*self.metrics[candidate.index()].get()).byte_length };
+				absolute = absolute.saturating_add(sibling_len as u64);
+				sibling = unsafe { (*self.edges[candidate.index()].get()).next_sibling };
+			}
+
+			curr = parent;
+		}
+
+		absolute
+	}
+
 	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget {
 		let root_len = unsafe { (*self.metrics[root.index()].get()).byte_length as u64 };
 		let clamped_target = target_byte.get().min(root_len);
@@ -553,5 +590,22 @@ mod tests {
 		assert_eq!(eof.node_start_byte, DocByte::new(9));
 		assert_eq!(eof.node_end_byte, DocByte::new(14));
 		assert_eq!(eof.node_byte, crate::core::NodeByteOffset::new(5));
+	}
+
+	#[test]
+	fn doc_byte_for_node_offset_reconstructs_absolute_positions() {
+		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
+
+		let second = registry.find_node_at_doc_byte(root, DocByte::new(6));
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, second.node_id, second.node_byte),
+			DocByte::new(6)
+		);
+
+		let third = registry.find_node_at_doc_byte(root, DocByte::new(11));
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, third.node_id, third.node_byte),
+			DocByte::new(11)
+		);
 	}
 }
