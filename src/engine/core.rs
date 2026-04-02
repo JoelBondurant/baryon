@@ -458,59 +458,29 @@ fn find_all_matches(doc_bytes: &[u8], re: &Regex) -> Vec<SearchMatch> {
 	matches
 }
 
-fn substitute_bytes(
+fn substitute_text_deltas(
 	doc: &[u8],
 	re: &Regex,
-	replacement: &[u8],
+	replacement: &str,
 	byte_range: Option<(usize, usize)>,
-) -> (Vec<u8>, u32) {
+) -> Vec<TextDelta> {
 	let (start, end) = byte_range.unwrap_or((0, doc.len()));
-	let mut result = Vec::with_capacity(doc.len());
-	let mut count = 0u32;
+	let mut deltas = Vec::new();
 
-	result.extend_from_slice(&doc[..start]);
-
-	let region = &doc[start..end];
-	let mut last = 0usize;
-	for m in re.find_iter(region) {
-		result.extend_from_slice(&region[last..m.start()]);
-		result.extend_from_slice(replacement);
-		count += 1;
-		last = m.end();
+	for m in re.find_iter(&doc[start..end]) {
+		let match_start = start + m.start();
+		let match_end = start + m.end();
+		deltas.push(TextDelta {
+			global_byte_offset: DocByte::new(match_start as u64),
+			deleted_text: String::from_utf8_lossy(&doc[match_start..match_end]).into_owned(),
+			inserted_text: replacement.to_string(),
+			state_before: StateId::ZERO,
+			state_after: StateId::ZERO,
+		});
 	}
-	result.extend_from_slice(&region[last..]);
 
-	result.extend_from_slice(&doc[end..]);
-	(result, count)
-}
-
-fn create_document_from_bytes(registry: &UastRegistry, bytes: &[u8]) -> (NodeId, NodeId) {
-	use crate::uast::kind::SemanticKind;
-	use crate::uast::metrics::SpanMetrics;
-	let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
-	let byte_len = bytes.len() as u32;
-	let mut chunk = registry.reserve_chunk(2).expect("OOM");
-	let root = chunk.spawn_node(
-		SemanticKind::RelationalTable,
-		None,
-		SpanMetrics {
-			byte_length: byte_len,
-			newlines,
-		},
-	);
-	let leaf = chunk.spawn_node(
-		SemanticKind::Token,
-		None,
-		SpanMetrics {
-			byte_length: byte_len,
-			newlines,
-		},
-	);
-	chunk.append_local_child(root, leaf);
-	unsafe {
-		*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
-	}
-	(root, leaf)
+	deltas.reverse();
+	deltas
 }
 
 fn temp_save_path(target_path: &Path) -> Result<PathBuf, String> {
@@ -687,6 +657,7 @@ fn rebind_document_spans_to_saved_file(registry: &UastRegistry, root: NodeId, de
 	}
 }
 
+#[cfg(test)]
 fn common_char_prefix_len(left: &str, right: &str) -> usize {
 	let mut prefix = 0usize;
 	let mut left_chars = left.chars();
@@ -702,6 +673,7 @@ fn common_char_prefix_len(left: &str, right: &str) -> usize {
 	prefix
 }
 
+#[cfg(test)]
 fn common_char_suffix_len(left: &str, right: &str) -> usize {
 	let mut suffix = 0usize;
 	let mut left_chars = left.chars().rev();
@@ -717,6 +689,7 @@ fn common_char_suffix_len(left: &str, right: &str) -> usize {
 	suffix
 }
 
+#[cfg(test)]
 fn document_rewrite_delta(before: &str, after: &str) -> Option<(u64, String, String)> {
 	if before == after {
 		return None;
@@ -778,56 +751,6 @@ fn rebase_semantic_highlights_after_deltas(
 	}
 }
 
-fn invert_text_delta(delta: &TextDelta) -> TextDelta {
-	TextDelta {
-		global_byte_offset: delta.global_byte_offset,
-		deleted_text: delta.inserted_text.clone(),
-		inserted_text: delta.deleted_text.clone(),
-		state_before: StateId::ZERO,
-		state_after: StateId::ZERO,
-	}
-}
-
-fn rebase_semantic_highlights_after_undo_group(
-	semantic_highlights: &mut Vec<HighlightSpan>,
-	deltas: &[TextDelta],
-) {
-	for delta in deltas.iter().rev() {
-		rebase_semantic_highlights_after_delta(semantic_highlights, &invert_text_delta(delta));
-	}
-}
-
-fn document_rewrite_text_delta(before: &[u8], after: &[u8]) -> Option<TextDelta> {
-	if before == after {
-		return None;
-	}
-
-	if let (Ok(before_text), Ok(after_text)) =
-		(std::str::from_utf8(before), std::str::from_utf8(after))
-	{
-		if let Some((global_byte_offset, deleted_text, inserted_text)) =
-			document_rewrite_delta(before_text, after_text)
-		{
-			return Some(TextDelta {
-				global_byte_offset: DocByte::new(global_byte_offset),
-				deleted_text,
-				inserted_text,
-				state_before: StateId::ZERO,
-				state_after: StateId::ZERO,
-			});
-		}
-		return None;
-	}
-
-	Some(TextDelta {
-		global_byte_offset: DocByte::ZERO,
-		deleted_text: String::from_utf8_lossy(before).into_owned(),
-		inserted_text: String::from_utf8_lossy(after).into_owned(),
-		state_before: StateId::ZERO,
-		state_after: StateId::ZERO,
-	})
-}
-
 #[cfg(test)]
 fn linewise_put_insertion(
 	doc: &[u8],
@@ -866,6 +789,78 @@ fn read_loaded_document(registry: &UastRegistry, root: NodeId) -> Result<Vec<u8>
 			DocByte::new(registry.get_total_bytes(root)),
 		)
 		.map_err(|msg| msg.to_string())
+}
+
+fn insert_text_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	byte_offset: DocByte,
+	text: &str,
+) -> Result<(NodeId, u32), String> {
+	let file_size = registry.get_total_bytes(root);
+	if byte_offset.get() > file_size {
+		return Err("Edit range exceeded document bounds".to_string());
+	}
+	if text.is_empty() {
+		let target = registry.find_node_at_doc_byte(root, byte_offset);
+		return Ok((target.node_id, target.node_byte.get()));
+	}
+
+	let target = registry.find_node_at_doc_byte(root, byte_offset);
+	Ok(registry.insert_text(
+		target.node_id,
+		target.node_byte.get(),
+		text.as_bytes(),
+	))
+}
+
+fn delete_text_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	byte_offset: DocByte,
+	expected_deleted: &str,
+) -> Result<(NodeId, u32), String> {
+	if expected_deleted.is_empty() {
+		let target = registry.find_node_at_doc_byte(root, byte_offset);
+		return Ok((target.node_id, target.node_byte.get()));
+	}
+
+	let delete_len = expected_deleted.len() as u64;
+	let delete_end = byte_offset.saturating_add(delete_len);
+	let file_size = registry.get_total_bytes(root);
+	if delete_end.get() > file_size {
+		return Err("Edit range exceeded document bounds".to_string());
+	}
+
+	let live_bytes = registry
+		.read_loaded_slice(root, byte_offset, delete_end)
+		.map_err(|msg| msg.to_string())?;
+	if live_bytes != expected_deleted.as_bytes() {
+		return Err("Edit range no longer matches live document".to_string());
+	}
+
+	let mut target = registry.find_node_at_doc_byte(root, delete_end);
+	let mut current_byte =
+		registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte);
+	while current_byte > byte_offset {
+		let previous_byte = current_byte;
+		let (new_node, new_offset) = registry.delete_backwards(
+			target.node_id,
+			target.node_byte.get(),
+		);
+		target.node_id = new_node;
+		target.node_byte = NodeByteOffset::new(new_offset);
+		current_byte = registry.doc_byte_for_node_offset(root, new_node, target.node_byte);
+		if current_byte >= previous_byte {
+			return Err("Sparse delete made no progress".to_string());
+		}
+	}
+
+	if current_byte != byte_offset {
+		return Err("Sparse delete overshot target range".to_string());
+	}
+
+	Ok((target.node_id, target.node_byte.get()))
 }
 
 fn line_start_byte_sparse(registry: &UastRegistry, root: NodeId, target_line: DocLine) -> DocByte {
@@ -1418,6 +1413,67 @@ fn extract_visual_text_sparse(
 	Ok(text)
 }
 
+fn apply_deltas_to_document_internal(
+	registry: &UastRegistry,
+	root_id: &mut Option<NodeId>,
+	cursor_node: &mut NodeId,
+	cursor_offset: &mut u32,
+	cursor_abs_line: &mut DocLine,
+	cursor_abs_col: &mut VisualCol,
+	ledger: &mut UndoLedger,
+	semantic_highlights: &mut Vec<HighlightSpan>,
+	deltas: Vec<TextDelta>,
+	record_undo: bool,
+	cursor_byte_override: Option<DocByte>,
+) -> Result<(), String> {
+	if deltas.is_empty() {
+		return Ok(());
+	}
+
+	let rid = (*root_id).ok_or_else(|| "No file loaded".to_string())?;
+
+	for delta in &deltas {
+		if !delta.deleted_text.is_empty() {
+			delete_text_sparse(
+				registry,
+				rid,
+				delta.global_byte_offset,
+				&delta.deleted_text,
+			)?;
+		}
+		if !delta.inserted_text.is_empty() {
+			insert_text_sparse(
+				registry,
+				rid,
+				delta.global_byte_offset,
+				&delta.inserted_text,
+			)?;
+		}
+	}
+
+	let last_delta = deltas.last().expect("non-empty delta group");
+	let file_size = registry.get_total_bytes(rid);
+	let cursor_byte_after_edit = cursor_byte_override.unwrap_or_else(|| {
+		last_delta
+			.global_byte_offset
+			.saturating_add(last_delta.inserted_text.len() as u64)
+	});
+	let cursor_byte_after_edit = DocByte::new(cursor_byte_after_edit.get().min(file_size));
+
+	rebase_semantic_highlights_after_deltas(semantic_highlights, &deltas);
+	if record_undo {
+		ledger.push_group(deltas);
+	}
+	*root_id = Some(rid);
+
+	let (line, col) = line_col_from_doc_byte_sparse(registry, rid, cursor_byte_after_edit)?;
+	*cursor_abs_line = line;
+	let target = registry.find_node_at_line_col(rid, line, col);
+	apply_cursor_target(target, cursor_node, cursor_offset, cursor_abs_col);
+
+	Ok(())
+}
+
 fn apply_deltas_to_document(
 	registry: &UastRegistry,
 	root_id: &mut Option<NodeId>,
@@ -1429,57 +1485,19 @@ fn apply_deltas_to_document(
 	semantic_highlights: &mut Vec<HighlightSpan>,
 	deltas: Vec<TextDelta>,
 ) -> Result<(), String> {
-	if deltas.is_empty() {
-		return Ok(());
-	}
-
-	let rid = (*root_id).ok_or_else(|| "No file loaded".to_string())?;
-	let mut current_bytes = read_loaded_document(registry, rid)?;
-	let mut current_root = rid;
-	let mut current_leaf = *cursor_node;
-
-	for delta in &deltas {
-		let start = delta.global_byte_offset.get() as usize;
-		let end = start.saturating_add(delta.deleted_text.len());
-
-		if end > current_bytes.len() {
-			return Err("Edit range exceeded document bounds".to_string());
-		}
-
-		if current_bytes[start..end] != delta.deleted_text.as_bytes()[..] {
-			return Err("Edit range no longer matches live document".to_string());
-		}
-
-		let mut new_bytes = Vec::with_capacity(
-			current_bytes.len() - delta.deleted_text.len() + delta.inserted_text.len(),
-		);
-		new_bytes.extend_from_slice(&current_bytes[..start]);
-		new_bytes.extend_from_slice(delta.inserted_text.as_bytes());
-		new_bytes.extend_from_slice(&current_bytes[end..]);
-
-		let (new_root, new_leaf) = create_document_from_bytes(registry, &new_bytes);
-		current_bytes = new_bytes;
-		current_root = new_root;
-		current_leaf = new_leaf;
-	}
-
-	let last_delta = deltas.last().expect("non-empty delta group");
-	let cursor_byte_after_edit = last_delta
-		.global_byte_offset
-		.saturating_add(last_delta.inserted_text.len() as u64);
-
-	rebase_semantic_highlights_after_deltas(semantic_highlights, &deltas);
-	ledger.push_group(deltas);
-	*root_id = Some(current_root);
-	*cursor_node = current_leaf;
-	*cursor_offset = 0;
-
-	let (line, col) = line_col_from_byte_offset(&current_bytes, cursor_byte_after_edit);
-	*cursor_abs_line = line;
-	let target = registry.find_node_at_line_col(current_root, line, col);
-	apply_cursor_target(target, cursor_node, cursor_offset, cursor_abs_col);
-
-	Ok(())
+	apply_deltas_to_document_internal(
+		registry,
+		root_id,
+		cursor_node,
+		cursor_offset,
+		cursor_abs_line,
+		cursor_abs_col,
+		ledger,
+		semantic_highlights,
+		deltas,
+		true,
+		None,
+	)
 }
 
 pub struct Engine {
@@ -1979,8 +1997,6 @@ impl Engine {
 						);
 						let mut buf = [0; 4];
 						let s = c.encode_utf8(&mut buf);
-						let (new_node, new_offset) =
-							registry.insert_text(cursor_node, cursor_offset, s.as_bytes());
 						let delta = TextDelta {
 							global_byte_offset: global_offset,
 							deleted_text: String::new(),
@@ -1988,22 +2004,18 @@ impl Engine {
 							state_before: StateId::ZERO,
 							state_after: StateId::ZERO,
 						};
-
-						rebase_semantic_highlights_after_delta(&mut semantic_highlights, &delta);
-						ledger.push_group(vec![delta]);
-
-						cursor_node = new_node;
-						cursor_offset = new_offset;
-						match line_col_from_doc_byte_sparse(
+						if let Err(msg) = apply_deltas_to_document(
 							&registry,
-							rid,
-							global_offset.saturating_add(s.len() as u64),
+							&mut root_id,
+							&mut cursor_node,
+							&mut cursor_offset,
+							&mut cursor_abs_line,
+							&mut cursor_abs_col,
+							&mut ledger,
+							&mut semantic_highlights,
+							vec![delta],
 						) {
-							Ok((line, col)) => {
-								cursor_abs_line = line;
-								cursor_abs_col = col;
-							}
-							Err(msg) => status_message = Some(msg),
+							status_message = Some(msg);
 						}
 						needs_render = true;
 					}
@@ -2045,8 +2057,6 @@ impl Engine {
 									delete_node,
 									NodeByteOffset::new(delete_start as u32),
 								);
-								let (new_node, new_offset) =
-									registry.delete_backwards(cursor_node, cursor_offset);
 								let delta = TextDelta {
 									global_byte_offset: delete_start_byte,
 									deleted_text,
@@ -2054,25 +2064,18 @@ impl Engine {
 									state_before: StateId::ZERO,
 									state_after: StateId::ZERO,
 								};
-
-								rebase_semantic_highlights_after_delta(
-									&mut semantic_highlights,
-									&delta,
-								);
-								ledger.push_group(vec![delta]);
-								cursor_node = new_node;
-								cursor_offset = new_offset;
-
-								match line_col_from_doc_byte_sparse(
+								if let Err(msg) = apply_deltas_to_document(
 									&registry,
-									rid,
-									delete_start_byte,
+									&mut root_id,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_line,
+									&mut cursor_abs_col,
+									&mut ledger,
+									&mut semantic_highlights,
+									vec![delta],
 								) {
-									Ok((line, col)) => {
-										cursor_abs_line = line;
-										cursor_abs_col = col;
-									}
-									Err(msg) => status_message = Some(msg),
+									status_message = Some(msg);
 								}
 							}
 							Err(msg) => status_message = Some(msg),
@@ -2402,61 +2405,31 @@ impl Engine {
 								Ok(bytes) => {
 									let byte_range =
 										resolve_byte_range(&range, &bytes, cursor_abs_line);
-									let (new_bytes, count) = substitute_bytes(
-										&bytes,
-										&re,
-										replacement.as_bytes(),
-										byte_range,
-									);
+									let deltas =
+										substitute_text_deltas(&bytes, &re, &replacement, byte_range);
+									let count = deltas.len() as u32;
 									if count == 0 {
 										status_message = Some("Pattern not found".to_string());
 									} else {
-										if let Some(delta) =
-											document_rewrite_text_delta(&bytes, &new_bytes)
-										{
-											match apply_deltas_to_document(
-												&registry,
-												&mut root_id,
-												&mut cursor_node,
-												&mut cursor_offset,
-												&mut cursor_abs_line,
-												&mut cursor_abs_col,
-												&mut ledger,
-												&mut semantic_highlights,
-												vec![delta],
-											) {
-												Ok(()) => {
-													cursor_abs_line = DocLine::new(
-														cursor_abs_line.get().min(
-															new_bytes
-																.iter()
-																.filter(|&&b| b == b'\n')
-																.count() as u32,
-														),
-													);
-													if let Some(new_root) = root_id {
-														let target = registry
-															.find_node_at_line_col(
-																new_root,
-																cursor_abs_line,
-																VisualCol::ZERO,
-															);
-														apply_cursor_target(
-															target,
-															&mut cursor_node,
-															&mut cursor_offset,
-															&mut cursor_abs_col,
-														);
-													}
-
-													search_matches.clear();
-													search_match_index = None;
-													search_match_info = None;
-													status_message =
-														Some(format!("{} substitution(s)", count));
-												}
-												Err(msg) => status_message = Some(msg),
+										match apply_deltas_to_document(
+											&registry,
+											&mut root_id,
+											&mut cursor_node,
+											&mut cursor_offset,
+											&mut cursor_abs_line,
+											&mut cursor_abs_col,
+											&mut ledger,
+											&mut semantic_highlights,
+											deltas,
+										) {
+											Ok(()) => {
+												search_matches.clear();
+												search_match_index = None;
+												search_match_info = None;
+												status_message =
+													Some(format!("{} substitution(s)", count));
 											}
+											Err(msg) => status_message = Some(msg),
 										}
 									}
 								}
@@ -2553,55 +2526,56 @@ impl Engine {
 						let pat = search_pattern.clone().unwrap_or_default();
 						match action {
 							ConfirmAction::Yes => {
-								// Replace current match, rebuild doc, re-scan from next position
+								// Replace current match, then re-scan from the replacement point.
 								if let Ok(bytes) = read_loaded_document(&registry, rid) {
 									let idx = search_match_index.unwrap_or(0);
 									let current_match = search_matches[idx];
-									// Find byte offset of this match (mc is visual column)
-									let mut byte_off = 0usize;
-									let mut line = DocLine::ZERO;
-									let mut col = VisualCol::ZERO;
-									for &b in bytes.iter() {
-										if line == current_match.line && col == current_match.col {
-											break;
-										}
-										advance_col(b, &mut line, &mut col);
-										byte_off += 1;
-									}
+									let byte_off = byte_offset_from_line_col(
+										&bytes,
+										current_match.line,
+										current_match.col,
+									)
+									.get() as usize;
 									let rep = cs.replacement.as_bytes();
-									let mut new_bytes = Vec::with_capacity(bytes.len());
-									new_bytes.extend_from_slice(&bytes[..byte_off]);
-									new_bytes.extend_from_slice(rep);
-									new_bytes.extend_from_slice(
-										&bytes[byte_off + current_match.byte_len..],
-									);
+									let delta = TextDelta {
+										global_byte_offset: DocByte::new(byte_off as u64),
+										deleted_text: String::from_utf8_lossy(
+											&bytes[byte_off..byte_off + current_match.byte_len],
+										)
+										.into_owned(),
+										inserted_text: cs.replacement.clone(),
+										state_before: StateId::ZERO,
+										state_after: StateId::ZERO,
+									};
 									cs.replacements_done += 1;
-									let applied_ok = if let Some(delta) =
-										document_rewrite_text_delta(&bytes, &new_bytes)
-									{
-										match apply_deltas_to_document(
-											&registry,
-											&mut root_id,
-											&mut cursor_node,
-											&mut cursor_offset,
-											&mut cursor_abs_line,
-											&mut cursor_abs_col,
-											&mut ledger,
-											&mut semantic_highlights,
-											vec![delta],
-										) {
-											Ok(()) => true,
-											Err(msg) => {
-												status_message = Some(msg);
-												false
-											}
+									let applied_ok = match apply_deltas_to_document(
+										&registry,
+										&mut root_id,
+										&mut cursor_node,
+										&mut cursor_offset,
+										&mut cursor_abs_line,
+										&mut cursor_abs_col,
+										&mut ledger,
+										&mut semantic_highlights,
+										vec![delta],
+									) {
+										Ok(()) => true,
+										Err(msg) => {
+											status_message = Some(msg);
+											false
 										}
-									} else {
-										true
 									};
 
 									if applied_ok {
 										if let Some(new_rid) = root_id {
+											let Ok(new_bytes) = read_loaded_document(&registry, new_rid)
+											else {
+												status_message = Some(
+													"Failed to reload document after substitution"
+														.to_string(),
+												);
+												continue;
+											};
 											// Re-scan for remaining matches after replacement point, filtered by range
 											let re = build_regex(&pat, cs.flags.case_insensitive)
 												.unwrap();
@@ -2726,63 +2700,39 @@ impl Engine {
 									// Replace all remaining from current position
 									let idx = search_match_index.unwrap_or(0);
 									let current_match = search_matches[idx];
-									let mut byte_off = 0usize;
-									let mut line = DocLine::ZERO;
-									let mut col = VisualCol::ZERO;
-									for &b in bytes.iter() {
-										if line == current_match.line && col == current_match.col {
-											break;
-										}
-										advance_col(b, &mut line, &mut col);
-										byte_off += 1;
-									}
-									let remaining = &bytes[byte_off..];
+									let byte_off = byte_offset_from_line_col(
+										&bytes,
+										current_match.line,
+										current_match.col,
+									)
+									.get() as usize;
 									let re = build_regex(&pat, cs.flags.case_insensitive).unwrap();
-									let (replaced, count) = substitute_bytes(
-										remaining,
+									let deltas = substitute_text_deltas(
+										&bytes,
 										&re,
-										cs.replacement.as_bytes(),
-										None,
+										&cs.replacement,
+										Some((byte_off, bytes.len())),
 									);
-									let mut new_bytes = Vec::with_capacity(bytes.len());
-									new_bytes.extend_from_slice(&bytes[..byte_off]);
-									new_bytes.extend_from_slice(&replaced);
+									let count = deltas.len() as u32;
 									cs.replacements_done += count;
-									if let Some(delta) =
-										document_rewrite_text_delta(&bytes, &new_bytes)
-									{
-										match apply_deltas_to_document(
-											&registry,
-											&mut root_id,
-											&mut cursor_node,
-											&mut cursor_offset,
-											&mut cursor_abs_line,
-											&mut cursor_abs_col,
-											&mut ledger,
-											&mut semantic_highlights,
-											vec![delta],
-										) {
-											Ok(()) => {
-												if let Some(new_root) = root_id {
-													let target = registry.find_node_at_line_col(
-														new_root,
-														cursor_abs_line,
-														cursor_abs_col,
-													);
-													apply_cursor_target(
-														target,
-														&mut cursor_node,
-														&mut cursor_offset,
-														&mut cursor_abs_col,
-													);
-												}
-												status_message = Some(format!(
-													"{} substitution(s)",
-													cs.replacements_done
-												));
-											}
-											Err(msg) => status_message = Some(msg),
+									match apply_deltas_to_document(
+										&registry,
+										&mut root_id,
+										&mut cursor_node,
+										&mut cursor_offset,
+										&mut cursor_abs_line,
+										&mut cursor_abs_col,
+										&mut ledger,
+										&mut semantic_highlights,
+										deltas,
+									) {
+										Ok(()) => {
+											status_message = Some(format!(
+												"{} substitution(s)",
+												cs.replacements_done
+											));
 										}
+										Err(msg) => status_message = Some(msg),
 									}
 								}
 								mode_override = Some(EditorMode::Normal);
@@ -2906,28 +2856,22 @@ impl Engine {
 					}
 				}
 				EditorCommand::Undo => {
-					if let Some(rid) = root_id {
-						if let Some((new_root, new_leaf, cursor_byte, _, deltas)) =
-							ledger.undo(&registry, rid)
-						{
-							rebase_semantic_highlights_after_undo_group(
+					if root_id.is_some() {
+						if let Some((inverse_deltas, cursor_byte)) = ledger.undo() {
+							if let Err(msg) = apply_deltas_to_document_internal(
+								&registry,
+								&mut root_id,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_line,
+								&mut cursor_abs_col,
+								&mut ledger,
 								&mut semantic_highlights,
-								&deltas,
-							);
-							root_id = Some(new_root);
-							cursor_node = new_leaf;
-							cursor_offset = 0;
-							if let Ok((line, col)) =
-								line_col_from_doc_byte_sparse(&registry, new_root, cursor_byte)
-							{
-								cursor_abs_line = line;
-								let target = registry.find_node_at_line_col(new_root, line, col);
-								apply_cursor_target(
-									target,
-									&mut cursor_node,
-									&mut cursor_offset,
-									&mut cursor_abs_col,
-								);
+								inverse_deltas,
+								false,
+								Some(cursor_byte),
+							) {
+								status_message = Some(msg);
 							}
 							needs_render = true;
 						} else {
@@ -2937,28 +2881,22 @@ impl Engine {
 					}
 				}
 				EditorCommand::Redo => {
-					if let Some(rid) = root_id {
-						if let Some((new_root, new_leaf, cursor_byte, _, deltas)) =
-							ledger.redo(&registry, rid)
-						{
-							rebase_semantic_highlights_after_deltas(
+					if root_id.is_some() {
+						if let Some((redo_deltas, cursor_byte)) = ledger.redo() {
+							if let Err(msg) = apply_deltas_to_document_internal(
+								&registry,
+								&mut root_id,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_line,
+								&mut cursor_abs_col,
+								&mut ledger,
 								&mut semantic_highlights,
-								&deltas,
-							);
-							root_id = Some(new_root);
-							cursor_node = new_leaf;
-							cursor_offset = 0;
-							if let Ok((line, col)) =
-								line_col_from_doc_byte_sparse(&registry, new_root, cursor_byte)
-							{
-								cursor_abs_line = line;
-								let target = registry.find_node_at_line_col(new_root, line, col);
-								apply_cursor_target(
-									target,
-									&mut cursor_node,
-									&mut cursor_offset,
-									&mut cursor_abs_col,
-								);
+								redo_deltas,
+								false,
+								Some(cursor_byte),
+							) {
+								status_message = Some(msg);
 							}
 							needs_render = true;
 						} else {
@@ -3203,13 +3141,13 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		FILE_DEVICE_ID, VisualKind, apply_deltas_to_document, delete_to_line_end_delta,
-		document_rewrite_delta, first_non_whitespace_visual_col, line_col_from_doc_byte_sparse,
-		line_end_visual_col, linewise_put_insertion, next_word_end, next_word_start,
-		prev_word_start, rebase_semantic_highlights_after_delta,
-		rebind_document_spans_to_saved_file, resolve_visual_ranges, save_document_atomic,
-		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
-		word_object_delta_at_cursor,
+		FILE_DEVICE_ID, VisualKind, apply_deltas_to_document,
+		apply_deltas_to_document_internal, delete_to_line_end_delta, document_rewrite_delta,
+		first_non_whitespace_visual_col, line_col_from_doc_byte_sparse, line_end_visual_col,
+		linewise_put_insertion, next_word_end, next_word_start, prev_word_start,
+		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
+		resolve_visual_ranges, save_document_atomic, smart_home_visual_col,
+		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
@@ -3639,11 +3577,25 @@ mod tests {
 		assert_eq!(cursor_abs_line, DocLine::ZERO);
 		assert_eq!(cursor_abs_col, VisualCol::new(2));
 
-		let (undo_root, _, _, _, undo_group) = ledger
-			.undo(&registry, root_id.expect("mutated root for undo"))
-			.expect("single undo should restore whole group");
+		let (undo_group, undo_cursor_byte) =
+			ledger.undo().expect("single undo should restore whole group");
 		assert_eq!(undo_group.len(), 3);
 		assert_eq!(ledger.current_state_id, StateId::ZERO);
+		apply_deltas_to_document_internal(
+			&registry,
+			&mut root_id,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+			&mut ledger,
+			&mut semantic_highlights,
+			undo_group,
+			false,
+			Some(undo_cursor_byte),
+		)
+		.expect("undo deltas should apply sparsely");
+		let undo_root = root_id.expect("root after undo");
 		let restored = registry
 			.read_loaded_slice(
 				undo_root,
@@ -3656,11 +3608,25 @@ mod tests {
 			"abcd\nefgh\nijkl\n"
 		);
 
-		let (redo_root, _, _, _, redo_group) = ledger
-			.redo(&registry, undo_root)
-			.expect("single redo should reapply whole group");
+		let (redo_group, redo_cursor_byte) =
+			ledger.redo().expect("single redo should reapply whole group");
 		assert_eq!(redo_group.len(), 3);
 		assert_eq!(ledger.current_state_id, StateId::new(1));
+		apply_deltas_to_document_internal(
+			&registry,
+			&mut root_id,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+			&mut ledger,
+			&mut semantic_highlights,
+			redo_group,
+			false,
+			Some(redo_cursor_byte),
+		)
+		.expect("redo deltas should apply sparsely");
+		let redo_root = root_id.expect("root after redo");
 		let redone = registry
 			.read_loaded_slice(
 				redo_root,

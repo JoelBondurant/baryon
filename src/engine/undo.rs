@@ -1,6 +1,4 @@
 use crate::core::{DocByte, DocLine, StateId, TAB_SIZE, VisualCol};
-use crate::ecs::{NodeId, UastRegistry};
-use crate::uast::UastProjection;
 
 #[derive(Debug, Clone)]
 pub struct TextDelta {
@@ -69,129 +67,44 @@ impl UndoLedger {
 		self.current_state_id != self.saved_state_id
 	}
 
-	/// Pop the most recent delta, apply its inverse to the document,
-	/// and return (root, leaf, cursor_global_byte, new_doc_size).
-	pub fn undo(
-		&mut self,
-		registry: &UastRegistry,
-		root: NodeId,
-	) -> Option<(NodeId, NodeId, DocByte, u64, Vec<TextDelta>)> {
+	/// Pop the most recent transaction group and return its inverse deltas in the
+	/// correct sparse replay order, along with the cursor target byte.
+	pub fn undo(&mut self) -> Option<(Vec<TextDelta>, DocByte)> {
 		let deltas = self.undo_stack.pop()?;
-		let bytes = registry
-			.read_loaded_slice(
-				root,
-				DocByte::ZERO,
-				DocByte::new(registry.get_total_bytes(root)),
-			)
-			.ok()?;
-		let mut new_bytes = bytes;
-		for delta in deltas.iter().rev() {
-			splice_document_bytes(
-				&mut new_bytes,
-				delta.global_byte_offset,
-				delta.inserted_text.as_bytes(),
-				delta.deleted_text.as_bytes(),
-			)?;
-		}
-		let new_size = new_bytes.len() as u64;
-		let (new_root, new_leaf) = create_document(registry, &new_bytes);
 		let last_delta = deltas.last()?;
 		let cursor_byte = last_delta
 			.global_byte_offset
 			.saturating_add(last_delta.deleted_text.len() as u64);
 
 		self.current_state_id = last_delta.state_before;
-		let cache_deltas = deltas.clone();
+		let inverse_deltas = deltas
+			.iter()
+			.rev()
+			.map(|delta| TextDelta {
+				global_byte_offset: delta.global_byte_offset,
+				deleted_text: delta.inserted_text.clone(),
+				inserted_text: delta.deleted_text.clone(),
+				state_before: StateId::ZERO,
+				state_after: StateId::ZERO,
+			})
+			.collect();
 		self.redo_stack.push(deltas);
-		Some((new_root, new_leaf, cursor_byte, new_size, cache_deltas))
+		Some((inverse_deltas, cursor_byte))
 	}
 
-	/// Pop the most recent undone delta, re-apply it forward,
-	/// and return (root, leaf, cursor_global_byte, new_doc_size).
-	pub fn redo(
-		&mut self,
-		registry: &UastRegistry,
-		root: NodeId,
-	) -> Option<(NodeId, NodeId, DocByte, u64, Vec<TextDelta>)> {
+	/// Pop the most recent undone transaction group and return its forward deltas
+	/// for sparse replay, along with the cursor target byte.
+	pub fn redo(&mut self) -> Option<(Vec<TextDelta>, DocByte)> {
 		let deltas = self.redo_stack.pop()?;
-		let bytes = registry
-			.read_loaded_slice(
-				root,
-				DocByte::ZERO,
-				DocByte::new(registry.get_total_bytes(root)),
-			)
-			.ok()?;
-		let mut new_bytes = bytes;
-		for delta in &deltas {
-			splice_document_bytes(
-				&mut new_bytes,
-				delta.global_byte_offset,
-				delta.deleted_text.as_bytes(),
-				delta.inserted_text.as_bytes(),
-			)?;
-		}
-		let new_size = new_bytes.len() as u64;
-		let (new_root, new_leaf) = create_document(registry, &new_bytes);
 		let last_delta = deltas.last()?;
 		let cursor_byte = last_delta
 			.global_byte_offset
 			.saturating_add(last_delta.inserted_text.len() as u64);
 
 		self.current_state_id = last_delta.state_after;
-		let cache_deltas = deltas.clone();
-		self.undo_stack.push(deltas);
-		Some((new_root, new_leaf, cursor_byte, new_size, cache_deltas))
+		self.undo_stack.push(deltas.clone());
+		Some((deltas, cursor_byte))
 	}
-}
-
-fn splice_document_bytes(
-	bytes: &mut Vec<u8>,
-	global_byte_offset: DocByte,
-	expected_deleted: &[u8],
-	inserted: &[u8],
-) -> Option<()> {
-	let start = global_byte_offset.get() as usize;
-	let end = start.checked_add(expected_deleted.len())?;
-	if end > bytes.len() || bytes[start..end] != expected_deleted[..] {
-		return None;
-	}
-
-	let mut new_bytes = Vec::with_capacity(bytes.len() - expected_deleted.len() + inserted.len());
-	new_bytes.extend_from_slice(&bytes[..start]);
-	new_bytes.extend_from_slice(inserted);
-	new_bytes.extend_from_slice(&bytes[end..]);
-	*bytes = new_bytes;
-	Some(())
-}
-
-/// Reconstruct a single-leaf document from raw bytes.
-fn create_document(registry: &UastRegistry, bytes: &[u8]) -> (NodeId, NodeId) {
-	use crate::uast::kind::SemanticKind;
-	use crate::uast::metrics::SpanMetrics;
-	let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
-	let byte_len = bytes.len() as u32;
-	let mut chunk = registry.reserve_chunk(2).expect("OOM");
-	let root = chunk.spawn_node(
-		SemanticKind::RelationalTable,
-		None,
-		SpanMetrics {
-			byte_length: byte_len,
-			newlines,
-		},
-	);
-	let leaf = chunk.spawn_node(
-		SemanticKind::Token,
-		None,
-		SpanMetrics {
-			byte_length: byte_len,
-			newlines,
-		},
-	);
-	chunk.append_local_child(root, leaf);
-	unsafe {
-		*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
-	}
-	(root, leaf)
 }
 
 /// Compute (line, col) from a global byte offset into raw document bytes.
