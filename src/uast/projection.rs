@@ -129,6 +129,73 @@ pub trait UastProjection {
 	) -> Result<Vec<u8>, &'static str>;
 }
 
+impl UastRegistry {
+	pub fn for_each_loaded_slice_fragment<F>(
+		&self,
+		root: NodeId,
+		start: DocByte,
+		end: DocByte,
+		mut callback: F,
+	) -> Result<(), &'static str>
+	where
+		F: FnMut(&[u8]),
+	{
+		let root_len = self.get_total_bytes(root);
+		let start = start.get().min(root_len);
+		let end = end.get().min(root_len);
+		if start >= end {
+			return Ok(());
+		}
+
+		let start_target = self.find_node_at_doc_byte(root, DocByte::new(start));
+		let mut visit = Some(start_target.node_id);
+		let mut local_start = start_target.node_byte.get() as usize;
+		let mut absolute_start = start_target.node_start_byte;
+		let mut remaining = (end - start) as usize;
+
+		while let Some(node) = visit {
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			if has_children {
+				visit = self.get_first_child(node);
+				continue;
+			}
+
+			let node_len = unsafe { (*self.metrics[idx].get()).byte_length as usize };
+			if node_len > 0 && absolute_start.get() < end {
+				let bytes = unsafe {
+					if let Some(v_data) = &*self.virtual_data[idx].get() {
+						v_data.as_slice()
+					} else if (*self.spans[idx].get()).is_some() {
+						return Err("File still loading, cannot read slice yet");
+					} else {
+						return Err("Leaf text unavailable");
+					}
+				};
+
+				let take_len = (node_len.saturating_sub(local_start)).min(remaining);
+				if take_len > 0 {
+					callback(&bytes[local_start..local_start + take_len]);
+					remaining -= take_len;
+					if remaining == 0 {
+						return Ok(());
+					}
+				}
+			}
+
+			absolute_start = absolute_start.saturating_add(node_len as u64);
+			local_start = 0;
+			visit = self.get_next_node_in_walk(node);
+		}
+
+		if remaining == 0 {
+			Ok(())
+		} else {
+			Err("Slice exceeded loaded document bounds")
+		}
+	}
+}
+
 impl UastProjection for UastRegistry {
 	fn query_viewport(
 		&self,
@@ -362,55 +429,16 @@ impl UastProjection for UastRegistry {
 		let root_len = self.get_total_bytes(root);
 		let start = start.get().min(root_len);
 		let end = end.get().min(root_len);
-		if start >= end {
-			return Ok(Vec::new());
-		}
-
-		let start_target = self.find_node_at_doc_byte(root, DocByte::new(start));
-		let mut visit = Some(start_target.node_id);
-		let mut local_start = start_target.node_byte.get() as usize;
-		let mut absolute_start = start_target.node_start_byte;
-		let mut remaining = (end - start) as usize;
-		let mut result = Vec::with_capacity(remaining);
-
-		while let Some(node) = visit {
-			let idx = node.index();
-			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
-			if has_children {
-				visit = self.get_first_child(node);
-				continue;
-			}
-
-			let node_len = unsafe { (*self.metrics[idx].get()).byte_length as usize };
-			if node_len > 0 && absolute_start.get() < end {
-				let bytes = unsafe {
-					if let Some(v_data) = &*self.virtual_data[idx].get() {
-						v_data
-					} else if (*self.spans[idx].get()).is_some() {
-						return Err("File still loading, cannot read slice yet");
-					} else {
-						return Err("Leaf text unavailable");
-					}
-				};
-
-				let take_len = (node_len.saturating_sub(local_start)).min(remaining);
-				result.extend_from_slice(&bytes[local_start..local_start + take_len]);
-				remaining -= take_len;
-				if remaining == 0 {
-					break;
-				}
-			}
-
-			absolute_start = absolute_start.saturating_add(node_len as u64);
-			local_start = 0;
-			visit = self.get_next_node_in_walk(node);
-		}
-
-		if remaining == 0 {
-			Ok(result)
-		} else {
-			Err("Slice exceeded loaded document bounds")
-		}
+		let mut result = Vec::with_capacity((end.saturating_sub(start)) as usize);
+		self.for_each_loaded_slice_fragment(
+			root,
+			DocByte::new(start),
+			DocByte::new(end),
+			|fragment| {
+				result.extend_from_slice(fragment);
+			},
+		)?;
+		Ok(result)
 	}
 
 	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget {
@@ -645,5 +673,32 @@ mod tests {
 			registry.doc_byte_for_node_offset(root, third.node_id, third.node_byte),
 			DocByte::new(11)
 		);
+	}
+
+	#[test]
+	fn for_each_loaded_slice_fragment_yields_disjoint_leaf_slices_in_order() {
+		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
+		let mut fragments = Vec::new();
+
+		registry
+			.for_each_loaded_slice_fragment(root, DocByte::new(3), DocByte::new(11), |fragment| {
+				fragments.push(String::from_utf8_lossy(fragment).into_owned());
+			})
+			.expect("slice fragments");
+
+		assert_eq!(
+			fragments,
+			vec!["ha".to_string(), "beta".to_string(), "ga".to_string()]
+		);
+	}
+
+	#[test]
+	fn read_loaded_slice_collects_fragments_from_the_fragment_visitor() {
+		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
+		let slice = registry
+			.read_loaded_slice(root, DocByte::new(3), DocByte::new(11))
+			.expect("loaded slice");
+
+		assert_eq!(String::from_utf8(slice).expect("utf8"), "habetaga");
 	}
 }
