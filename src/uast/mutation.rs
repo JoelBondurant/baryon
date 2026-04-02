@@ -102,14 +102,15 @@ impl UastMutation for UastRegistry {
 		}
 
 		let p2_len = old_svp.byte_length.saturating_sub(offset);
-		let total_offset = old_svp.head_trim as u32 + offset;
+		let base_offset = old_svp.lba * 512 + u64::from(old_svp.head_trim);
+		let split_offset = base_offset + u64::from(offset);
 		unsafe {
 			*self.kinds[p2_idx].get() = SemanticKind::Token;
 			*self.spans[p2_idx].get() = Some(SvpPointer {
-				lba: old_svp.lba + (total_offset / 4096) as u64,
+				lba: split_offset / 512,
 				byte_length: p2_len,
 				device_id: old_svp.device_id,
-				head_trim: (total_offset % 4096) as u16,
+				head_trim: (split_offset % 512) as u16,
 			});
 
 			let m = &mut *self.metrics[p2_idx].get();
@@ -166,7 +167,16 @@ impl UastMutation for UastRegistry {
 			self.apply_edit(target, -(bytes_to_remove as i32), 0);
 			(target, offset_in_node - bytes_to_remove as u32)
 		} else {
-			let bytes_to_remove = 1;
+			let mut bytes_to_remove = 1u32;
+			unsafe {
+				if let Some(v_data) = &*self.virtual_data[idx].get() {
+					let mut start = offset_in_node as usize - 1;
+					while start > 0 && (v_data[start] & 0xC0) == 0x80 {
+						start -= 1;
+					}
+					bytes_to_remove = (offset_in_node as usize - start) as u32;
+				}
+			}
 			let split_offset = offset_in_node.saturating_sub(bytes_to_remove);
 			let v_id = self.split_node_pvp_delete(target, split_offset, bytes_to_remove);
 			(v_id, 0)
@@ -217,14 +227,15 @@ impl UastMutation for UastRegistry {
 		}
 
 		let p2_len = old_svp.byte_length.saturating_sub(offset + delete_len);
-		let total_offset = old_svp.head_trim as u32 + offset + delete_len;
+		let base_offset = old_svp.lba * 512 + u64::from(old_svp.head_trim);
+		let split_offset = base_offset + u64::from(offset + delete_len);
 		unsafe {
 			*self.kinds[p2_idx].get() = SemanticKind::Token;
 			*self.spans[p2_idx].get() = Some(SvpPointer {
-				lba: old_svp.lba + (total_offset / 4096) as u64,
+				lba: split_offset / 512,
 				byte_length: p2_len,
 				device_id: old_svp.device_id,
-				head_trim: (total_offset % 4096) as u16,
+				head_trim: (split_offset % 512) as u16,
 			});
 			let m = &mut *self.metrics[p2_idx].get();
 			m.byte_length = p2_len;
@@ -250,5 +261,118 @@ impl UastMutation for UastRegistry {
 		self.apply_edit(parent, -(delete_len as i32), 0);
 
 		v_id
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::UastMutation;
+	use crate::ecs::UastRegistry;
+	use crate::svp::pointer::SvpPointer;
+	use crate::uast::kind::SemanticKind;
+	use crate::uast::metrics::SpanMetrics;
+
+	fn build_physical_leaf(registry: &UastRegistry, span: SvpPointer) -> crate::ecs::NodeId {
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: span.byte_length,
+				newlines: 0,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			Some(span),
+			SpanMetrics {
+				byte_length: span.byte_length,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+		leaf
+	}
+
+	#[test]
+	fn split_node_pvp_preserves_512_byte_span_addressing() {
+		let registry = UastRegistry::new(8);
+		let span = SvpPointer {
+			lba: 1,
+			byte_length: 10_000,
+			device_id: 7,
+			head_trim: 88,
+		};
+		let leaf = build_physical_leaf(&registry, span);
+
+		let inserted = registry.split_node_pvp(leaf, 9_000, b"hi");
+		let tail = registry
+			.get_next_sibling(inserted)
+			.expect("tail span should exist");
+		let tail_span = unsafe { (*registry.spans[tail.index()].get()).expect("tail span") };
+
+		let expected_offset = span.lba * 512 + u64::from(span.head_trim) + 9_000;
+		assert_eq!(tail_span.lba, expected_offset / 512);
+		assert_eq!(u64::from(tail_span.head_trim), expected_offset % 512);
+	}
+
+	#[test]
+	fn split_node_pvp_delete_preserves_512_byte_span_addressing() {
+		let registry = UastRegistry::new(8);
+		let span = SvpPointer {
+			lba: 3,
+			byte_length: 12_000,
+			device_id: 9,
+			head_trim: 144,
+		};
+		let leaf = build_physical_leaf(&registry, span);
+
+		let tombstone = registry.split_node_pvp_delete(leaf, 8_000, 3);
+		let tail = registry
+			.get_next_sibling(tombstone)
+			.expect("tail span should exist");
+		let tail_span = unsafe { (*registry.spans[tail.index()].get()).expect("tail span") };
+
+		let expected_offset = span.lba * 512 + u64::from(span.head_trim) + 8_003;
+		assert_eq!(tail_span.lba, expected_offset / 512);
+		assert_eq!(u64::from(tail_span.head_trim), expected_offset % 512);
+	}
+
+	#[test]
+	fn delete_backwards_uses_utf8_width_for_resolved_physical_leaves() {
+		let registry = UastRegistry::new(8);
+		let span = SvpPointer {
+			lba: 0,
+			byte_length: 4,
+			device_id: 1,
+			head_trim: 0,
+		};
+		let leaf = build_physical_leaf(&registry, span);
+		unsafe {
+			*registry.virtual_data[leaf.index()].get() = Some("aéb".as_bytes().to_vec());
+		}
+
+		let tombstone = registry.delete_backwards(leaf, 3);
+		let tail = registry
+			.get_next_sibling(tombstone.0)
+			.expect("tail span should exist");
+
+		assert_eq!(tombstone.1, 0);
+		assert_eq!(
+			unsafe { (*registry.metrics[leaf.index()].get()).byte_length },
+			1
+		);
+		assert_eq!(
+			unsafe { (*registry.metrics[tail.index()].get()).byte_length },
+			1
+		);
+		assert_eq!(
+			unsafe { (*registry.virtual_data[leaf.index()].get()).as_deref() },
+			Some("a".as_bytes()),
+		);
+		assert_eq!(
+			unsafe { (*registry.virtual_data[tail.index()].get()).as_deref() },
+			Some("b".as_bytes()),
+		);
 	}
 }

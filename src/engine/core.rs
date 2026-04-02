@@ -8,15 +8,20 @@ use crate::engine::undo::{
 };
 use crate::svp::highlight::HighlightSpan;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest};
-use crate::svp::{RequestPriority, SvpResolver, ingest_svp_file};
-use crate::uast::{NodeByteTarget, NodeCursorTarget, UastProjection, Viewport};
+use crate::svp::{RequestPriority, SvpPointer, SvpResolver, ingest_svp_file};
+use crate::uast::{NodeByteTarget, NodeCursorTarget, UastMutation, UastProjection, Viewport};
 use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+
+const FILE_DEVICE_ID: u16 = 0x42;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorMode {
@@ -507,6 +512,180 @@ fn create_document_from_bytes(registry: &UastRegistry, bytes: &[u8]) -> (NodeId,
 	(root, leaf)
 }
 
+fn temp_save_path(target_path: &Path) -> Result<PathBuf, String> {
+	let file_name = target_path
+		.file_name()
+		.ok_or_else(|| "Invalid target path".to_string())?;
+	let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
+	let file_name = file_name.to_string_lossy();
+	let pid = std::process::id();
+
+	for attempt in 0..1024u32 {
+		let candidate = parent.join(format!(".{}.baryon.{}.{}.tmp", file_name, pid, attempt));
+		if !candidate.exists() {
+			return Ok(candidate);
+		}
+	}
+
+	Err("Unable to allocate temporary save path".to_string())
+}
+
+fn copy_physical_span_to_writer(
+	source_file: &mut File,
+	span: SvpPointer,
+	writer: &mut impl Write,
+	buffer: &mut [u8],
+) -> Result<u64, String> {
+	let mut remaining = span.byte_length as usize;
+	let source_offset = span.lba * 512 + u64::from(span.head_trim);
+	source_file
+		.seek(SeekFrom::Start(source_offset))
+		.map_err(|e| format!("Write error: {}", e))?;
+
+	let mut written = 0u64;
+	while remaining > 0 {
+		let chunk_len = remaining.min(buffer.len());
+		source_file
+			.read_exact(&mut buffer[..chunk_len])
+			.map_err(|e| format!("Write error: {}", e))?;
+		writer
+			.write_all(&buffer[..chunk_len])
+			.map_err(|e| format!("Write error: {}", e))?;
+		remaining -= chunk_len;
+		written += chunk_len as u64;
+	}
+
+	Ok(written)
+}
+
+fn stream_document_to_writer(
+	registry: &UastRegistry,
+	root: NodeId,
+	source_path: Option<&Path>,
+	writer: &mut impl Write,
+) -> Result<u64, String> {
+	let mut visit = registry.get_first_child(root);
+	let mut source_file: Option<File> = None;
+	let mut buffer = vec![0u8; 256 * 1024];
+	let mut written = 0u64;
+
+	while let Some(node) = visit {
+		let idx = node.index();
+		let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
+
+		if has_children {
+			visit = registry.get_first_child(node);
+			continue;
+		}
+
+		unsafe {
+			if let Some(v_data) = &*registry.virtual_data[idx].get() {
+				writer
+					.write_all(v_data)
+					.map_err(|e| format!("Write error: {}", e))?;
+				written += v_data.len() as u64;
+			} else if let Some(span) = *registry.spans[idx].get() {
+				if source_file.is_none() {
+					let Some(path) = source_path else {
+						return Err(
+							"Cannot stream-save physical spans without a source file".to_string()
+						);
+					};
+					source_file =
+						Some(File::open(path).map_err(|e| format!("Write error: {}", e))?);
+				}
+
+				written += copy_physical_span_to_writer(
+					source_file
+						.as_mut()
+						.expect("source file must be opened for physical span"),
+					span,
+					writer,
+					&mut buffer,
+				)?;
+			}
+		}
+
+		visit = registry.get_next_node_in_walk(node);
+	}
+
+	Ok(written)
+}
+
+fn save_document_atomic(
+	registry: &UastRegistry,
+	root: NodeId,
+	source_path: Option<&Path>,
+	target_path: &Path,
+) -> Result<u64, String> {
+	let temp_path = temp_save_path(target_path)?;
+
+	let save_result = (|| -> Result<u64, String> {
+		let temp_file = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&temp_path)
+			.map_err(|e| format!("Write error: {}", e))?;
+		let mut writer = BufWriter::with_capacity(1024 * 1024, temp_file);
+		let written = stream_document_to_writer(registry, root, source_path, &mut writer)?;
+		writer.flush().map_err(|e| format!("Write error: {}", e))?;
+		let temp_file = writer
+			.into_inner()
+			.map_err(|e| format!("Write error: {}", e.into_error()))?;
+		temp_file
+			.sync_all()
+			.map_err(|e| format!("Write error: {}", e))?;
+		std::fs::rename(&temp_path, target_path).map_err(|e| format!("Write error: {}", e))?;
+		if let Some(parent) = target_path.parent() {
+			if let Ok(dir) = File::open(parent) {
+				let _ = dir.sync_all();
+			}
+		}
+		Ok(written)
+	})();
+
+	if save_result.is_err() {
+		let _ = std::fs::remove_file(&temp_path);
+	}
+
+	save_result
+}
+
+fn rebind_document_spans_to_saved_file(registry: &UastRegistry, root: NodeId, device_id: u16) {
+	let mut visit = registry.get_first_child(root);
+	let mut byte_offset = 0u64;
+
+	while let Some(node) = visit {
+		let idx = node.index();
+		let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
+
+		if has_children {
+			visit = registry.get_first_child(node);
+			continue;
+		}
+
+		let byte_length = unsafe { (*registry.metrics[idx].get()).byte_length };
+		unsafe {
+			*registry.spans[idx].get() = if byte_length == 0 {
+				None
+			} else {
+				Some(SvpPointer {
+					lba: byte_offset / 512,
+					byte_length,
+					device_id,
+					head_trim: (byte_offset % 512) as u16,
+				})
+			};
+			*registry.virtual_data[idx].get() = None;
+		}
+		registry.dma_in_flight[idx].store(false, Ordering::Relaxed);
+		registry.metrics_inflated[idx].store(byte_length != 0, Ordering::Relaxed);
+
+		byte_offset += byte_length as u64;
+		visit = registry.get_next_node_in_walk(node);
+	}
+}
+
 fn common_char_prefix_len(left: &str, right: &str) -> usize {
 	let mut prefix = 0usize;
 	let mut left_chars = left.chars();
@@ -648,6 +827,7 @@ fn document_rewrite_text_delta(before: &[u8], after: &[u8]) -> Option<TextDelta>
 	})
 }
 
+#[cfg(test)]
 fn linewise_put_insertion(
 	doc: &[u8],
 	cursor_line: DocLine,
@@ -677,6 +857,111 @@ fn linewise_put_insertion(
 	(line_end, inserted_text, target_cursor_line)
 }
 
+fn read_loaded_document(registry: &UastRegistry, root: NodeId) -> Result<Vec<u8>, String> {
+	registry
+		.read_loaded_slice(
+			root,
+			DocByte::ZERO,
+			DocByte::new(registry.get_total_bytes(root)),
+		)
+		.map_err(|msg| msg.to_string())
+}
+
+fn line_start_byte_sparse(registry: &UastRegistry, root: NodeId, target_line: DocLine) -> DocByte {
+	let target = registry.find_node_at_line_col(root, target_line, VisualCol::ZERO);
+	registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte)
+}
+
+fn line_end_byte_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	include_newline: bool,
+) -> Result<DocByte, String> {
+	let line_start_target = registry.find_node_at_line_col(root, target_line, VisualCol::ZERO);
+	let mut node = line_start_target.node_id;
+	let mut node_offset = line_start_target.node_byte.get() as usize;
+	let mut absolute = registry.doc_byte_for_node_offset(
+		root,
+		line_start_target.node_id,
+		line_start_target.node_byte,
+	);
+	let file_size = registry.get_total_bytes(root);
+
+	loop {
+		let text = resolve_loaded_node_text(registry, node)?;
+		for &b in &text.as_bytes()[node_offset..] {
+			if b == b'\n' {
+				return Ok(if include_newline {
+					absolute.saturating_add(1)
+				} else {
+					absolute
+				});
+			}
+			absolute = absolute.saturating_add(1);
+		}
+
+		if absolute.get() >= file_size {
+			return Ok(DocByte::new(file_size));
+		}
+
+		let Some(next) = registry.get_next_sibling(node) else {
+			return Ok(DocByte::new(file_size));
+		};
+		node = next;
+		node_offset = 0;
+	}
+}
+
+fn read_line_bytes_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	include_newline: bool,
+) -> Result<Vec<u8>, String> {
+	let start = line_start_byte_sparse(registry, root, target_line);
+	let end = line_end_byte_sparse(registry, root, target_line, include_newline)?;
+	registry
+		.read_loaded_slice(root, start, end)
+		.map_err(|msg| msg.to_string())
+}
+
+fn linewise_put_insertion_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	cursor_line: DocLine,
+	text: &str,
+) -> Result<(DocByte, String, DocLine), String> {
+	let file_size = registry.get_total_bytes(root);
+	let insert_offset = line_end_byte_sparse(registry, root, cursor_line, true)?;
+	let needs_line_break = if insert_offset.get() == file_size && file_size > 0 {
+		let last = registry
+			.read_loaded_slice(
+				root,
+				DocByte::new(file_size.saturating_sub(1)),
+				DocByte::new(file_size),
+			)
+			.map_err(|msg| msg.to_string())?;
+		last.first().copied() != Some(b'\n')
+	} else {
+		false
+	};
+
+	let mut inserted_text = String::with_capacity(text.len() + usize::from(needs_line_break));
+	if needs_line_break {
+		inserted_text.push('\n');
+	}
+	inserted_text.push_str(text);
+
+	let target_cursor_line = if file_size == 0 {
+		DocLine::ZERO
+	} else {
+		cursor_line + 1
+	};
+
+	Ok((insert_offset, inserted_text, target_cursor_line))
+}
+
 fn apply_cursor_target(
 	target: NodeCursorTarget,
 	cursor_node: &mut NodeId,
@@ -686,6 +971,62 @@ fn apply_cursor_target(
 	*cursor_node = target.node_id;
 	*cursor_offset = target.node_byte.get();
 	*cursor_abs_col = target.visual_col;
+}
+
+fn line_col_from_doc_byte_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_byte: DocByte,
+) -> Result<(DocLine, VisualCol), String> {
+	let leaf = registry.find_node_at_doc_byte(root, target_byte);
+	let mut line = DocLine::ZERO;
+	let mut visit = registry.get_first_child(root);
+
+	while let Some(node) = visit {
+		if node == leaf.node_id {
+			break;
+		}
+		line = line.saturating_add(unsafe { (*registry.metrics[node.index()].get()).newlines });
+		visit = registry.get_next_sibling(node);
+	}
+
+	let leaf_text = resolve_loaded_node_text(registry, leaf.node_id)?;
+	let local_offset = leaf.node_byte.get() as usize;
+	let local_prefix = &leaf_text.as_bytes()[..local_offset.min(leaf_text.len())];
+	line = line.saturating_add(local_prefix.iter().filter(|&&b| b == b'\n').count() as u32);
+
+	let mut line_bytes = if let Some(last_newline) = local_prefix.iter().rposition(|&b| b == b'\n')
+	{
+		local_prefix[last_newline + 1..].to_vec()
+	} else {
+		local_prefix.to_vec()
+	};
+
+	if local_prefix.iter().rposition(|&b| b == b'\n').is_none() {
+		let mut prev = registry.get_prev_sibling(leaf.node_id);
+		while let Some(node) = prev {
+			let text = resolve_loaded_node_text(registry, node)?;
+			let bytes = text.as_bytes();
+			if let Some(last_newline) = bytes.iter().rposition(|&b| b == b'\n') {
+				let mut prefix = bytes[last_newline + 1..].to_vec();
+				prefix.extend_from_slice(&line_bytes);
+				line_bytes = prefix;
+				break;
+			}
+
+			let mut prefix = bytes.to_vec();
+			prefix.extend_from_slice(&line_bytes);
+			line_bytes = prefix;
+			prev = registry.get_prev_sibling(node);
+		}
+	}
+
+	let mut col = VisualCol::ZERO;
+	for &b in &line_bytes {
+		advance_visual_col_only(&mut col, b);
+	}
+
+	Ok((line, col))
 }
 
 struct ParseWindow {
@@ -843,6 +1184,7 @@ fn word_object_delta_at_cursor(
 	}))
 }
 
+#[cfg(test)]
 fn delete_to_line_end_delta(
 	doc: &[u8],
 	cursor_line: DocLine,
@@ -878,6 +1220,14 @@ fn clamp_visual_byte(byte: DocByte, buffer: &[u8]) -> Option<DocByte> {
 		Some(DocByte::new(
 			byte.get().min(buffer.len().saturating_sub(1) as u64),
 		))
+	}
+}
+
+fn clamp_existing_doc_byte(byte: DocByte, file_size: u64) -> Option<DocByte> {
+	if file_size == 0 {
+		None
+	} else {
+		Some(DocByte::new(byte.get().min(file_size.saturating_sub(1))))
 	}
 }
 
@@ -964,19 +1314,96 @@ pub fn resolve_visual_ranges(
 	}
 }
 
-fn visual_range_end_exclusive(end_inclusive: DocByte, buffer_len: usize) -> usize {
-	(end_inclusive.get() as usize)
-		.saturating_add(1)
-		.min(buffer_len)
+fn resolve_visual_ranges_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	anchor: DocByte,
+	cursor: DocByte,
+	kind: VisualKind,
+) -> Result<Vec<(DocByte, DocByte)>, String> {
+	let file_size = registry.get_total_bytes(root);
+	let Some(anchor) = clamp_existing_doc_byte(anchor, file_size) else {
+		return Ok(Vec::new());
+	};
+	let Some(cursor) = clamp_existing_doc_byte(cursor, file_size) else {
+		return Ok(Vec::new());
+	};
+
+	let start = DocByte::new(anchor.get().min(cursor.get()));
+	let end = DocByte::new(anchor.get().max(cursor.get()));
+
+	match kind {
+		VisualKind::Char => Ok(vec![(start, end)]),
+		VisualKind::Line => {
+			let (start_line, _) = line_col_from_doc_byte_sparse(registry, root, start)?;
+			let (end_line, _) = line_col_from_doc_byte_sparse(registry, root, end)?;
+			let expanded_start = line_start_byte_sparse(registry, root, start_line);
+			let expanded_end_exclusive = line_end_byte_sparse(registry, root, end_line, true)?;
+			if expanded_end_exclusive <= expanded_start {
+				Ok(Vec::new())
+			} else {
+				Ok(vec![(
+					expanded_start,
+					expanded_end_exclusive.saturating_sub(1),
+				)])
+			}
+		}
+		VisualKind::Block => {
+			let (anchor_line, anchor_col) = line_col_from_doc_byte_sparse(registry, root, anchor)?;
+			let (cursor_line, cursor_col) = line_col_from_doc_byte_sparse(registry, root, cursor)?;
+			let min_line = anchor_line.get().min(cursor_line.get());
+			let max_line = anchor_line.get().max(cursor_line.get());
+			let min_col = VisualCol::new(anchor_col.get().min(cursor_col.get()));
+			let max_col = VisualCol::new(anchor_col.get().max(cursor_col.get()));
+			let mut ranges = Vec::new();
+
+			for line in min_line..=max_line {
+				let line = DocLine::new(line);
+				let start_target = registry.find_node_at_line_col(root, line, min_col);
+				let start_byte = registry.doc_byte_for_node_offset(
+					root,
+					start_target.node_id,
+					start_target.node_byte,
+				);
+				let line_content_end = line_end_byte_sparse(registry, root, line, false)?;
+				if start_byte >= line_content_end {
+					continue;
+				}
+
+				let end_target = registry.find_node_at_line_col(root, line, max_col);
+				let raw_end = registry.doc_byte_for_node_offset(
+					root,
+					end_target.node_id,
+					end_target.node_byte,
+				);
+				let end_byte = if raw_end >= line_content_end {
+					line_content_end.saturating_sub(1)
+				} else {
+					raw_end
+				};
+
+				if start_byte <= end_byte {
+					ranges.push((start_byte, end_byte));
+				}
+			}
+
+			Ok(ranges)
+		}
+	}
 }
 
-fn extract_visual_text(ranges: &[(DocByte, DocByte)], buffer: &[u8]) -> String {
+fn extract_visual_text_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	ranges: &[(DocByte, DocByte)],
+) -> Result<String, String> {
 	let mut text = String::new();
 
 	for (idx, (start, end)) in ranges.iter().enumerate() {
-		let start_idx = start.get() as usize;
-		let end_idx = visual_range_end_exclusive(*end, buffer.len());
-		if start_idx >= end_idx {
+		let bytes = registry
+			.read_loaded_slice(root, *start, end.saturating_add(1))
+			.map_err(|msg| msg.to_string())?;
+		if bytes.is_empty() {
 			continue;
 		}
 
@@ -984,10 +1411,10 @@ fn extract_visual_text(ranges: &[(DocByte, DocByte)], buffer: &[u8]) -> String {
 			text.push('\n');
 		}
 
-		text.push_str(&String::from_utf8_lossy(&buffer[start_idx..end_idx]));
+		text.push_str(&String::from_utf8_lossy(&bytes));
 	}
 
-	text
+	Ok(text)
 }
 
 fn apply_deltas_to_document(
@@ -1006,9 +1433,7 @@ fn apply_deltas_to_document(
 	}
 
 	let rid = (*root_id).ok_or_else(|| "No file loaded".to_string())?;
-	let mut current_bytes = registry
-		.collect_document_bytes(rid)
-		.map_err(|msg| msg.to_string())?;
+	let mut current_bytes = read_loaded_document(registry, rid)?;
 	let mut current_root = rid;
 	let mut current_leaf = *cursor_node;
 
@@ -1151,10 +1576,12 @@ impl Engine {
 								}
 							}
 							MoveDirection::Left => {
-								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+								if let Ok(line_bytes) =
+									read_line_bytes_sparse(&registry, rid, cursor_abs_line, false)
+								{
 									cursor_abs_col = step_left_visual_col(
-										&bytes,
-										cursor_abs_line,
+										&line_bytes,
+										DocLine::ZERO,
 										cursor_abs_col,
 									);
 								} else {
@@ -1162,10 +1589,12 @@ impl Engine {
 								}
 							}
 							MoveDirection::Right => {
-								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+								if let Ok(line_bytes) =
+									read_line_bytes_sparse(&registry, rid, cursor_abs_line, false)
+								{
 									cursor_abs_col = step_right_visual_col(
-										&bytes,
-										cursor_abs_line,
+										&line_bytes,
+										DocLine::ZERO,
 										cursor_abs_col,
 									);
 								} else {
@@ -1175,14 +1604,15 @@ impl Engine {
 							MoveDirection::NextWord
 							| MoveDirection::PrevWord
 							| MoveDirection::NextWordEnd => {
-								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+								if let Ok(bytes) = read_loaded_document(&registry, rid) {
 									if let Ok(doc) = std::str::from_utf8(&bytes) {
-										let cursor_abs_byte = byte_offset_from_line_col(
-											&bytes,
-											cursor_abs_line,
-											cursor_abs_col,
-										)
-										.get() as usize;
+										let cursor_abs_byte = registry
+											.doc_byte_for_node_offset(
+												rid,
+												cursor_node,
+												NodeByteOffset::new(cursor_offset),
+											)
+											.get() as usize;
 										let target_byte = match dir {
 											MoveDirection::NextWord => {
 												next_word_start(doc, cursor_abs_byte)
@@ -1245,18 +1675,22 @@ impl Engine {
 				| EditorCommand::LineEnd
 				| EditorCommand::SmartHome) => {
 					if let Some(rid) = root_id {
-						if let Ok(bytes) = registry.collect_document_bytes(rid) {
+						if let Ok(line_bytes) =
+							read_line_bytes_sparse(&registry, rid, cursor_abs_line, false)
+						{
 							let target_col = match line_motion {
 								EditorCommand::LineStart => VisualCol::ZERO,
 								EditorCommand::FirstNonWhitespace => {
-									first_non_whitespace_visual_col(&bytes, cursor_abs_line)
+									first_non_whitespace_visual_col(&line_bytes, DocLine::ZERO)
 								}
 								EditorCommand::LineEnd => {
-									line_end_visual_col(&bytes, cursor_abs_line)
+									line_end_visual_col(&line_bytes, DocLine::ZERO)
 								}
-								EditorCommand::SmartHome => {
-									smart_home_visual_col(&bytes, cursor_abs_line, cursor_abs_col)
-								}
+								EditorCommand::SmartHome => smart_home_visual_col(
+									&line_bytes,
+									DocLine::ZERO,
+									cursor_abs_col,
+								),
 								_ => unreachable!(),
 							};
 							let target =
@@ -1313,23 +1747,33 @@ impl Engine {
 				}
 				EditorCommand::VisualYank { anchor, kind } => {
 					if let Some(rid) = root_id {
-						match registry.collect_document_bytes(rid) {
-							Ok(bytes) => {
-								let cursor_abs_byte = byte_offset_from_line_col(
-									&bytes,
-									cursor_abs_line,
-									cursor_abs_col,
-								);
-								let ranges =
-									resolve_visual_ranges(anchor, cursor_abs_byte, kind, &bytes);
+						let cursor_abs_byte = registry.doc_byte_for_node_offset(
+							rid,
+							cursor_node,
+							NodeByteOffset::new(cursor_offset),
+						);
+						match resolve_visual_ranges_sparse(
+							&registry,
+							rid,
+							anchor,
+							cursor_abs_byte,
+							kind,
+						) {
+							Ok(ranges) => {
 								if ranges.is_empty() {
 									status_message = Some("Nothing selected".to_string());
 								} else {
-									let selected_text = extract_visual_text(&ranges, &bytes);
-									registers.insert('"', selected_text.clone());
-									clipboard.set_text(&selected_text);
-									status_message =
-										Some(format!("{} bytes yanked", selected_text.len()));
+									match extract_visual_text_sparse(&registry, rid, &ranges) {
+										Ok(selected_text) => {
+											registers.insert('"', selected_text.clone());
+											clipboard.set_text(&selected_text);
+											status_message = Some(format!(
+												"{} bytes yanked",
+												selected_text.len()
+											));
+										}
+										Err(msg) => status_message = Some(msg),
+									}
 								}
 								active_visual = None;
 								needs_render = true;
@@ -1345,34 +1789,54 @@ impl Engine {
 				visual_delete_cmd @ (EditorCommand::VisualDelete { anchor, kind }
 				| EditorCommand::VisualChange { anchor, kind }) => {
 					if let Some(rid) = root_id {
-						match registry.collect_document_bytes(rid) {
-							Ok(bytes) => {
-								let cursor_abs_byte = byte_offset_from_line_col(
-									&bytes,
-									cursor_abs_line,
-									cursor_abs_col,
-								);
-								let ranges =
-									resolve_visual_ranges(anchor, cursor_abs_byte, kind, &bytes);
+						let cursor_abs_byte = registry.doc_byte_for_node_offset(
+							rid,
+							cursor_node,
+							NodeByteOffset::new(cursor_offset),
+						);
+						match resolve_visual_ranges_sparse(
+							&registry,
+							rid,
+							anchor,
+							cursor_abs_byte,
+							kind,
+						) {
+							Ok(ranges) => {
 								if ranges.is_empty() {
 									status_message = Some("Nothing selected".to_string());
 								} else {
-									let selected_text = extract_visual_text(&ranges, &bytes);
-									registers.insert('"', selected_text);
+									match extract_visual_text_sparse(&registry, rid, &ranges) {
+										Ok(selected_text) => {
+											registers.insert('"', selected_text);
+										}
+										Err(msg) => {
+											status_message = Some(msg);
+											active_visual = None;
+											continue;
+										}
+									}
 									let mut deltas = Vec::with_capacity(ranges.len());
 									for (start, end) in ranges.iter().rev() {
-										let start_idx = start.get() as usize;
-										let end_idx = visual_range_end_exclusive(*end, bytes.len());
-										if start_idx >= end_idx {
+										let deleted_bytes = match registry.read_loaded_slice(
+											rid,
+											*start,
+											end.saturating_add(1),
+										) {
+											Ok(bytes) => bytes,
+											Err(msg) => {
+												status_message = Some(msg.to_string());
+												deltas.clear();
+												break;
+											}
+										};
+										if deleted_bytes.is_empty() {
 											continue;
 										}
 
 										let delta = TextDelta {
 											global_byte_offset: *start,
-											deleted_text: String::from_utf8_lossy(
-												&bytes[start_idx..end_idx],
-											)
-											.into_owned(),
+											deleted_text: String::from_utf8_lossy(&deleted_bytes)
+												.into_owned(),
 											inserted_text: String::new(),
 											state_before: StateId::ZERO,
 											state_after: StateId::ZERO,
@@ -1417,58 +1881,69 @@ impl Engine {
 				}
 				word_cmd @ (EditorCommand::DeleteInnerWord | EditorCommand::ChangeInnerWord) => {
 					if let Some(rid) = root_id {
-						if let Ok(bytes) = registry.collect_document_bytes(rid) {
-							let cursor_abs_byte_offset =
-								byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col);
-							match word_object_delta_at_cursor(
-								&registry,
-								rid,
-								cursor_abs_byte_offset,
-							) {
-								Ok(Some(delta)) => {
-									match apply_deltas_to_document(
-										&registry,
-										&mut root_id,
-										&mut cursor_node,
-										&mut cursor_offset,
-										&mut cursor_abs_line,
-										&mut cursor_abs_col,
-										&mut ledger,
-										&mut semantic_highlights,
-										vec![delta],
-									) {
-										Ok(()) => {
-											if matches!(word_cmd, EditorCommand::ChangeInnerWord) {
-												mode_override = Some(EditorMode::Insert);
-											}
+						let cursor_abs_byte_offset = registry.doc_byte_for_node_offset(
+							rid,
+							cursor_node,
+							NodeByteOffset::new(cursor_offset),
+						);
+						match word_object_delta_at_cursor(&registry, rid, cursor_abs_byte_offset) {
+							Ok(Some(delta)) => {
+								match apply_deltas_to_document(
+									&registry,
+									&mut root_id,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_line,
+									&mut cursor_abs_col,
+									&mut ledger,
+									&mut semantic_highlights,
+									vec![delta],
+								) {
+									Ok(()) => {
+										if matches!(word_cmd, EditorCommand::ChangeInnerWord) {
+											mode_override = Some(EditorMode::Insert);
 										}
-										Err(msg) => status_message = Some(msg),
 									}
+									Err(msg) => status_message = Some(msg),
 								}
-								Ok(None) => {
-									status_message =
-										Some("No structural word at cursor".to_string())
-								}
-								Err(msg) => status_message = Some(msg),
 							}
-							needs_render = true;
-						} else {
-							status_message = Some(
-								"File still loading, cannot resolve structural token".to_string(),
-							);
-							needs_render = true;
+							Ok(None) => {
+								status_message = Some("No structural word at cursor".to_string())
+							}
+							Err(msg) => status_message = Some(msg),
 						}
+						needs_render = true;
 					}
 				}
 				EditorCommand::DeleteToLineEnd => {
 					if let Some(rid) = root_id {
-						match registry.collect_document_bytes(rid) {
-							Ok(bytes) => {
-								if let Some(delta) = delete_to_line_end_delta(
-									&bytes,
-									cursor_abs_line,
-									cursor_abs_col,
-								) {
+						let cursor_abs_byte = registry.doc_byte_for_node_offset(
+							rid,
+							cursor_node,
+							NodeByteOffset::new(cursor_offset),
+						);
+						match line_end_byte_sparse(&registry, rid, cursor_abs_line, false) {
+							Ok(line_end) => {
+								if cursor_abs_byte < line_end {
+									let deleted_bytes = match registry.read_loaded_slice(
+										rid,
+										cursor_abs_byte,
+										line_end,
+									) {
+										Ok(bytes) => bytes,
+										Err(msg) => {
+											status_message = Some(msg.to_string());
+											continue;
+										}
+									};
+									let delta = TextDelta {
+										global_byte_offset: cursor_abs_byte,
+										deleted_text: String::from_utf8_lossy(&deleted_bytes)
+											.into_owned(),
+										inserted_text: String::new(),
+										state_before: StateId::ZERO,
+										state_after: StateId::ZERO,
+									};
 									if let Err(msg) = apply_deltas_to_document(
 										&registry,
 										&mut root_id,
@@ -1496,84 +1971,112 @@ impl Engine {
 				}
 				EditorCommand::InsertChar(c) => {
 					if let Some(rid) = root_id {
-						if let Ok(bytes) = registry.collect_document_bytes(rid) {
-							let global_offset =
-								byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col);
-							let mut buf = [0; 4];
-							let s = c.encode_utf8(&mut buf);
-							if let Err(msg) = apply_deltas_to_document(
-								&registry,
-								&mut root_id,
-								&mut cursor_node,
-								&mut cursor_offset,
-								&mut cursor_abs_line,
-								&mut cursor_abs_col,
-								&mut ledger,
-								&mut semantic_highlights,
-								vec![TextDelta {
-									global_byte_offset: global_offset,
-									deleted_text: String::new(),
-									inserted_text: s.to_string(),
-									state_before: StateId::ZERO,
-									state_after: StateId::ZERO,
-								}],
-							) {
-								status_message = Some(msg);
+						let global_offset = registry.doc_byte_for_node_offset(
+							rid,
+							cursor_node,
+							NodeByteOffset::new(cursor_offset),
+						);
+						let mut buf = [0; 4];
+						let s = c.encode_utf8(&mut buf);
+						let (new_node, new_offset) =
+							registry.insert_text(cursor_node, cursor_offset, s.as_bytes());
+						let delta = TextDelta {
+							global_byte_offset: global_offset,
+							deleted_text: String::new(),
+							inserted_text: s.to_string(),
+							state_before: StateId::ZERO,
+							state_after: StateId::ZERO,
+						};
+
+						rebase_semantic_highlights_after_delta(&mut semantic_highlights, &delta);
+						ledger.push_group(vec![delta]);
+
+						cursor_node = new_node;
+						cursor_offset = new_offset;
+						match line_col_from_doc_byte_sparse(
+							&registry,
+							rid,
+							global_offset.saturating_add(s.len() as u64),
+						) {
+							Ok((line, col)) => {
+								cursor_abs_line = line;
+								cursor_abs_col = col;
 							}
+							Err(msg) => status_message = Some(msg),
 						}
 						needs_render = true;
 					}
 				}
 				EditorCommand::Backspace => {
 					if let Some(rid) = root_id {
-						// Compute global byte offset and peek at the char to be deleted.
-						let global_offset = if let Ok(bytes) = registry.collect_document_bytes(rid)
-						{
-							byte_offset_from_line_col(&bytes, cursor_abs_line, cursor_abs_col)
+						let (delete_node, delete_offset) = if cursor_offset == 0 {
+							match registry.get_prev_sibling(cursor_node) {
+								Some(prev) => {
+									let prev_len = unsafe {
+										(*registry.metrics[prev.index()].get()).byte_length
+									};
+									(prev, prev_len)
+								}
+								None => continue,
+							}
 						} else {
-							DocByte::ZERO
+							(cursor_node, cursor_offset)
 						};
 
-						if global_offset > DocByte::ZERO {
-							// Extract the character about to be deleted.
-							let (deleted_text, delete_start) =
-								if let Ok(bytes) = registry.collect_document_bytes(rid) {
-									let off = global_offset.get() as usize;
-									let mut start = off - 1;
-									while start > 0 && (bytes[start] & 0xC0) == 0x80 {
-										start -= 1;
-									}
-									(
-										String::from_utf8_lossy(&bytes[start..off]).into_owned(),
-										DocByte::new(start as u64),
-									)
-								} else {
-									(String::new(), global_offset.saturating_sub(1))
+						match resolve_loaded_node_text(&registry, delete_node) {
+							Ok(text) => {
+								let bytes = text.as_bytes();
+								let delete_end = delete_offset as usize;
+								if delete_end == 0 || delete_end > bytes.len() {
+									continue;
+								}
+
+								let mut delete_start = delete_end - 1;
+								while delete_start > 0 && (bytes[delete_start] & 0xC0) == 0x80 {
+									delete_start -= 1;
+								}
+
+								let deleted_text =
+									String::from_utf8_lossy(&bytes[delete_start..delete_end])
+										.into_owned();
+								let delete_start_byte = registry.doc_byte_for_node_offset(
+									rid,
+									delete_node,
+									NodeByteOffset::new(delete_start as u32),
+								);
+								let (new_node, new_offset) =
+									registry.delete_backwards(cursor_node, cursor_offset);
+								let delta = TextDelta {
+									global_byte_offset: delete_start_byte,
+									deleted_text,
+									inserted_text: String::new(),
+									state_before: StateId::ZERO,
+									state_after: StateId::ZERO,
 								};
 
-							if !deleted_text.is_empty() {
-								if let Err(msg) = apply_deltas_to_document(
-									&registry,
-									&mut root_id,
-									&mut cursor_node,
-									&mut cursor_offset,
-									&mut cursor_abs_line,
-									&mut cursor_abs_col,
-									&mut ledger,
+								rebase_semantic_highlights_after_delta(
 									&mut semantic_highlights,
-									vec![TextDelta {
-										global_byte_offset: delete_start,
-										deleted_text,
-										inserted_text: String::new(),
-										state_before: StateId::ZERO,
-										state_after: StateId::ZERO,
-									}],
+									&delta,
+								);
+								ledger.push_group(vec![delta]);
+								cursor_node = new_node;
+								cursor_offset = new_offset;
+
+								match line_col_from_doc_byte_sparse(
+									&registry,
+									rid,
+									delete_start_byte,
 								) {
-									status_message = Some(msg);
+									Ok((line, col)) => {
+										cursor_abs_line = line;
+										cursor_abs_col = col;
+									}
+									Err(msg) => status_message = Some(msg),
 								}
 							}
-							needs_render = true;
+							Err(msg) => status_message = Some(msg),
 						}
+						needs_render = true;
 					}
 				}
 				EditorCommand::Scroll(delta) => {
@@ -1679,21 +2182,23 @@ impl Engine {
 				EditorCommand::WriteFile => {
 					if let Some(rid) = root_id {
 						if let Some(ref path) = file_path {
-							match registry.collect_document_bytes(rid) {
-								Ok(bytes) => {
-									let len = bytes.len();
-									match std::fs::write(path, &bytes) {
-										Ok(_) => {
-											ledger.mark_saved();
-											status_message =
-												Some(format!("\"{}\" {}B written", path, len));
-										}
-										Err(e) => {
-											status_message = Some(format!("Write error: {}", e))
-										}
-									}
+							match save_document_atomic(
+								&registry,
+								rid,
+								Some(Path::new(path)),
+								Path::new(path),
+							) {
+								Ok(len) => {
+									resolver.register_device(FILE_DEVICE_ID, path);
+									rebind_document_spans_to_saved_file(
+										&registry,
+										rid,
+										FILE_DEVICE_ID,
+									);
+									ledger.mark_saved();
+									status_message = Some(format!("\"{}\" {}B written", path, len));
 								}
-								Err(msg) => status_message = Some(msg.to_string()),
+								Err(msg) => status_message = Some(msg),
 							}
 						} else {
 							status_message = Some("No file name".to_string());
@@ -1705,20 +2210,16 @@ impl Engine {
 				}
 				EditorCommand::WriteFileAs(path) => {
 					if let Some(rid) = root_id {
-						match registry.collect_document_bytes(rid) {
-							Ok(bytes) => {
-								let len = bytes.len();
-								match std::fs::write(&path, &bytes) {
-									Ok(_) => {
-										ledger.mark_saved();
-										status_message =
-											Some(format!("\"{}\" {}B written", path, len));
-										file_path = Some(path);
-									}
-									Err(e) => status_message = Some(format!("Write error: {}", e)),
-								}
+						let source_path = file_path.as_deref().map(Path::new);
+						match save_document_atomic(&registry, rid, source_path, Path::new(&path)) {
+							Ok(len) => {
+								resolver.register_device(FILE_DEVICE_ID, &path);
+								rebind_document_spans_to_saved_file(&registry, rid, FILE_DEVICE_ID);
+								ledger.mark_saved();
+								status_message = Some(format!("\"{}\" {}B written", path, len));
+								file_path = Some(path);
 							}
-							Err(msg) => status_message = Some(msg.to_string()),
+							Err(msg) => status_message = Some(msg),
 						}
 					} else {
 						status_message = Some("No file to write".to_string());
@@ -1728,22 +2229,24 @@ impl Engine {
 				EditorCommand::WriteAndQuit => {
 					if let Some(rid) = root_id {
 						if let Some(ref path) = file_path {
-							match registry.collect_document_bytes(rid) {
-								Ok(bytes) => {
-									let len = bytes.len();
-									match std::fs::write(path, &bytes) {
-										Ok(_) => {
-											ledger.mark_saved();
-											status_message =
-												Some(format!("\"{}\" {}B written", path, len));
-											pending_quit = true;
-										}
-										Err(e) => {
-											status_message = Some(format!("Write error: {}", e))
-										}
-									}
+							match save_document_atomic(
+								&registry,
+								rid,
+								Some(Path::new(path)),
+								Path::new(path),
+							) {
+								Ok(len) => {
+									resolver.register_device(FILE_DEVICE_ID, path);
+									rebind_document_spans_to_saved_file(
+										&registry,
+										rid,
+										FILE_DEVICE_ID,
+									);
+									ledger.mark_saved();
+									status_message = Some(format!("\"{}\" {}B written", path, len));
+									pending_quit = true;
 								}
-								Err(msg) => status_message = Some(msg.to_string()),
+								Err(msg) => status_message = Some(msg),
 							}
 						} else {
 							status_message = Some("No file name".to_string());
@@ -1756,7 +2259,7 @@ impl Engine {
 				EditorCommand::SearchStart(pattern) => {
 					if let Some(rid) = root_id {
 						match build_regex(&pattern, false) {
-							Ok(re) => match registry.collect_document_bytes(rid) {
+							Ok(re) => match read_loaded_document(&registry, rid) {
 								Ok(bytes) => {
 									let matches = find_all_matches(&bytes, &re);
 									if matches.is_empty() {
@@ -1894,7 +2397,7 @@ impl Engine {
 				} => {
 					if let Some(rid) = root_id {
 						match build_regex(&pattern, flags.case_insensitive) {
-							Ok(re) => match registry.collect_document_bytes(rid) {
+							Ok(re) => match read_loaded_document(&registry, rid) {
 								Ok(bytes) => {
 									let byte_range =
 										resolve_byte_range(&range, &bytes, cursor_abs_line);
@@ -1975,7 +2478,7 @@ impl Engine {
 				} => {
 					if let Some(rid) = root_id {
 						match build_regex(&pattern, flags.case_insensitive) {
-							Ok(re) => match registry.collect_document_bytes(rid) {
+							Ok(re) => match read_loaded_document(&registry, rid) {
 								Ok(bytes) => {
 									let all_matches = find_all_matches(&bytes, &re);
 									let matches: Vec<SearchMatch> = match &range {
@@ -2050,7 +2553,7 @@ impl Engine {
 						match action {
 							ConfirmAction::Yes => {
 								// Replace current match, rebuild doc, re-scan from next position
-								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+								if let Ok(bytes) = read_loaded_document(&registry, rid) {
 									let idx = search_match_index.unwrap_or(0);
 									let current_match = search_matches[idx];
 									// Find byte offset of this match (mc is visual column)
@@ -2218,7 +2721,7 @@ impl Engine {
 								}
 							}
 							ConfirmAction::All => {
-								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+								if let Ok(bytes) = read_loaded_document(&registry, rid) {
 									// Replace all remaining from current position
 									let idx = search_match_index.unwrap_or(0);
 									let current_match = search_matches[idx];
@@ -2302,18 +2805,11 @@ impl Engine {
 				}
 				EditorCommand::YankLine { register } => {
 					if let Some(rid) = root_id {
-						if let Ok(bytes) = registry.collect_document_bytes(rid) {
-							let global_offset =
-								byte_offset_from_line_col(&bytes, cursor_abs_line, VisualCol::ZERO);
-							let off = global_offset.get() as usize;
-							// Find the end of the current line (including the \n).
-							let line_end = bytes[off..]
-								.iter()
-								.position(|&b| b == b'\n')
-								.map(|p| off + p + 1)
-								.unwrap_or(bytes.len());
-							let line_text =
-								String::from_utf8_lossy(&bytes[off..line_end]).into_owned();
+						let line_start = line_start_byte_sparse(&registry, rid, cursor_abs_line);
+						if let Ok(line_bytes) =
+							read_line_bytes_sparse(&registry, rid, cursor_abs_line, true)
+						{
+							let line_text = String::from_utf8_lossy(&line_bytes).into_owned();
 
 							// Always store in the unnamed register.
 							registers.insert('"', line_text.clone());
@@ -2327,16 +2823,15 @@ impl Engine {
 							}
 
 							// Yank flash: highlight the yanked line for 200ms.
-							yank_flash =
-								Some((DocByte::new(off as u64), DocByte::new(line_end as u64)));
+							let line_end = line_start.saturating_add(line_bytes.len() as u64);
+							yank_flash = Some((line_start, line_end));
 							let tx_flash = tx_cmd.clone();
 							std::thread::spawn(move || {
 								std::thread::sleep(std::time::Duration::from_millis(200));
 								let _ = tx_flash.send(EditorCommand::ClearFlash);
 							});
 
-							let line_len = line_end - off;
-							status_message = Some(format!("{} bytes yanked", line_len));
+							status_message = Some(format!("{} bytes yanked", line_bytes.len()));
 							needs_render = true;
 						}
 					}
@@ -2358,10 +2853,14 @@ impl Engine {
 
 						if let Some(text) = paste_text {
 							if !text.is_empty() {
-								if let Ok(bytes) = registry.collect_document_bytes(rid) {
+								if let Ok((insert_offset, inserted_text, target_cursor_line)) =
+									linewise_put_insertion_sparse(
+										&registry,
+										rid,
+										cursor_abs_line,
+										&text,
+									) {
 									// Insert after current line (Vim 'p' for line-wise yank).
-									let (insert_offset, inserted_text, target_cursor_line) =
-										linewise_put_insertion(&bytes, cursor_abs_line, &text);
 									if let Err(msg) = apply_deltas_to_document(
 										&registry,
 										&mut root_id,
@@ -2372,7 +2871,7 @@ impl Engine {
 										&mut ledger,
 										&mut semantic_highlights,
 										vec![TextDelta {
-											global_byte_offset: DocByte::new(insert_offset as u64),
+											global_byte_offset: insert_offset,
 											deleted_text: String::new(),
 											inserted_text,
 											state_before: StateId::ZERO,
@@ -2417,8 +2916,9 @@ impl Engine {
 							root_id = Some(new_root);
 							cursor_node = new_leaf;
 							cursor_offset = 0;
-							if let Ok(bytes) = registry.collect_document_bytes(new_root) {
-								let (line, col) = line_col_from_byte_offset(&bytes, cursor_byte);
+							if let Ok((line, col)) =
+								line_col_from_doc_byte_sparse(&registry, new_root, cursor_byte)
+							{
 								cursor_abs_line = line;
 								let target = registry.find_node_at_line_col(new_root, line, col);
 								apply_cursor_target(
@@ -2447,8 +2947,9 @@ impl Engine {
 							root_id = Some(new_root);
 							cursor_node = new_leaf;
 							cursor_offset = 0;
-							if let Ok(bytes) = registry.collect_document_bytes(new_root) {
-								let (line, col) = line_col_from_byte_offset(&bytes, cursor_byte);
+							if let Ok((line, col)) =
+								line_col_from_doc_byte_sparse(&registry, new_root, cursor_byte)
+							{
 								cursor_abs_line = line;
 								let target = registry.find_node_at_line_col(new_root, line, col);
 								apply_cursor_target(
@@ -2530,7 +3031,7 @@ impl Engine {
 
 							// Dual-Lock Gate: triggers on user mutation OR silent DMA load.
 							if let Some(rid) = root_id {
-								if let Ok(live_bytes) = registry.collect_document_bytes(rid) {
+								if let Ok(live_bytes) = read_loaded_document(&registry, rid) {
 									let path_changed =
 										last_semantic_path.as_deref() != Some(path.as_str());
 									if path_changed
@@ -2622,11 +3123,10 @@ impl Engine {
 						(DocByte::ZERO, DocByte::ZERO, 0)
 					};
 				let selection_ranges = match (active_visual, root_id) {
-					(Some((anchor, kind)), Some(rid)) => registry
-						.collect_document_bytes(rid)
-						.ok()
-						.map(|bytes| resolve_visual_ranges(anchor, cursor_abs_byte, kind, &bytes))
-						.unwrap_or_default(),
+					(Some((anchor, kind)), Some(rid)) => {
+						resolve_visual_ranges_sparse(&registry, rid, anchor, cursor_abs_byte, kind)
+							.unwrap_or_default()
+					}
 					_ => Vec::new(),
 				};
 
@@ -2696,19 +3196,25 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		VisualKind, apply_deltas_to_document, delete_to_line_end_delta, document_rewrite_delta,
-		first_non_whitespace_visual_col, line_end_visual_col, linewise_put_insertion,
-		next_word_end, next_word_start, prev_word_start, rebase_semantic_highlights_after_delta,
-		resolve_visual_ranges, smart_home_visual_col, step_left_visual_col, step_right_visual_col,
+		FILE_DEVICE_ID, VisualKind, apply_deltas_to_document, delete_to_line_end_delta,
+		document_rewrite_delta, first_non_whitespace_visual_col, line_col_from_doc_byte_sparse,
+		line_end_visual_col, linewise_put_insertion, next_word_end, next_word_start,
+		prev_word_start, rebase_semantic_highlights_after_delta,
+		rebind_document_spans_to_saved_file, resolve_visual_ranges, save_document_atomic,
+		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
 		word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
 	use crate::engine::undo::{TextDelta, UndoLedger};
+	use crate::svp::SvpPointer;
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
 	use crate::uast::UastProjection;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
+	use std::path::PathBuf;
+	use std::sync::atomic::Ordering;
+	use std::time::{SystemTime, UNIX_EPOCH};
 
 	fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
 		let registry = UastRegistry::new(32);
@@ -2737,6 +3243,105 @@ mod tests {
 		(registry, root)
 	}
 
+	fn build_split_virtual_document(parts: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new((parts.len() as u32) + 4);
+		let total_bytes = parts.iter().map(|part| part.len()).sum::<usize>() as u32;
+		let total_newlines = parts
+			.iter()
+			.map(|part| part.as_bytes().iter().filter(|&&b| b == b'\n').count() as u32)
+			.sum();
+		let mut chunk = registry
+			.reserve_chunk((parts.len() as u32) + 1)
+			.expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: total_bytes,
+				newlines: total_newlines,
+			},
+		);
+
+		for part in parts {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				None,
+				SpanMetrics {
+					byte_length: part.len() as u32,
+					newlines: part.as_bytes().iter().filter(|&&b| b == b'\n').count() as u32,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			unsafe {
+				*registry.virtual_data[leaf.index()].get() = Some(part.as_bytes().to_vec());
+			}
+		}
+
+		(registry, root)
+	}
+
+	fn temp_test_path(name: &str) -> PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("time should move forward")
+			.as_nanos();
+		std::env::temp_dir().join(format!("baryon-{}-{}-{}", name, std::process::id(), nanos))
+	}
+
+	fn build_mixed_save_document() -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(16);
+		let mut chunk = registry.reserve_chunk(4).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 12,
+				newlines: 0,
+			},
+		);
+		let first = chunk.spawn_node(
+			SemanticKind::Token,
+			Some(SvpPointer {
+				lba: 0,
+				byte_length: 5,
+				device_id: FILE_DEVICE_ID,
+				head_trim: 0,
+			}),
+			SpanMetrics {
+				byte_length: 5,
+				newlines: 0,
+			},
+		);
+		let middle = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 2,
+				newlines: 0,
+			},
+		);
+		let last = chunk.spawn_node(
+			SemanticKind::Token,
+			Some(SvpPointer {
+				lba: 0,
+				byte_length: 5,
+				device_id: FILE_DEVICE_ID,
+				head_trim: 5,
+			}),
+			SpanMetrics {
+				byte_length: 5,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, first);
+		chunk.append_local_child(root, middle);
+		chunk.append_local_child(root, last);
+		unsafe {
+			*registry.virtual_data[middle.index()].get() = Some(b"ZZ".to_vec());
+		}
+		(registry, root)
+	}
+
 	#[test]
 	fn rewrite_delta_tracks_changed_middle_span() {
 		let delta =
@@ -2744,6 +3349,15 @@ mod tests {
 		assert_eq!(delta.0, 3);
 		assert_eq!(delta.1, "main");
 		assert_eq!(delta.2, "demo");
+	}
+
+	#[test]
+	fn sparse_line_col_tracks_columns_across_leaf_boundaries() {
+		let (registry, root) = build_split_virtual_document(&["ab\ncd", "ef"]);
+		let (line, col) =
+			line_col_from_doc_byte_sparse(&registry, root, DocByte::new(6)).expect("line/col");
+		assert_eq!(line, DocLine::new(1));
+		assert_eq!(col, VisualCol::new(3));
 	}
 
 	#[test]
@@ -3008,7 +3622,11 @@ mod tests {
 
 		assert_eq!(ledger.current_state_id, StateId::new(1));
 		let bytes = registry
-			.collect_document_bytes(root_id.expect("mutated root"))
+			.read_loaded_slice(
+				root_id.expect("mutated root"),
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(root_id.expect("mutated root"))),
+			)
 			.expect("collect mutated bytes");
 		assert_eq!(String::from_utf8(bytes).expect("utf8"), "ab\nef\nij\n");
 		assert_eq!(cursor_abs_line, DocLine::ZERO);
@@ -3020,7 +3638,11 @@ mod tests {
 		assert_eq!(undo_group.len(), 3);
 		assert_eq!(ledger.current_state_id, StateId::ZERO);
 		let restored = registry
-			.collect_document_bytes(undo_root)
+			.read_loaded_slice(
+				undo_root,
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(undo_root)),
+			)
 			.expect("collect restored bytes");
 		assert_eq!(
 			String::from_utf8(restored).expect("utf8"),
@@ -3033,9 +3655,64 @@ mod tests {
 		assert_eq!(redo_group.len(), 3);
 		assert_eq!(ledger.current_state_id, StateId::new(1));
 		let redone = registry
-			.collect_document_bytes(redo_root)
+			.read_loaded_slice(
+				redo_root,
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(redo_root)),
+			)
 			.expect("collect redone bytes");
 		assert_eq!(String::from_utf8(redone).expect("utf8"), "ab\nef\nij\n");
+	}
+
+	#[test]
+	fn save_document_atomic_streams_mixed_physical_and_virtual_leaves() {
+		let source_path = temp_test_path("save-source");
+		let target_path = temp_test_path("save-target");
+		std::fs::write(&source_path, b"alphagamma").expect("write source");
+
+		let (registry, root) = build_mixed_save_document();
+		let bytes_written = save_document_atomic(&registry, root, Some(&source_path), &target_path)
+			.expect("streaming save should succeed");
+		assert_eq!(bytes_written, 12);
+
+		let written = std::fs::read(&target_path).expect("read target");
+		assert_eq!(&written, b"alphaZZgamma");
+
+		let _ = std::fs::remove_file(source_path);
+		let _ = std::fs::remove_file(target_path);
+	}
+
+	#[test]
+	fn rebind_document_spans_to_saved_file_re_sparsifies_saved_leaves() {
+		let (registry, root) = build_mixed_save_document();
+		registry.dma_in_flight[1].store(true, Ordering::Relaxed);
+		registry.dma_in_flight[2].store(true, Ordering::Relaxed);
+		registry.dma_in_flight[3].store(true, Ordering::Relaxed);
+		rebind_document_spans_to_saved_file(&registry, root, FILE_DEVICE_ID);
+
+		let first = registry.get_first_child(root).expect("first leaf");
+		let second = registry.get_next_sibling(first).expect("second leaf");
+		let third = registry.get_next_sibling(second).expect("third leaf");
+
+		let first_span = unsafe { (*registry.spans[first.index()].get()).expect("first span") };
+		let second_span = unsafe { (*registry.spans[second.index()].get()).expect("second span") };
+		let third_span = unsafe { (*registry.spans[third.index()].get()).expect("third span") };
+
+		assert_eq!(first_span.lba * 512 + u64::from(first_span.head_trim), 0);
+		assert_eq!(second_span.lba * 512 + u64::from(second_span.head_trim), 5);
+		assert_eq!(third_span.lba * 512 + u64::from(third_span.head_trim), 7);
+
+		assert!(unsafe { (*registry.virtual_data[first.index()].get()).is_none() });
+		assert!(unsafe { (*registry.virtual_data[second.index()].get()).is_none() });
+		assert!(unsafe { (*registry.virtual_data[third.index()].get()).is_none() });
+
+		assert!(!registry.dma_in_flight[first.index()].load(Ordering::Relaxed));
+		assert!(!registry.dma_in_flight[second.index()].load(Ordering::Relaxed));
+		assert!(!registry.dma_in_flight[third.index()].load(Ordering::Relaxed));
+
+		assert!(registry.metrics_inflated[first.index()].load(Ordering::Relaxed));
+		assert!(registry.metrics_inflated[second.index()].load(Ordering::Relaxed));
+		assert!(registry.metrics_inflated[third.index()].load(Ordering::Relaxed));
 	}
 
 	#[test]

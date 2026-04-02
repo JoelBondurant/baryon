@@ -77,7 +77,13 @@ impl UndoLedger {
 		root: NodeId,
 	) -> Option<(NodeId, NodeId, DocByte, u64, Vec<TextDelta>)> {
 		let deltas = self.undo_stack.pop()?;
-		let bytes = registry.collect_document_bytes(root).ok()?;
+		let bytes = registry
+			.read_loaded_slice(
+				root,
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(root)),
+			)
+			.ok()?;
 		let mut new_bytes = bytes;
 		for delta in deltas.iter().rev() {
 			splice_document_bytes(
@@ -108,7 +114,13 @@ impl UndoLedger {
 		root: NodeId,
 	) -> Option<(NodeId, NodeId, DocByte, u64, Vec<TextDelta>)> {
 		let deltas = self.redo_stack.pop()?;
-		let bytes = registry.collect_document_bytes(root).ok()?;
+		let bytes = registry
+			.read_loaded_slice(
+				root,
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(root)),
+			)
+			.ok()?;
 		let mut new_bytes = bytes;
 		for delta in &deltas {
 			splice_document_bytes(

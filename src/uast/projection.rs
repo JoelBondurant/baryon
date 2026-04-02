@@ -121,7 +121,12 @@ pub trait UastProjection {
 		node: NodeId,
 		node_offset: NodeByteOffset,
 	) -> DocByte;
-	fn collect_document_bytes(&self, root: NodeId) -> Result<Vec<u8>, &'static str>;
+	fn read_loaded_slice(
+		&self,
+		root: NodeId,
+		start: DocByte,
+		end: DocByte,
+	) -> Result<Vec<u8>, &'static str>;
 }
 
 impl UastProjection for UastRegistry {
@@ -317,33 +322,6 @@ impl UastProjection for UastRegistry {
 		}
 	}
 
-	fn collect_document_bytes(&self, root: NodeId) -> Result<Vec<u8>, &'static str> {
-		let mut result = Vec::new();
-		let mut visit = self.get_first_child(root);
-
-		while let Some(node) = visit {
-			let idx = node.index();
-			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
-
-			if has_children {
-				visit = self.get_first_child(node);
-				continue;
-			}
-
-			unsafe {
-				if let Some(v_data) = &*self.virtual_data[idx].get() {
-					result.extend_from_slice(v_data);
-				} else if (*self.spans[idx].get()).is_some() {
-					return Err("File still loading, cannot write yet");
-				}
-			}
-
-			visit = self.get_next_node_in_walk(node);
-		}
-
-		Ok(result)
-	}
-
 	fn doc_byte_for_node_offset(
 		&self,
 		root: NodeId,
@@ -373,6 +351,66 @@ impl UastProjection for UastRegistry {
 		}
 
 		absolute
+	}
+
+	fn read_loaded_slice(
+		&self,
+		root: NodeId,
+		start: DocByte,
+		end: DocByte,
+	) -> Result<Vec<u8>, &'static str> {
+		let root_len = self.get_total_bytes(root);
+		let start = start.get().min(root_len);
+		let end = end.get().min(root_len);
+		if start >= end {
+			return Ok(Vec::new());
+		}
+
+		let start_target = self.find_node_at_doc_byte(root, DocByte::new(start));
+		let mut visit = Some(start_target.node_id);
+		let mut local_start = start_target.node_byte.get() as usize;
+		let mut absolute_start = start_target.node_start_byte;
+		let mut remaining = (end - start) as usize;
+		let mut result = Vec::with_capacity(remaining);
+
+		while let Some(node) = visit {
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			if has_children {
+				visit = self.get_first_child(node);
+				continue;
+			}
+
+			let node_len = unsafe { (*self.metrics[idx].get()).byte_length as usize };
+			if node_len > 0 && absolute_start.get() < end {
+				let bytes = unsafe {
+					if let Some(v_data) = &*self.virtual_data[idx].get() {
+						v_data
+					} else if (*self.spans[idx].get()).is_some() {
+						return Err("File still loading, cannot read slice yet");
+					} else {
+						return Err("Leaf text unavailable");
+					}
+				};
+
+				let take_len = (node_len.saturating_sub(local_start)).min(remaining);
+				result.extend_from_slice(&bytes[local_start..local_start + take_len]);
+				remaining -= take_len;
+				if remaining == 0 {
+					break;
+				}
+			}
+
+			absolute_start = absolute_start.saturating_add(node_len as u64);
+			local_start = 0;
+			visit = self.get_next_node_in_walk(node);
+		}
+
+		if remaining == 0 {
+			Ok(result)
+		} else {
+			Err("Slice exceeded loaded document bounds")
+		}
 	}
 
 	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget {
