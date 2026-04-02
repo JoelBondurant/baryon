@@ -45,6 +45,18 @@ impl UastMutation for UastRegistry {
 			}
 			(target, offset_in_node + new_text.len() as u32)
 		} else {
+			unsafe {
+				if let Some(v_data) = &mut *self.virtual_data[idx].get() {
+					*self.spans[idx].get() = None;
+					v_data.splice(
+						(offset_in_node as usize)..(offset_in_node as usize),
+						new_text.iter().copied(),
+					);
+					self.metrics_inflated[idx].store(true, std::sync::atomic::Ordering::Relaxed);
+					return (target, offset_in_node + new_text.len() as u32);
+				}
+			}
+
 			let v_id = self.split_node_pvp(target, offset_in_node, new_text);
 			(v_id, new_text.len() as u32)
 		}
@@ -154,6 +166,7 @@ impl UastMutation for UastRegistry {
 
 		if is_virtual {
 			let mut bytes_to_remove = 1;
+			let mut removed_newlines = 0i32;
 			unsafe {
 				if let Some(v_data) = &mut *self.virtual_data[idx].get() {
 					let mut start = offset_in_node as usize - 1;
@@ -161,22 +174,36 @@ impl UastMutation for UastRegistry {
 						start -= 1;
 					}
 					bytes_to_remove = offset_in_node as usize - start;
+					removed_newlines = v_data[start..offset_in_node as usize]
+						.iter()
+						.filter(|&&b| b == b'\n')
+						.count() as i32;
 					v_data.drain(start..offset_in_node as usize);
 				}
 			}
-			self.apply_edit(target, -(bytes_to_remove as i32), 0);
+			self.apply_edit(target, -(bytes_to_remove as i32), -removed_newlines);
 			(target, offset_in_node - bytes_to_remove as u32)
 		} else {
-			let mut bytes_to_remove = 1u32;
 			unsafe {
-				if let Some(v_data) = &*self.virtual_data[idx].get() {
+				if let Some(v_data) = &mut *self.virtual_data[idx].get() {
 					let mut start = offset_in_node as usize - 1;
 					while start > 0 && (v_data[start] & 0xC0) == 0x80 {
 						start -= 1;
 					}
-					bytes_to_remove = (offset_in_node as usize - start) as u32;
+					let bytes_to_remove = offset_in_node as usize - start;
+					let removed_newlines = v_data[start..offset_in_node as usize]
+						.iter()
+						.filter(|&&b| b == b'\n')
+						.count() as i32;
+					v_data.drain(start..offset_in_node as usize);
+					*self.spans[idx].get() = None;
+					self.metrics_inflated[idx].store(true, std::sync::atomic::Ordering::Relaxed);
+					self.apply_edit(target, -(bytes_to_remove as i32), -removed_newlines);
+					return (target, start as u32);
 				}
 			}
+
+			let bytes_to_remove = 1u32;
 			let split_offset = offset_in_node.saturating_sub(bytes_to_remove);
 			let v_id = self.split_node_pvp_delete(target, split_offset, bytes_to_remove);
 			(v_id, 0)
@@ -199,6 +226,15 @@ impl UastMutation for UastRegistry {
 		let p2_idx = p2_id.index();
 
 		let resolved_data = unsafe { (*self.virtual_data[target_idx].get()).take() };
+		let deleted_newlines = resolved_data
+			.as_ref()
+			.map(|data| {
+				data[offset as usize..(offset + delete_len) as usize]
+					.iter()
+					.filter(|&&b| b == b'\n')
+					.count() as i32
+			})
+			.unwrap_or(0);
 
 		unsafe {
 			let s = &mut *self.spans[target_idx].get();
@@ -258,7 +294,7 @@ impl UastMutation for UastRegistry {
 			}
 		}
 
-		self.apply_edit(parent, -(delete_len as i32), 0);
+		self.apply_edit(parent, -(delete_len as i32), -deleted_newlines);
 
 		v_id
 	}
@@ -339,7 +375,50 @@ mod tests {
 	}
 
 	#[test]
-	fn delete_backwards_uses_utf8_width_for_resolved_physical_leaves() {
+	fn resolved_physical_leaf_edits_promote_the_whole_chunk_to_virtual() {
+		let registry = UastRegistry::new(8);
+		let span = SvpPointer {
+			lba: 0,
+			byte_length: 6,
+			device_id: 1,
+			head_trim: 0,
+		};
+		let leaf = build_physical_leaf(&registry, span);
+		unsafe {
+			*registry.virtual_data[leaf.index()].get() = Some(b"abcdef".to_vec());
+		}
+
+		let (inserted, insert_offset) = registry.insert_text(leaf, 3, b"ZZ");
+		assert_eq!(inserted, leaf);
+		assert_eq!(insert_offset, 5);
+		assert!(registry.get_next_sibling(leaf).is_none());
+		assert!(unsafe { (*registry.spans[leaf.index()].get()).is_none() });
+		assert_eq!(
+			unsafe { (*registry.virtual_data[leaf.index()].get()).as_deref() },
+			Some("abcZZdef".as_bytes()),
+		);
+		assert_eq!(
+			unsafe { (*registry.metrics[leaf.index()].get()).byte_length },
+			8
+		);
+
+		let (deleted, delete_offset) = registry.delete_backwards(leaf, 5);
+		assert_eq!(deleted, leaf);
+		assert_eq!(delete_offset, 4);
+		assert!(registry.get_next_sibling(leaf).is_none());
+		assert!(unsafe { (*registry.spans[leaf.index()].get()).is_none() });
+		assert_eq!(
+			unsafe { (*registry.virtual_data[leaf.index()].get()).as_deref() },
+			Some("abcZdef".as_bytes()),
+		);
+		assert_eq!(
+			unsafe { (*registry.metrics[leaf.index()].get()).byte_length },
+			7
+		);
+	}
+
+	#[test]
+	fn delete_backwards_uses_utf8_width_for_promoted_physical_leaves() {
 		let registry = UastRegistry::new(8);
 		let span = SvpPointer {
 			lba: 0,
@@ -352,27 +431,14 @@ mod tests {
 			*registry.virtual_data[leaf.index()].get() = Some("aéb".as_bytes().to_vec());
 		}
 
-		let tombstone = registry.delete_backwards(leaf, 3);
-		let tail = registry
-			.get_next_sibling(tombstone.0)
-			.expect("tail span should exist");
-
-		assert_eq!(tombstone.1, 0);
-		assert_eq!(
-			unsafe { (*registry.metrics[leaf.index()].get()).byte_length },
-			1
-		);
-		assert_eq!(
-			unsafe { (*registry.metrics[tail.index()].get()).byte_length },
-			1
-		);
+		let (deleted, delete_offset) = registry.delete_backwards(leaf, 3);
+		assert_eq!(deleted, leaf);
+		assert_eq!(delete_offset, 1);
+		assert!(registry.get_next_sibling(leaf).is_none());
+		assert!(unsafe { (*registry.spans[leaf.index()].get()).is_none() });
 		assert_eq!(
 			unsafe { (*registry.virtual_data[leaf.index()].get()).as_deref() },
-			Some("a".as_bytes()),
-		);
-		assert_eq!(
-			unsafe { (*registry.virtual_data[tail.index()].get()).as_deref() },
-			Some("b".as_bytes()),
+			Some("ab".as_bytes()),
 		);
 	}
 }

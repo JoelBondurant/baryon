@@ -22,6 +22,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 const FILE_DEVICE_ID: u16 = 0x42;
+const MAX_SEMANTIC_BYTES: u64 = 1_048_576;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorMode {
@@ -3031,32 +3032,38 @@ impl Engine {
 
 							// Dual-Lock Gate: triggers on user mutation OR silent DMA load.
 							if let Some(rid) = root_id {
-								if let Ok(live_bytes) = read_loaded_document(&registry, rid) {
-									let path_changed =
-										last_semantic_path.as_deref() != Some(path.as_str());
-									if path_changed
-										|| last_semantic_state != Some(ledger.current_state_id)
-										|| live_bytes.len() != last_semantic_len
+								let live_len = registry.get_total_bytes(rid) as usize;
+								let path_changed =
+									last_semantic_path.as_deref() != Some(path.as_str());
+								if path_changed
+									|| last_semantic_state != Some(ledger.current_state_id)
+									|| live_len != last_semantic_len
+								{
+									if live_len == 0 || live_len as u64 >= MAX_SEMANTIC_BYTES {
+										semantic_highlights.clear();
+										last_semantic_state = Some(ledger.current_state_id);
+										last_semantic_len = live_len;
+										last_semantic_path = Some(path.clone());
+										pending_semantic_request_id = None;
+									} else if let Ok(live_bytes) =
+										read_loaded_document(&registry, rid)
 									{
-										// Skip incomplete 0-byte ghost reads on startup.
-										if !live_bytes.is_empty() && live_bytes.len() < 1_048_576 {
-											let text =
-												String::from_utf8_lossy(&live_bytes).into_owned();
-											let request_id = next_semantic_request_id;
-											next_semantic_request_id += 1;
-											reactor.send(SemanticRequest {
-												content: text,
-												global_offset: DocByte::ZERO,
-												file_path: file_path.clone().unwrap_or_default(),
-												state_id: ledger.current_state_id,
-												request_id,
-											});
-											// Lock only after a successful, non-empty send.
-											last_semantic_state = Some(ledger.current_state_id);
-											last_semantic_len = live_bytes.len();
-											last_semantic_path = Some(path.clone());
-											pending_semantic_request_id = Some(request_id);
-										}
+										let text =
+											String::from_utf8_lossy(&live_bytes).into_owned();
+										let request_id = next_semantic_request_id;
+										next_semantic_request_id += 1;
+										reactor.send(SemanticRequest {
+											content: text,
+											global_offset: DocByte::ZERO,
+											file_path: file_path.clone().unwrap_or_default(),
+											state_id: ledger.current_state_id,
+											request_id,
+										});
+										// Lock only after a successful bounded send.
+										last_semantic_state = Some(ledger.current_state_id);
+										last_semantic_len = live_len;
+										last_semantic_path = Some(path.clone());
+										pending_semantic_request_id = Some(request_id);
 									}
 								}
 							}
