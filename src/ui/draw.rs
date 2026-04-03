@@ -1,13 +1,93 @@
 use super::Frontend;
+use super::minimap::render_byte_fallback_snapshot;
 use crate::core::TAB_SIZE;
 use crate::engine::{EditorMode, VisualKind};
 use crate::svp::projector::HighlightProjector;
+use crate::uast::MinimapMode;
 use crate::uast::kind::SemanticKind;
 use crate::ui::*;
-use ratatui::{backend::Backend, layout::Rect, style::Style};
+use ratatui::{backend::Backend, buffer::Buffer, layout::Rect, style::Style};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 use std::io;
+
+fn draw_gutter_line_number(
+	buf: &mut Buffer,
+	gutter_width: u16,
+	y: usize,
+	line_index: u32,
+	total_newlines: u32,
+	gutter_style: Style,
+) {
+	if y > u16::MAX as usize || line_index > total_newlines {
+		return;
+	}
+
+	let line_str = (line_index + 1).to_string();
+	if line_str.len() >= gutter_width as usize {
+		return;
+	}
+
+	let start_x = (gutter_width - 1).saturating_sub(line_str.len() as u16);
+	for (i, c) in line_str.chars().enumerate() {
+		if let Some(cell) = buf.cell_mut((start_x + i as u16, y as u16)) {
+			cell.set_char(c).set_style(gutter_style);
+		}
+	}
+}
+
+fn paint_wrapped_text(
+	buf: &mut Buffer,
+	x: &mut usize,
+	y: &mut usize,
+	text_left: usize,
+	text_right: usize,
+	render_height: usize,
+	text: &str,
+	style: Style,
+) -> bool {
+	if text_right <= text_left {
+		return *y < render_height;
+	}
+
+	for c in text.chars() {
+		if *x >= text_right {
+			*y += 1;
+			*x = text_left;
+		}
+		if *y >= render_height {
+			return false;
+		}
+		if let Some(cell) = buf.cell_mut((*x as u16, *y as u16)) {
+			cell.set_char(c).set_style(style);
+		}
+		*x += 1;
+	}
+
+	*y < render_height
+}
+
+fn next_utf8_chunk(bytes: &[u8]) -> Option<(char, usize)> {
+	let max_len = bytes.len().min(4);
+	for len in 1..=max_len {
+		let prefix = &bytes[..len];
+		if let Ok(text) = std::str::from_utf8(prefix) {
+			if let Some(ch) = text.chars().next() {
+				if ch.len_utf8() == len {
+					return Some((ch, len));
+				}
+			}
+		}
+	}
+	None
+}
+
+fn segment_overlaps(ranges: &[(usize, usize)], start: usize, len: usize) -> bool {
+	let end = start.saturating_add(len);
+	ranges
+		.iter()
+		.any(|&(range_start, range_end)| range_start < end && range_end > start)
+}
 
 impl<B: Backend + io::Write> Frontend<B> {
 	pub(super) fn draw(&mut self) -> Result<(), B::Error> {
@@ -39,8 +119,6 @@ impl<B: Backend + io::Write> Frontend<B> {
 					if let Some(view) = current_viewport {
 						let scroll_y = view.scroll_y;
 						let viewport_line_count = view.viewport_line_count.max(1);
-						let render_line_count =
-							viewport_line_count.min(max_height.saturating_sub(1) as u32) as u16;
 						let max_line_on_screen = scroll_y + viewport_line_count.saturating_sub(1);
 						let minimap_width = if view.minimap.is_some() && max_width > 40 {
 							14u16.min(max_width.saturating_sub(24))
@@ -60,24 +138,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 						let digits = max_line_on_screen.max(1).ilog10() + 1;
 						let gutter_width: u16 = digits as u16 + 1;
 						let gutter_style = Style::default().bg(GUTTER_BG).fg(GUTTER_FG);
+						let text_left = gutter_width as usize;
+						let render_height = (max_height as usize).saturating_sub(1);
 
-						for gy in 0..render_line_count {
+						for gy in 0..render_height as u16 {
 							for gx in 0..gutter_width {
 								if let Some(cell) = buf.cell_mut((gx, gy)) {
 									cell.set_char(' ').set_style(gutter_style);
-								}
-							}
-							let line_num = scroll_y + gy as u32 + 1;
-							if line_num <= view.total_lines + 1 {
-								let line_str = line_num.to_string();
-								if line_str.len() < gutter_width as usize {
-									let start_x =
-										(gutter_width - 1).saturating_sub(line_str.len() as u16);
-									for (i, c) in line_str.chars().enumerate() {
-										if let Some(cell) = buf.cell_mut((start_x + i as u16, gy)) {
-											cell.set_char(c);
-										}
-									}
 								}
 							}
 						}
@@ -99,9 +166,19 @@ impl<B: Backend + io::Write> Frontend<B> {
 							}
 						}
 
-						let mut x: usize = gutter_width as usize;
+						let mut x = text_left;
 						let mut y: usize = 0;
-						let render_height = (max_height as usize).saturating_sub(1);
+						let mut current_doc_line = view.viewport_start_line.get();
+						if render_height > 0 {
+							draw_gutter_line_number(
+								buf,
+								gutter_width,
+								y,
+								current_doc_line,
+								view.total_lines,
+								gutter_style,
+							);
+						}
 
 						let search_pat = view.search_pattern.as_deref().unwrap_or("");
 						let projector = HighlightProjector::new(
@@ -116,130 +193,195 @@ impl<B: Backend + io::Write> Frontend<B> {
 								_ => Style::default().fg(TEXT_FG),
 							};
 							let virtual_style = base_style;
-							let text = if token.text.is_empty() {
-								"[DMA PENDING...]"
+							let has_physical_bytes = !token.text.is_empty();
+							let text = if has_physical_bytes {
+								token.text.as_slice()
 							} else {
-								&token.text
+								b"[DMA PENDING...]"
 							};
 
 							let highlight_style =
 								Style::default().bg(SEARCH_MATCH_BG).fg(SEARCH_MATCH_FG);
 							let search_ci = view.search_case_insensitive;
 							let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
-							if !search_pat.is_empty() && !token.text.is_empty() {
-								let tbytes = text.as_bytes();
+							if !search_pat.is_empty() && has_physical_bytes {
 								if let Ok(re) = Regex::builder()
 									.syntax(syntax::Config::new().case_insensitive(search_ci))
 									.build(search_pat)
 								{
-									for m in re.find_iter(tbytes) {
+									for m in re.find_iter(text) {
 										highlight_ranges.push((m.start(), m.end()));
 									}
 								}
 							}
 
 							let mut byte_idx = 0usize;
-							for c in text.chars() {
-								let in_highlight = highlight_ranges
-									.iter()
-									.any(|&(s, e)| byte_idx >= s && byte_idx < e);
+							while byte_idx < text.len() {
+								if y >= render_height {
+									break;
+								}
 
+								let remaining = &text[byte_idx..];
+								let (chunk_kind, chunk_len) =
+									if let Some((ch, ch_len)) = next_utf8_chunk(remaining) {
+										if ch == '\n' {
+											(0u8, 1usize)
+										} else if ch == '\t' {
+											(1u8, 1usize)
+										} else if ch.is_control() {
+											(2u8, ch_len)
+										} else {
+											(3u8, ch_len)
+										}
+									} else {
+										(2u8, 1usize)
+									};
+
+								let in_highlight =
+									segment_overlaps(&highlight_ranges, byte_idx, chunk_len);
 								let mut style = if in_highlight {
 									highlight_style
 								} else {
 									virtual_style
 								};
-								if !in_highlight && !token.text.is_empty() {
+
+								if !in_highlight && has_physical_bytes {
 									if let Some(fg) = projector.style_for_byte(current_global_byte)
 									{
 										style = style.fg(fg);
 									}
 								}
 
-								let char_len = c.len_utf8();
-								let char_start_byte = current_global_byte;
-								let char_end_byte = current_global_byte
-									.saturating_add(char_len as u64)
-									.saturating_sub(1);
-								let in_selection =
-									view.selection_ranges.iter().any(|(start, end)| {
-										*start <= char_end_byte && *end >= char_start_byte
-									});
-								if in_selection {
-									style = style.bg(SELECTION_BG);
-								}
-
-								if let Some((flash_start, flash_end)) = view.yank_flash {
-									if current_global_byte >= flash_start
-										&& current_global_byte < flash_end
-									{
-										style =
-											Style::default().bg(MODE_NORMAL_BG).fg(MODE_TEXT_FG);
+								if has_physical_bytes {
+									let chunk_start_byte = current_global_byte;
+									let chunk_end_byte = current_global_byte
+										.saturating_add(chunk_len as u64)
+										.saturating_sub(1);
+									let in_selection =
+										view.selection_ranges.iter().any(|(start, end)| {
+											*start <= chunk_end_byte && *end >= chunk_start_byte
+										});
+									if in_selection {
+										style = style.bg(SELECTION_BG);
 									}
-								}
 
-								let is_trailing_space = c == ' ' && {
-									let rest = &text.as_bytes()[byte_idx + char_len..];
-									rest.is_empty() || rest[0] == b'\n'
-								};
-
-								byte_idx += char_len;
-								current_global_byte =
-									current_global_byte.saturating_add(char_len as u64);
-
-								if y >= render_height {
-									break;
-								}
-
-								let ws_style = style.fg(SYNTAX_WHITESPACE);
-
-								if c == '\n' {
-									if x < text_right {
-										if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-											cell.set_char('\u{00AC}').set_style(ws_style);
+									if let Some((flash_start, flash_end)) = view.yank_flash {
+										if flash_start <= chunk_end_byte
+											&& flash_end >= chunk_start_byte
+										{
+											style = Style::default()
+												.bg(MODE_NORMAL_BG)
+												.fg(MODE_TEXT_FG);
 										}
 									}
-									y += 1;
-									x = gutter_width as usize;
-								} else if c == '\t' {
-									let col = x - gutter_width as usize;
-									let spaces_to_add =
-										TAB_SIZE as usize - (col % TAB_SIZE as usize);
-									if x < text_right {
-										if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-											cell.set_char('\u{25B8}').set_style(ws_style);
+								}
+
+								match chunk_kind {
+									0 => {
+										byte_idx += 1;
+										if has_physical_bytes {
+											current_global_byte =
+												current_global_byte.saturating_add(1);
+										}
+										y += 1;
+										x = text_left;
+										current_doc_line = current_doc_line.saturating_add(1);
+										if y < render_height {
+											draw_gutter_line_number(
+												buf,
+												gutter_width,
+												y,
+												current_doc_line,
+												view.total_lines,
+												gutter_style,
+											);
 										}
 									}
-									x += 1;
-									for _ in 1..spaces_to_add {
-										if x < text_right {
-											if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-												cell.set_char(' ').set_style(ws_style);
+									1 => {
+										let col = x.saturating_sub(text_left);
+										let spaces_to_add =
+											TAB_SIZE as usize - (col % TAB_SIZE as usize);
+										let ws_style = style.fg(SYNTAX_WHITESPACE);
+										if !paint_wrapped_text(
+											buf,
+											&mut x,
+											&mut y,
+											text_left,
+											text_right,
+											render_height,
+											"\u{25B8}",
+											ws_style,
+										) {
+											y = render_height;
+										}
+										for _ in 1..spaces_to_add {
+											if !paint_wrapped_text(
+												buf,
+												&mut x,
+												&mut y,
+												text_left,
+												text_right,
+												render_height,
+												" ",
+												ws_style,
+											) {
+												y = render_height;
+												break;
 											}
 										}
-										x += 1;
-									}
-								} else if is_trailing_space {
-									if x < text_right {
-										if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-											cell.set_char('~').set_style(ws_style);
+										byte_idx += 1;
+										if has_physical_bytes {
+											current_global_byte =
+												current_global_byte.saturating_add(1);
 										}
 									}
-									x += 1;
-								} else if c == ' ' {
-									if x < text_right {
-										if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-											cell.set_char('\u{2423}').set_style(ws_style);
+									2 => {
+										let ws_style = style.fg(SYNTAX_WHITESPACE);
+										for &byte in &remaining[..chunk_len] {
+											let hex = format!("<{:02X}>", byte);
+											if !paint_wrapped_text(
+												buf,
+												&mut x,
+												&mut y,
+												text_left,
+												text_right,
+												render_height,
+												&hex,
+												ws_style,
+											) {
+												y = render_height;
+												break;
+											}
+										}
+										byte_idx += chunk_len;
+										if has_physical_bytes {
+											current_global_byte = current_global_byte
+												.saturating_add(chunk_len as u64);
 										}
 									}
-									x += 1;
-								} else {
-									if x < text_right {
-										if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-											cell.set_char(c).set_style(style);
+									_ => {
+										let (ch, ch_len) = next_utf8_chunk(remaining)
+											.expect("printable chunk must decode");
+										let mut encoded = [0u8; 4];
+										let display = ch.encode_utf8(&mut encoded);
+										if !paint_wrapped_text(
+											buf,
+											&mut x,
+											&mut y,
+											text_left,
+											text_right,
+											render_height,
+											display,
+											style,
+										) {
+											y = render_height;
+										}
+										byte_idx += ch_len;
+										if has_physical_bytes {
+											current_global_byte =
+												current_global_byte.saturating_add(ch_len as u64);
 										}
 									}
-									x += 1;
 								}
 							}
 							if y >= render_height {
@@ -252,7 +394,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 						let visual_cursor_x = (view.cursor_abs_pos.col.get() as u16)
 							.checked_add(gutter_width)
 							.unwrap_or(text_right as u16);
-						if max_height > 1 && text_right > 0 {
+						if max_height > 1 && text_right > text_left {
 							let max_cursor_y = max_height.saturating_sub(2);
 							let max_cursor_x = text_right.saturating_sub(1) as u16;
 							cursor_to_set = Some((
@@ -278,8 +420,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 						.and_then(|view| view.minimap.as_ref()),
 				) {
 					let _ = view;
-					minimap.request(snapshot, minimap_area);
-					minimap.render(f, minimap_area);
+					if snapshot.mode == MinimapMode::ByteFallback {
+						let buf = f.buffer_mut();
+						render_byte_fallback_snapshot(buf, minimap_area, snapshot);
+					} else {
+						minimap.request(snapshot, minimap_area);
+						minimap.render(f, minimap_area);
+					}
 				}
 
 				let bar_y = max_height.saturating_sub(1);

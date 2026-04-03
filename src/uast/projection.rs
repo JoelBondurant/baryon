@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 pub struct RenderToken {
 	pub node_id: NodeId,
 	pub kind: SemanticKind,
-	pub text: String,
+	pub text: Vec<u8>,
 	#[allow(dead_code)]
 	pub absolute_start_line: DocLine,
 	pub absolute_start_byte: DocByte,
@@ -34,6 +34,7 @@ pub struct NodeByteTarget {
 pub struct Viewport {
 	pub tokens: Vec<RenderToken>,
 	pub scroll_y: u32,
+	pub viewport_start_line: DocLine,
 	pub viewport_line_count: u32,
 	pub cursor_abs_pos: CursorPosition,
 	pub cursor_abs_byte: DocByte,
@@ -283,19 +284,9 @@ impl UastProjection for UastRegistry {
 				}
 
 				if !text.is_empty() {
-					let to_skip = target_line.get().saturating_sub(line_accumulator.get());
-					let mut skipped = 0;
-					let mut byte_offset = 0;
-					for (i, b) in text.as_bytes().iter().enumerate() {
-						if skipped == to_skip {
-							byte_offset = i;
-							break;
-						}
-						if *b == b'\n' {
-							skipped += 1;
-						}
-					}
-					display_text = text[byte_offset..].to_string();
+					let to_skip = target_line.saturating_sub(line_accumulator.get());
+					let byte_offset = line_start_offset(&text, to_skip).unwrap_or(text.len());
+					display_text = text.get(byte_offset..).unwrap_or(&[]).to_vec();
 					token_start_byte = token_start_byte.saturating_add(byte_offset as u64);
 				}
 				line_accumulator = target_line;
@@ -322,8 +313,8 @@ impl UastProjection for UastRegistry {
 					.last()
 					.unwrap()
 					.text
-					.chars()
-					.filter(|&c| c == '\n')
+					.iter()
+					.filter(|&&b| b == b'\n')
 					.count() as u32;
 				line_accumulator = line_accumulator.saturating_add(lines_shown);
 				collected_lines += lines_shown;
@@ -568,6 +559,33 @@ mod tests {
 		(registry, root)
 	}
 
+	fn build_document_bytes(bytes: &[u8]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: bytes.len() as u32,
+				newlines,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: bytes.len() as u32,
+				newlines,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+		unsafe {
+			*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
+		}
+		(registry, root)
+	}
+
 	fn build_document_with_leaves(chunks: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
 		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
 		let mut chunk = registry
@@ -785,6 +803,16 @@ mod tests {
 			.expect("loaded slice");
 
 		assert_eq!(String::from_utf8(slice).expect("utf8"), "habetaga");
+	}
+
+	#[test]
+	fn query_viewport_preserves_invalid_utf8_bytes_when_skipping_lines() {
+		let (registry, root) = build_document_bytes(b"aa\n\xffbb\ncc");
+		let tokens = registry.query_viewport(root, DocLine::new(1), 2);
+
+		assert_eq!(tokens.len(), 1);
+		assert_eq!(tokens[0].absolute_start_byte, DocByte::new(3));
+		assert_eq!(tokens[0].text, b"\xffbb\ncc".to_vec());
 	}
 
 	#[test]

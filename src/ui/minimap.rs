@@ -1,6 +1,11 @@
 use crate::uast::{MinimapMode, MinimapSnapshot};
 use image::{DynamicImage, Rgba, RgbaImage};
-use ratatui::{Frame, layout::Rect};
+use ratatui::{
+	Frame,
+	buffer::Buffer,
+	layout::Rect,
+	style::{Color, Style},
+};
 use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -82,6 +87,132 @@ fn minimap_worker_loop(picker: Picker, rx: Receiver<MinimapRequest>, tx: Sender<
 				protocol,
 			});
 		}
+	}
+}
+
+fn rgb(color: [u8; 4]) -> Color {
+	Color::Rgb(color[0], color[1], color[2])
+}
+
+fn set_minimap_cell(buf: &mut Buffer, x: u16, y: u16, color: Color) {
+	if let Some(cell) = buf.cell_mut((x, y)) {
+		cell.set_char(' ')
+			.set_style(Style::default().bg(color).fg(color));
+	}
+}
+
+pub(super) fn render_byte_fallback_snapshot(
+	buf: &mut Buffer,
+	area: Rect,
+	snapshot: &MinimapSnapshot,
+) {
+	use crate::ui::*;
+
+	if area.width == 0 || area.height == 0 || snapshot.bands.is_empty() {
+		return;
+	}
+
+	let marker_gutter = if area.width > 2 { 1 } else { 0 };
+	let content_width = area.width.saturating_sub(marker_gutter).max(1);
+	let base_bg = rgb(MINIMAP_RGBA_BG);
+	let fallback_bg = rgb(MINIMAP_RGBA_FALLBACK);
+	let viewport_bg = Color::Rgb(30, 30, 30);
+	let viewport_fallback_bg = Color::Rgb(88, 88, 88);
+	let frame_bg = rgb(MINIMAP_RGBA_FRAME);
+	let frame_side_bg = rgb(MINIMAP_RGBA_FRAME_SIDE);
+	let cursor_bg = rgb(MINIMAP_RGBA_CURSOR);
+	let search_active_bg = rgb(MINIMAP_RGBA_SEARCH_ACTIVE);
+	let search_inactive_bg = rgb(MINIMAP_RGBA_SEARCH_INACTIVE);
+
+	for row in 0..area.height {
+		let band_idx = ((row as usize) * snapshot.bands.len()) / (area.height.max(1) as usize);
+		let density = snapshot.bands[band_idx.min(snapshot.bands.len().saturating_sub(1))];
+		let line_width =
+			((density as u32).saturating_mul(content_width as u32) / 255).max(1) as u16;
+
+		for col in 0..area.width {
+			set_minimap_cell(buf, area.x + col, area.y + row, base_bg);
+		}
+		for col in 0..line_width.min(content_width) {
+			set_minimap_cell(buf, area.x + col, area.y + row, fallback_bg);
+		}
+	}
+
+	for (band_idx, intensity) in snapshot.search_bands.iter().copied().enumerate() {
+		if intensity == 0 || marker_gutter == 0 {
+			continue;
+		}
+		let y0 =
+			((band_idx as u32) * area.height as u32) / snapshot.search_bands.len().max(1) as u32;
+		let y1 = (((band_idx as u32) + 1) * area.height as u32)
+			/ snapshot.search_bands.len().max(1) as u32;
+		let color = if snapshot.active_search_band == Some(band_idx) {
+			search_active_bg
+		} else {
+			search_inactive_bg
+		};
+		let marker_width = if snapshot.active_search_band == Some(band_idx) && marker_gutter > 1 {
+			2
+		} else {
+			1
+		}
+		.min(area.width);
+		let marker_x = area.x + area.width.saturating_sub(marker_width);
+		for row in
+			y0.min(area.height.saturating_sub(1) as u32)..y1.max(y0 + 1).min(area.height as u32)
+		{
+			for x in 0..marker_width {
+				set_minimap_cell(buf, marker_x + x, area.y + row as u16, color);
+			}
+		}
+	}
+
+	let total_lines = snapshot.total_lines.max(1);
+	let viewport_start = snapshot.viewport_start_line.get().min(total_lines - 1);
+	let viewport_end = viewport_start
+		.saturating_add(snapshot.viewport_line_count.max(1))
+		.min(total_lines);
+	let viewport_top = ((viewport_start as u64) * area.height as u64 / total_lines as u64) as u16;
+	let viewport_bottom = ((viewport_end as u64) * area.height as u64 / total_lines as u64) as u16;
+	let viewport_bottom = viewport_bottom.max(viewport_top + 1).min(area.height);
+	let frame_right = area.x + content_width.saturating_sub(1);
+
+	for row in viewport_top.min(area.height.saturating_sub(1))..viewport_bottom {
+		for col in 0..content_width {
+			let x = area.x + col;
+			let is_fallback = buf[(x, area.y + row)].bg == fallback_bg;
+			let color = if is_fallback {
+				viewport_fallback_bg
+			} else {
+				viewport_bg
+			};
+			set_minimap_cell(buf, x, area.y + row, color);
+		}
+	}
+
+	let frame_top = viewport_top.min(area.height.saturating_sub(1));
+	let frame_bottom = viewport_bottom
+		.saturating_sub(1)
+		.min(area.height.saturating_sub(1));
+	for col in 0..content_width {
+		let x = area.x + col;
+		set_minimap_cell(buf, x, area.y + frame_top, frame_bg);
+		set_minimap_cell(buf, x, area.y + frame_bottom, frame_bg);
+	}
+	for row in frame_top..=frame_bottom {
+		set_minimap_cell(buf, area.x, area.y + row, frame_side_bg);
+		set_minimap_cell(buf, frame_right, area.y + row, frame_side_bg);
+	}
+
+	let cursor_row = ((snapshot.cursor_line.get().min(total_lines - 1) as u64) * area.height as u64
+		/ total_lines as u64) as u16;
+	for col in 0..area.width {
+		set_minimap_cell(
+			buf,
+			area.x + col,
+			area.y + cursor_row.min(area.height - 1),
+			cursor_bg,
+		);
 	}
 }
 
@@ -190,4 +321,45 @@ fn render_snapshot_image(snapshot: &MinimapSnapshot, area: Rect) -> DynamicImage
 	}
 
 	DynamicImage::ImageRgba8(image)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::render_byte_fallback_snapshot;
+	use crate::core::DocLine;
+	use crate::uast::{MinimapMode, MinimapSnapshot};
+	use ratatui::{buffer::Buffer, layout::Rect, style::Color};
+
+	#[test]
+	fn byte_fallback_cell_renderer_keeps_uniform_width_for_uniform_bands() {
+		let area = Rect::new(0, 0, 14, 20);
+		let mut buf = Buffer::empty(area);
+		let snapshot = MinimapSnapshot {
+			mode: MinimapMode::ByteFallback,
+			bands: vec![127; 256],
+			search_bands: vec![0; 256],
+			active_search_band: None,
+			total_lines: 1_000,
+			viewport_start_line: DocLine::new(500),
+			viewport_line_count: 1,
+			cursor_line: DocLine::new(500),
+		};
+
+		render_byte_fallback_snapshot(&mut buf, area, &snapshot);
+
+		let fallback_bg = Color::Rgb(76, 76, 76);
+		let expected_width = 6usize;
+		for row in 0..area.height {
+			if row == 10 {
+				continue;
+			}
+			let width = (0..area.width)
+				.take_while(|&col| buf[(col, row)].bg == fallback_bg)
+				.count();
+			assert_eq!(
+				width, expected_width,
+				"row {row} rendered uneven fallback width"
+			);
+		}
+	}
 }

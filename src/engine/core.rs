@@ -854,6 +854,8 @@ fn normalize_line_density(byte_len: usize) -> u8 {
 	((capped * 255) / 160) as u8
 }
 
+const BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP: usize = 80;
+
 fn build_text_minimap_snapshot(
 	bytes: &[u8],
 	viewport_start_line: DocLine,
@@ -916,6 +918,7 @@ fn build_byte_fallback_minimap_snapshot(
 	let mut bands = vec![0u8; MINIMAP_BANDS];
 	let mut visit = registry.get_first_child(root);
 	let mut cumulative_bytes = 0u64;
+	let fallback_density = normalize_line_density(BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP).max(24);
 
 	while let Some(node) = visit {
 		let idx = node.index();
@@ -932,14 +935,8 @@ fn build_byte_fallback_minimap_snapshot(
 		if end_band <= start_band {
 			end_band = start_band + 1;
 		}
-		let avg_line_bytes = if metrics.newlines == 0 {
-			metrics.byte_length as usize
-		} else {
-			(metrics.byte_length as usize) / (metrics.newlines as usize + 1)
-		};
-		let density = normalize_line_density(avg_line_bytes).max(24);
 		for band in start_band.min(MINIMAP_BANDS - 1)..end_band.min(MINIMAP_BANDS) {
-			bands[band] = bands[band].max(density);
+			bands[band] = bands[band].max(fallback_density);
 		}
 
 		cumulative_bytes = end_byte;
@@ -1303,7 +1300,7 @@ fn resolve_loaded_node_text(registry: &UastRegistry, node: NodeId) -> Result<Str
 	if text.is_empty() && byte_len > 0 {
 		return Err("File still loading, cannot resolve structural token".to_string());
 	}
-	Ok(text)
+	String::from_utf8(text).map_err(|_| "Loaded node is not valid UTF-8".to_string())
 }
 
 fn build_parse_window_around_leaf(
@@ -3281,7 +3278,7 @@ impl Engine {
 							let v_global_start = first_v_token.absolute_start_byte;
 							let mut virtual_buffer = Vec::new();
 							for token in &virtual_tokens {
-								virtual_buffer.extend_from_slice(token.text.as_bytes());
+								virtual_buffer.extend_from_slice(&token.text);
 							}
 							highlights = crate::svp::pipeline::SvpPipeline::process_viewport(
 								v_global_start,
@@ -3459,6 +3456,7 @@ impl Engine {
 				let _ = tx_view.send(Viewport {
 					tokens,
 					scroll_y,
+					viewport_start_line,
 					viewport_line_count: viewport_lines,
 					cursor_abs_pos: CursorPosition::new(cursor_abs_line, cursor_abs_col),
 					cursor_abs_byte,
@@ -3526,12 +3524,13 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch, VisualKind, apply_deltas_to_document,
-		apply_deltas_to_document_internal, build_search_minimap_bands,
+		BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP, FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch,
+		VisualKind, apply_deltas_to_document, apply_deltas_to_document_internal,
+		build_byte_fallback_minimap_snapshot, build_search_minimap_bands,
 		clamp_cursor_line_to_viewport, delete_char_delta_at_cursor, delete_to_line_end_delta,
 		document_rewrite_delta, first_non_whitespace_visual_col, line_col_from_doc_byte_sparse,
 		line_end_visual_col, linewise_put_insertion, next_word_end, next_word_start,
-		pan_scroll_y_to_keep_cursor_visible, prev_word_start,
+		normalize_line_density, pan_scroll_y_to_keep_cursor_visible, prev_word_start,
 		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
 		resolve_visual_ranges, save_document_atomic, scroll_viewport, smart_home_visual_col,
 		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
@@ -3983,6 +3982,96 @@ mod tests {
 
 		assert!(bands.iter().any(|&band| band > 0));
 		assert_eq!(active, Some((90usize * MINIMAP_BANDS) / 100usize));
+	}
+
+	#[test]
+	fn byte_fallback_minimap_caps_dense_binary_leaf_without_notches() {
+		let registry = UastRegistry::new(4);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 4096,
+				newlines: 0,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4096,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+
+		let snapshot =
+			build_byte_fallback_minimap_snapshot(&registry, root, DocLine::ZERO, 40, DocLine::ZERO);
+		let expected = normalize_line_density(BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP).max(24);
+
+		assert!(expected < 255);
+		assert!(snapshot.bands.iter().all(|&band| band == expected));
+	}
+
+	#[test]
+	fn byte_fallback_minimap_tiny_binary_leaf_stays_visibly_dense() {
+		let registry = UastRegistry::new(4);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 10,
+				newlines: 0,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 10,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+
+		let snapshot =
+			build_byte_fallback_minimap_snapshot(&registry, root, DocLine::ZERO, 40, DocLine::ZERO);
+		let expected = normalize_line_density(BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP).max(24);
+
+		assert!(expected >= 40);
+		assert!(snapshot.bands.iter().all(|&band| band == expected));
+	}
+
+	#[test]
+	fn byte_fallback_minimap_inflated_leaf_does_not_expand_past_baseline() {
+		let registry = UastRegistry::new(4);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 65_536,
+				newlines: 256,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 65_536,
+				newlines: 256,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+
+		let snapshot =
+			build_byte_fallback_minimap_snapshot(&registry, root, DocLine::ZERO, 40, DocLine::ZERO);
+		let expected = normalize_line_density(BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP).max(24);
+
+		assert!(expected < 255);
+		assert!(snapshot.bands.iter().all(|&band| band == expected));
 	}
 
 	#[test]

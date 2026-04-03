@@ -228,16 +228,16 @@ impl UastRegistry {
 		}
 	}
 
-	/// Resolves either physical SvpPointer or virtual_data into a String.
-	pub fn resolve_physical_bytes(&self, node: NodeId) -> String {
+	/// Resolves either physical SvpPointer or virtual_data into raw bytes.
+	pub fn resolve_physical_bytes(&self, node: NodeId) -> Vec<u8> {
 		let idx = node.index();
 		unsafe {
 			if let Some(v_data) = &*self.virtual_data[idx].get() {
-				return String::from_utf8_lossy(v_data).to_string();
+				return v_data.clone();
 			}
-			// Physical nodes return empty strings until the resolver hot-swaps them.
+			// Physical nodes return empty buffers until the resolver hot-swaps them.
 		}
-		String::new()
+		Vec::new()
 	}
 
 	pub fn get_first_child(&self, node: NodeId) -> Option<NodeId> {
