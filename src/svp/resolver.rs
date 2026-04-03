@@ -1,7 +1,6 @@
 use crate::ecs::id::NodeId;
 use crate::ecs::registry::UastRegistry;
 use crate::svp::pointer::SvpPointer;
-use crate::uast::mutation::UastMutation;
 use crossbeam_queue::ArrayQueue;
 use io_uring::{IoUring, opcode, types};
 use memchr::memchr_iter;
@@ -58,6 +57,7 @@ impl SvpResolver {
 	}
 
 	pub fn register_device(&self, device_id: u16, path: &str) {
+		self._registry.register_device_path(device_id, path);
 		if let Ok(file) = File::open(path) {
 			self.fds.lock().unwrap().insert(device_id, file);
 		}
@@ -176,9 +176,7 @@ impl SvpResolver {
 							memchr_iter(b'\n', &buffers[buf_idx][..byte_count]).count() as i32;
 
 						// 1. ATOMIC INFLATION: Ensure every physical node is counted exactly once
-						if !registry.metrics_inflated[node_idx].swap(true, Ordering::Relaxed) {
-							registry.apply_edit(node_id, 0, newlines);
-						}
+						registry.try_complete_metric_inflation(node_id, newlines as u32);
 
 						if was_viewport {
 							let data = buffers[buf_idx][..byte_count].to_vec();

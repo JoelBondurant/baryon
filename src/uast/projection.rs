@@ -2,6 +2,7 @@ use crate::core::{CursorPosition, DocByte, DocLine, NodeByteOffset, TAB_SIZE, Vi
 use crate::ecs::{NodeId, UastRegistry};
 use crate::svp::highlight::HighlightSpan;
 use crate::uast::kind::SemanticKind;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
 pub struct RenderToken {
@@ -366,41 +367,54 @@ impl UastProjection for UastRegistry {
 	) -> NodeCursorTarget {
 		let mut curr = Some(root);
 		let mut line_accumulator = DocLine::ZERO;
+		let mut last_leaf = None;
 
 		while let Some(node) = curr {
 			let idx = node.index();
-			let m = unsafe { &*self.metrics[idx].get() };
+			if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
+				curr = Some(child);
+				continue;
+			}
 
-			if line_accumulator + m.newlines >= target_line {
-				if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
-					curr = Some(child);
-					continue;
-				} else {
-					let text = self.resolve_physical_bytes(node);
+			if !self.metrics_inflated[idx].load(Ordering::Acquire) {
+				self.ensure_metrics_inflated(node);
+			}
 
-					let target_line_in_node = target_line.saturating_sub(line_accumulator.get());
-					if let Some(line_start) =
-						line_start_offset(text.as_bytes(), target_line_in_node)
-					{
-						let (line_offset, clamped_col) =
-							offset_for_visual_col(&text.as_bytes()[line_start..], target_col);
-						return NodeCursorTarget {
-							node_id: node,
-							node_byte: NodeByteOffset::new(line_start as u32 + line_offset.get()),
-							visual_col: clamped_col,
-						};
-					}
+			let metrics = unsafe { &*self.metrics[idx].get() };
+			let node_end_line = line_accumulator.saturating_add(metrics.newlines);
+			last_leaf = Some(node);
 
+			if target_line <= node_end_line {
+				let bytes = self.read_node_bytes_sync(node).unwrap_or_default();
+				let target_line_in_node = target_line.saturating_sub(line_accumulator.get());
+				if let Some(line_start) = line_start_offset(&bytes, target_line_in_node) {
+					let (line_offset, clamped_col) =
+						offset_for_visual_col(&bytes[line_start..], target_col);
 					return NodeCursorTarget {
 						node_id: node,
-						node_byte: NodeByteOffset::new(text.len() as u32),
-						visual_col: VisualCol::ZERO,
+						node_byte: NodeByteOffset::new(line_start as u32 + line_offset.get()),
+						visual_col: clamped_col,
 					};
 				}
-			} else {
-				line_accumulator = line_accumulator.saturating_add(m.newlines);
-				curr = unsafe { (*self.edges[idx].get()).next_sibling };
+
+				return NodeCursorTarget {
+					node_id: node,
+					node_byte: NodeByteOffset::new(bytes.len() as u32),
+					visual_col: VisualCol::ZERO,
+				};
 			}
+
+			line_accumulator = node_end_line;
+			curr = self.get_next_node_in_walk(node);
+		}
+
+		if let Some(node) = last_leaf {
+			let bytes = self.read_node_bytes_sync(node).unwrap_or_default();
+			return NodeCursorTarget {
+				node_id: node,
+				node_byte: NodeByteOffset::new(bytes.len() as u32),
+				visual_col: VisualCol::ZERO,
+			};
 		}
 
 		NodeCursorTarget {
@@ -519,8 +533,11 @@ mod tests {
 	use super::UastProjection;
 	use crate::core::{DocByte, DocLine, TAB_SIZE, VisualCol};
 	use crate::ecs::UastRegistry;
+	use crate::svp::pointer::SvpPointer;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
+	use std::sync::atomic::Ordering;
+	use std::time::{SystemTime, UNIX_EPOCH};
 
 	fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
 		let registry = UastRegistry::new(8);
@@ -579,6 +596,51 @@ mod tests {
 				*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
 			}
 		}
+		(registry, root)
+	}
+
+	fn temp_test_path(name: &str) -> std::path::PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("time should move forward")
+			.as_nanos();
+		std::env::temp_dir().join(format!("baryon-{}-{}-{}", name, std::process::id(), nanos))
+	}
+
+	fn build_uninflated_physical_document(chunks: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
+		let mut chunk = registry
+			.reserve_chunk((chunks.len() + 1) as u32)
+			.expect("OOM");
+		let total_len = chunks.iter().map(|part| part.len() as u32).sum();
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: total_len,
+				newlines: 0,
+			},
+		);
+
+		let mut byte_offset = 0u64;
+		for part in chunks {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				Some(SvpPointer {
+					lba: byte_offset / 512,
+					byte_length: part.len() as u32,
+					device_id: 77,
+					head_trim: (byte_offset % 512) as u16,
+				}),
+				SpanMetrics {
+					byte_length: part.len() as u32,
+					newlines: 0,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			byte_offset += part.len() as u64;
+		}
+
 		(registry, root)
 	}
 
@@ -721,5 +783,30 @@ mod tests {
 			.expect("loaded slice");
 
 		assert_eq!(String::from_utf8(slice).expect("utf8"), "habetaga");
+	}
+
+	#[test]
+	fn find_node_at_line_col_inflates_unloaded_physical_metrics_on_demand() {
+		let path = temp_test_path("projection-uninflated");
+		std::fs::write(&path, "aa\nbb\ncc\ndd").expect("write temp file");
+
+		let (registry, root) = build_uninflated_physical_document(&["aa\nbb\n", "cc\ndd"]);
+		registry.register_device_path(77, path.to_str().expect("utf8 path"));
+
+		let target = registry.find_node_at_line_col(root, DocLine::new(3), VisualCol::ZERO);
+		let first_leaf = registry.get_first_child(root).expect("first leaf");
+		let second_leaf = registry.get_next_sibling(first_leaf).expect("second leaf");
+
+		assert_eq!(target.node_id, second_leaf);
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::new(3));
+		assert_eq!(target.visual_col, VisualCol::ZERO);
+		assert_eq!(
+			unsafe { (*registry.metrics[root.index()].get()).newlines },
+			3
+		);
+		assert!(registry.metrics_inflated[first_leaf.index()].load(Ordering::Acquire));
+		assert!(registry.metrics_inflated[second_leaf.index()].load(Ordering::Acquire));
+
+		let _ = std::fs::remove_file(path);
 	}
 }

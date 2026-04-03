@@ -4,7 +4,13 @@ use crate::svp::pointer::SvpPointer;
 use crate::uast::kind::SemanticKind;
 use crate::uast::metrics::SpanMetrics;
 use crate::uast::topology::TreeEdges;
+use memchr::memchr_iter;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// ==========================================
@@ -35,8 +41,13 @@ pub struct UastRegistry {
 	/// Tracks nodes currently being resolved by the I/O thread.
 	pub dma_in_flight: Box<[AtomicBool]>,
 
+	/// Tracks newline inflation in progress to avoid double-counting.
+	pub metric_inflating: Box<[AtomicBool]>,
+
 	/// Ensures physical nodes are only inflated once.
 	pub metrics_inflated: Box<[AtomicBool]>,
+
+	pub(crate) device_paths: Mutex<HashMap<u16, PathBuf>>,
 }
 
 // SAFETY: The atomic `next_id` guarantees that no two threads will ever receive
@@ -80,10 +91,15 @@ impl UastRegistry {
 				.map(|_| AtomicBool::new(false))
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
+			metric_inflating: (0..cap)
+				.map(|_| AtomicBool::new(false))
+				.collect::<Vec<_>>()
+				.into_boxed_slice(),
 			metrics_inflated: (0..cap)
 				.map(|_| AtomicBool::new(false))
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
+			device_paths: Mutex::new(HashMap::new()),
 		}
 	}
 
@@ -115,6 +131,100 @@ impl UastRegistry {
 		let idx = node.index();
 		unsafe {
 			*self.virtual_data[idx].get() = Some(data);
+		}
+	}
+
+	pub fn register_device_path(&self, device_id: u16, path: &str) {
+		self.device_paths
+			.lock()
+			.unwrap()
+			.insert(device_id, PathBuf::from(path));
+	}
+
+	fn apply_newline_delta(&self, target: NodeId, added_newlines: i32) {
+		let mut curr = Some(target);
+		while let Some(node) = curr {
+			let idx = node.index();
+			unsafe {
+				let metrics = &mut *self.metrics[idx].get();
+				metrics.newlines = (metrics.newlines as i32 + added_newlines) as u32;
+				curr = (*self.edges[idx].get()).parent;
+			}
+		}
+	}
+
+	pub fn complete_metric_inflation(&self, node: NodeId, newline_count: u32) {
+		let idx = node.index();
+		let existing = unsafe { (*self.metrics[idx].get()).newlines };
+		let delta = newline_count as i32 - existing as i32;
+		if delta != 0 {
+			self.apply_newline_delta(node, delta);
+		}
+		self.metrics_inflated[idx].store(true, Ordering::Release);
+		self.metric_inflating[idx].store(false, Ordering::Release);
+	}
+
+	pub fn try_complete_metric_inflation(&self, node: NodeId, newline_count: u32) {
+		let idx = node.index();
+		if self.metrics_inflated[idx].load(Ordering::Acquire) {
+			return;
+		}
+		if self.metric_inflating[idx]
+			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+			.is_ok()
+		{
+			self.complete_metric_inflation(node, newline_count);
+		}
+	}
+
+	pub fn read_node_bytes_sync(&self, node: NodeId) -> io::Result<Vec<u8>> {
+		let idx = node.index();
+		unsafe {
+			if let Some(v_data) = &*self.virtual_data[idx].get() {
+				return Ok(v_data.clone());
+			}
+		}
+
+		let span = unsafe { *self.spans[idx].get() }
+			.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "node has no readable span"))?;
+		let path = self
+			.device_paths
+			.lock()
+			.unwrap()
+			.get(&span.device_id)
+			.cloned()
+			.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "device path not registered"))?;
+
+		let mut file = File::open(path)?;
+		file.seek(SeekFrom::Start(span.lba * 512 + u64::from(span.head_trim)))?;
+		let mut bytes = vec![0u8; span.byte_length as usize];
+		file.read_exact(&mut bytes)?;
+		Ok(bytes)
+	}
+
+	pub fn ensure_metrics_inflated(&self, node: NodeId) {
+		let idx = node.index();
+		loop {
+			if self.metrics_inflated[idx].load(Ordering::Acquire) {
+				return;
+			}
+			if self.metric_inflating[idx]
+				.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+				.is_ok()
+			{
+				break;
+			}
+			std::thread::yield_now();
+		}
+
+		match self.read_node_bytes_sync(node) {
+			Ok(bytes) => {
+				let newline_count = memchr_iter(b'\n', &bytes).count() as u32;
+				self.complete_metric_inflation(node, newline_count);
+			}
+			Err(_) => {
+				self.metric_inflating[idx].store(false, Ordering::Release);
+			}
 		}
 	}
 
