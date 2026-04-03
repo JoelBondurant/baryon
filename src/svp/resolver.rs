@@ -114,6 +114,18 @@ impl SvpResolver {
 						let buf_idx = in_flight;
 						let last_idx_plus_1 =
 							req.last_node_id.map(|id| id.index() + 1).unwrap_or(0);
+						let request_len = req.pointer.byte_length.min(DMA_CHUNK_SIZE as u32);
+						debug_assert!(
+							req.pointer.byte_length as usize <= DMA_CHUNK_SIZE,
+							"oversized DMA span for node {}: {} bytes",
+							req.node_id.index(),
+							req.pointer.byte_length
+						);
+						if request_len == 0 {
+							registry.dma_in_flight[req.node_id.index()]
+								.store(false, Ordering::Relaxed);
+							continue;
+						}
 
 						let user_data = (req.node_id.index() as u64)
 							| ((is_viewport as u64) << 32)
@@ -123,7 +135,7 @@ impl SvpResolver {
 						let read_op = opcode::Read::new(
 							types::Fd(raw_fd),
 							buffers[buf_idx].as_mut_ptr(),
-							req.pointer.byte_length,
+							request_len,
 						)
 						.offset(req.pointer.lba * 512 + req.pointer.head_trim as u64)
 						.build()
@@ -159,7 +171,7 @@ impl SvpResolver {
 					let node_id = NodeId::from_index(node_idx);
 
 					if res >= 0 {
-						let byte_count = res as usize;
+						let byte_count = (res as usize).min(DMA_CHUNK_SIZE);
 						let newlines =
 							memchr_iter(b'\n', &buffers[buf_idx][..byte_count]).count() as i32;
 

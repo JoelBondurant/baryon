@@ -1,6 +1,8 @@
 use crate::ecs::{NodeId, UastRegistry};
 use crate::svp::pointer::SvpPointer;
+use crate::svp::resolver::DMA_CHUNK_SIZE;
 use crate::uast::kind::SemanticKind;
+use std::sync::atomic::Ordering;
 
 pub trait UastMutation {
 	fn apply_edit(&self, target: NodeId, added_bytes: i32, added_newlines: i32);
@@ -8,6 +10,75 @@ pub trait UastMutation {
 	fn delete_backwards(&self, target: NodeId, offset_in_node: u32) -> (NodeId, u32);
 	fn split_node_pvp(&self, target: NodeId, offset: u32, new_text: &[u8]) -> NodeId;
 	fn split_node_pvp_delete(&self, target: NodeId, offset: u32, delete_len: u32) -> NodeId;
+}
+
+fn spawn_physical_tail_chain(
+	registry: &UastRegistry,
+	parent: NodeId,
+	start_offset: u64,
+	total_len: u32,
+	device_id: u16,
+	resolved_tail: Option<&[u8]>,
+	next_sibling: Option<NodeId>,
+) -> Option<(NodeId, NodeId)> {
+	if total_len == 0 {
+		return None;
+	}
+
+	let mut first: Option<NodeId> = None;
+	let mut prev: Option<NodeId> = None;
+	let mut offset_in_tail = 0u32;
+
+	while offset_in_tail < total_len {
+		let chunk_len = (total_len - offset_in_tail).min(DMA_CHUNK_SIZE as u32);
+		let chunk_start = start_offset + u64::from(offset_in_tail);
+		let node = registry.alloc_node_internal();
+		let idx = node.index();
+
+		unsafe {
+			*registry.kinds[idx].get() = SemanticKind::Token;
+			*registry.spans[idx].get() = Some(SvpPointer {
+				lba: chunk_start / 512,
+				byte_length: chunk_len,
+				device_id,
+				head_trim: (chunk_start % 512) as u16,
+			});
+
+			let metrics = &mut *registry.metrics[idx].get();
+			metrics.byte_length = chunk_len;
+			metrics.newlines = 0;
+
+			if let Some(data) = resolved_tail {
+				let start = offset_in_tail as usize;
+				let end = start + chunk_len as usize;
+				let chunk_data = &data[start..end];
+				metrics.newlines = chunk_data.iter().filter(|&&b| b == b'\n').count() as u32;
+				*registry.virtual_data[idx].get() = Some(chunk_data.to_vec());
+				registry.metrics_inflated[idx].store(true, Ordering::Relaxed);
+			}
+
+			let edges = &mut *registry.edges[idx].get();
+			edges.parent = Some(parent);
+			edges.next_sibling = None;
+		}
+
+		if let Some(prev_node) = prev {
+			unsafe {
+				(*registry.edges[prev_node.index()].get()).next_sibling = Some(node);
+			}
+		} else {
+			first = Some(node);
+		}
+		prev = Some(node);
+		offset_in_tail += chunk_len;
+	}
+
+	let first = first.expect("non-empty tail should create a first node");
+	let last = prev.expect("non-empty tail should create a last node");
+	unsafe {
+		(*registry.edges[last.index()].get()).next_sibling = next_sibling;
+	}
+	Some((first, last))
 }
 
 impl UastMutation for UastRegistry {
@@ -73,9 +144,7 @@ impl UastMutation for UastRegistry {
 		let parent = parent.expect("Cannot split a root node");
 
 		let v_id = self.alloc_node_internal();
-		let p2_id = self.alloc_node_internal();
 		let v_idx = v_id.index();
-		let p2_idx = p2_id.index();
 
 		let p1_len = offset;
 		// Split virtual_data if the node was already DMA-resolved
@@ -110,40 +179,31 @@ impl UastMutation for UastRegistry {
 
 			let e = &mut *self.edges[v_idx].get();
 			e.parent = Some(parent);
-			e.next_sibling = Some(p2_id);
+			e.next_sibling = old_next_sibling;
 		}
 
 		let p2_len = old_svp.byte_length.saturating_sub(offset);
 		let base_offset = old_svp.lba * 512 + u64::from(old_svp.head_trim);
 		let split_offset = base_offset + u64::from(offset);
+		let tail_chain = spawn_physical_tail_chain(
+			self,
+			parent,
+			split_offset,
+			p2_len,
+			old_svp.device_id,
+			resolved_data.as_ref().map(|data| &data[offset as usize..]),
+			old_next_sibling,
+		);
 		unsafe {
-			*self.kinds[p2_idx].get() = SemanticKind::Token;
-			*self.spans[p2_idx].get() = Some(SvpPointer {
-				lba: split_offset / 512,
-				byte_length: p2_len,
-				device_id: old_svp.device_id,
-				head_trim: (split_offset % 512) as u16,
-			});
-
-			let m = &mut *self.metrics[p2_idx].get();
-			m.byte_length = p2_len;
-			if let Some(ref data) = resolved_data {
-				let p2_data = &data[offset as usize..];
-				m.newlines = p2_data.iter().filter(|&&b| b == b'\n').count() as u32;
-				*self.virtual_data[p2_idx].get() = Some(p2_data.to_vec());
-				self.metrics_inflated[p2_idx].store(true, std::sync::atomic::Ordering::Relaxed);
-			}
-
-			let e = &mut *self.edges[p2_idx].get();
-			e.parent = Some(parent);
-			e.next_sibling = old_next_sibling;
+			(*self.edges[v_idx].get()).next_sibling =
+				tail_chain.map(|(first, _)| first).or(old_next_sibling);
 		}
 
 		let p_idx = parent.index();
 		unsafe {
 			let tail_ptr = &mut *self.child_tails[p_idx].get();
 			if *tail_ptr == Some(target) {
-				*tail_ptr = Some(p2_id);
+				*tail_ptr = Some(tail_chain.map(|(_, last)| last).unwrap_or(v_id));
 			}
 		}
 
@@ -221,9 +281,7 @@ impl UastMutation for UastRegistry {
 		let parent = parent.expect("Cannot split a root node");
 
 		let v_id = self.alloc_node_internal();
-		let p2_id = self.alloc_node_internal();
 		let v_idx = v_id.index();
-		let p2_idx = p2_id.index();
 
 		let resolved_data = unsafe { (*self.virtual_data[target_idx].get()).take() };
 		let deleted_newlines = resolved_data
@@ -259,38 +317,33 @@ impl UastMutation for UastRegistry {
 			m.newlines = 0;
 			let e = &mut *self.edges[v_idx].get();
 			e.parent = Some(parent);
-			e.next_sibling = Some(p2_id);
+			e.next_sibling = old_next_sibling;
 		}
 
 		let p2_len = old_svp.byte_length.saturating_sub(offset + delete_len);
 		let base_offset = old_svp.lba * 512 + u64::from(old_svp.head_trim);
 		let split_offset = base_offset + u64::from(offset + delete_len);
+		let tail_chain = spawn_physical_tail_chain(
+			self,
+			parent,
+			split_offset,
+			p2_len,
+			old_svp.device_id,
+			resolved_data
+				.as_ref()
+				.map(|data| &data[(offset + delete_len) as usize..]),
+			old_next_sibling,
+		);
 		unsafe {
-			*self.kinds[p2_idx].get() = SemanticKind::Token;
-			*self.spans[p2_idx].get() = Some(SvpPointer {
-				lba: split_offset / 512,
-				byte_length: p2_len,
-				device_id: old_svp.device_id,
-				head_trim: (split_offset % 512) as u16,
-			});
-			let m = &mut *self.metrics[p2_idx].get();
-			m.byte_length = p2_len;
-			if let Some(ref data) = resolved_data {
-				let p2_data = &data[(offset + delete_len) as usize..];
-				m.newlines = p2_data.iter().filter(|&&b| b == b'\n').count() as u32;
-				*self.virtual_data[p2_idx].get() = Some(p2_data.to_vec());
-				self.metrics_inflated[p2_idx].store(true, std::sync::atomic::Ordering::Relaxed);
-			}
-			let e = &mut *self.edges[p2_idx].get();
-			e.parent = Some(parent);
-			e.next_sibling = old_next_sibling;
+			(*self.edges[v_idx].get()).next_sibling =
+				tail_chain.map(|(first, _)| first).or(old_next_sibling);
 		}
 
 		let p_idx = parent.index();
 		unsafe {
 			let tail_ptr = &mut *self.child_tails[p_idx].get();
 			if *tail_ptr == Some(target) {
-				*tail_ptr = Some(p2_id);
+				*tail_ptr = Some(tail_chain.map(|(_, last)| last).unwrap_or(v_id));
 			}
 		}
 
@@ -305,6 +358,7 @@ mod tests {
 	use super::UastMutation;
 	use crate::ecs::UastRegistry;
 	use crate::svp::pointer::SvpPointer;
+	use crate::svp::resolver::DMA_CHUNK_SIZE;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
 
@@ -328,6 +382,31 @@ mod tests {
 		);
 		chunk.append_local_child(root, leaf);
 		leaf
+	}
+
+	fn parent_of(registry: &UastRegistry, node: crate::ecs::NodeId) -> crate::ecs::NodeId {
+		unsafe {
+			(*registry.edges[node.index()].get())
+				.parent
+				.expect("node should have parent")
+		}
+	}
+
+	fn collect_physical_spans(
+		registry: &UastRegistry,
+		start: Option<crate::ecs::NodeId>,
+	) -> Vec<SvpPointer> {
+		let mut spans = Vec::new();
+		let mut current = start;
+		while let Some(node) = current {
+			let span = unsafe { *registry.spans[node.index()].get() };
+			let Some(span) = span else {
+				break;
+			};
+			spans.push(span);
+			current = registry.get_next_sibling(node);
+		}
+		spans
 	}
 
 	#[test]
@@ -439,6 +518,78 @@ mod tests {
 		assert_eq!(
 			unsafe { (*registry.virtual_data[leaf.index()].get()).as_deref() },
 			Some("ab".as_bytes()),
+		);
+	}
+
+	#[test]
+	fn insert_text_rechunks_large_physical_tails_to_dma_sized_spans() {
+		let registry = UastRegistry::new(16);
+		let span = SvpPointer {
+			lba: 2,
+			byte_length: (DMA_CHUNK_SIZE as u32) * 2 + 17,
+			device_id: 11,
+			head_trim: 96,
+		};
+		let leaf = build_physical_leaf(&registry, span);
+		let root = parent_of(&registry, leaf);
+
+		let (inserted, insert_offset) = registry.insert_text(leaf, 1, b"XY");
+		assert_eq!(insert_offset, 2);
+
+		let tail_spans = collect_physical_spans(&registry, registry.get_next_sibling(inserted));
+		assert_eq!(tail_spans.len(), 3);
+		assert!(
+			tail_spans
+				.iter()
+				.all(|span| span.byte_length as usize <= DMA_CHUNK_SIZE)
+		);
+		assert_eq!(
+			tail_spans.iter().map(|span| span.byte_length).sum::<u32>(),
+			span.byte_length - 1,
+		);
+
+		let expected_offset = span.lba * 512 + u64::from(span.head_trim) + 1;
+		assert_eq!(tail_spans[0].lba, expected_offset / 512);
+		assert_eq!(u64::from(tail_spans[0].head_trim), expected_offset % 512);
+		assert_eq!(
+			unsafe { (*registry.metrics[root.index()].get()).byte_length },
+			span.byte_length + 2,
+		);
+	}
+
+	#[test]
+	fn delete_backwards_rechunks_large_physical_tails_to_dma_sized_spans() {
+		let registry = UastRegistry::new(16);
+		let span = SvpPointer {
+			lba: 4,
+			byte_length: (DMA_CHUNK_SIZE as u32) * 2 + 33,
+			device_id: 12,
+			head_trim: 144,
+		};
+		let leaf = build_physical_leaf(&registry, span);
+		let root = parent_of(&registry, leaf);
+
+		let (tombstone, delete_offset) = registry.delete_backwards(leaf, 1);
+		assert_eq!(delete_offset, 0);
+
+		let tail_spans = collect_physical_spans(&registry, registry.get_next_sibling(tombstone));
+		assert_eq!(tail_spans.len(), 3);
+		assert!(
+			tail_spans
+				.iter()
+				.all(|span| span.byte_length as usize <= DMA_CHUNK_SIZE)
+		);
+		assert_eq!(
+			tail_spans.iter().map(|span| span.byte_length).sum::<u32>(),
+			span.byte_length - 1,
+		);
+
+		let expected_offset = span.lba * 512 + u64::from(span.head_trim) + 1;
+		assert_eq!(tail_spans[0].lba, expected_offset / 512);
+		assert_eq!(u64::from(tail_spans[0].head_trim), expected_offset % 512);
+		assert_eq!(
+			unsafe { (*registry.metrics[root.index()].get()).byte_length },
+			span.byte_length - 1,
 		);
 	}
 }
