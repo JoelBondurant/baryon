@@ -28,6 +28,30 @@ fn set_color(map: &mut [Option<Color>; CATEGORY_COUNT], category: TokenCategory,
 	map[category as usize] = Some(color);
 }
 
+fn parse_theme_modifiers(name: &str) -> (&str, bool, bool, bool) {
+	let Some((base, suffix)) = name.rsplit_once('_') else {
+		return (name, false, false, false);
+	};
+
+	if suffix.is_empty() {
+		return (name, false, false, false);
+	}
+
+	let mut reverse = false;
+	let mut clip_low = false;
+	let mut clip_high = false;
+	for ch in suffix.chars() {
+		match ch {
+			'r' => reverse = true,
+			'c' => clip_low = true,
+			'C' => clip_high = true,
+			_ => return (name, false, false, false),
+		}
+	}
+
+	(base, reverse, clip_low, clip_high)
+}
+
 pub struct Theme {
 	pub syntax_colors: [Option<Color>; CATEGORY_COUNT],
 }
@@ -35,18 +59,11 @@ pub struct Theme {
 impl Theme {
 	pub fn try_new(name: &str) -> Result<Self, String> {
 		let mut colors = [None; CATEGORY_COUNT];
-		let name_lower = name.to_lowercase();
-
-		let (mut map_name, reverse) = if let Some(stripped) = name_lower.strip_suffix("_r") {
-			(stripped, true)
-		} else if let Some(stripped) = name_lower.strip_suffix("_rev") {
-			(stripped, true)
-		} else {
-			(name_lower.as_str(), false)
-		};
+		let (raw_map_name, reverse, clip_low, clip_high) = parse_theme_modifiers(name);
+		let mut map_name = raw_map_name.to_lowercase();
 
 		let mut is_discrete = true;
-		match map_name {
+		match map_name.as_str() {
 			"classic" | "original" => Self::fill_classic(&mut colors),
 			"pretty" => Self::fill_pretty(&mut colors),
 			"gruvbox" => Self::fill_gruvbox(&mut colors),
@@ -83,80 +100,58 @@ impl Theme {
 		}
 
 		if map_name.is_empty() {
-			map_name = "viridis";
+			map_name.push_str("viridis");
 		}
 
-		let valid_continuous = [
-			"black",
-			"bluegreen",
-			"bluered",
-			"bluewhitered",
-			"blues",
-			"cividis",
-			"greenblue",
-			"greenpurples",
-			"greenred",
-			"greens",
-			"grey",
-			"gray",
-			"greys",
-			"grays",
-			"inferno",
-			"magma",
-			"oranges",
-			"plasma",
-			"purplegreens",
-			"purples",
-			"rainbow",
-			"redblue",
-			"redgreen",
-			"reds",
-			"redwhiteblue",
-			"viridis",
-			"white",
-			"yellows",
-		];
+		let sampler: fn(f32) -> Color = match map_name.as_str() {
+			"black" => black,
+			"bluegreen" => blue_green,
+			"bluered" => blue_red,
+			"bluewhitered" => blue_white_red,
+			"blues" => blues,
+			"cividis" => cividis,
+			"greenblue" => green_blue,
+			"greenpurples" => green_purples,
+			"greenred" => green_red,
+			"greens" => greens,
+			"grey" | "gray" => grey,
+			"greys" | "grays" => greys,
+			"inferno" => inferno,
+			"magma" => magma,
+			"oranges" => oranges,
+			"plasma" => plasma,
+			"purplegreens" => purple_greens,
+			"purples" => purples,
+			"rainbow" => rainbow,
+			"redblue" => red_blue,
+			"redgreen" => red_green,
+			"reds" => reds,
+			"redwhiteblue" => red_white_blue,
+			"viridis" => viridis,
+			"white" => white,
+			"yellows" => yellows,
+			_ => return Err(format!("Unknown theme: {}", name)),
+		};
 
-		if !valid_continuous.contains(&map_name) {
-			return Err(format!("Unknown theme: {}", name));
+		let start = if clip_low { 0.2 } else { 0.0 };
+		let end = if clip_high { 0.8 } else { 1.0 };
+		let step_scale = end - start;
+		let mut sampled_colors = [Color::Reset; THEMED_CATEGORIES.len()];
+
+		for (i, color) in sampled_colors.iter_mut().enumerate() {
+			let t = i as f32 / (THEMED_CATEGORIES.len() as f32 - 1.0);
+			*color = sampler(start + (t * step_scale));
 		}
 
-		for (i, &cat) in THEMED_CATEGORIES.iter().enumerate() {
-			let mut t = i as f32 / (THEMED_CATEGORIES.len() as f32 - 1.0);
-			if reverse {
-				t = 1.0 - t;
-			}
+		if reverse {
+			sampled_colors.reverse();
+		}
 
-			let t_clipped = 0.2 + (t * 0.8);
-			let color = match map_name {
-				"black" => black(t_clipped),
-				"bluegreen" => blue_green(t_clipped),
-				"bluered" => blue_red(t_clipped),
-				"bluewhitered" => blue_white_red(t_clipped),
-				"blues" => blues(t_clipped),
-				"cividis" => cividis(t_clipped),
-				"greenblue" => green_blue(t_clipped),
-				"greenpurples" => green_purples(t_clipped),
-				"greenred" => green_red(t_clipped),
-				"greens" => greens(t_clipped),
-				"grey" | "gray" => grey(t_clipped),
-				"greys" | "grays" => greys(t_clipped),
-				"inferno" => inferno(t_clipped),
-				"magma" => magma(t_clipped),
-				"oranges" => oranges(t_clipped),
-				"purplegreens" => purple_greens(t_clipped),
-				"purples" => purples(t_clipped),
-				"rainbow" => rainbow(t_clipped),
-				"redblue" => red_blue(t_clipped),
-				"redgreen" => red_green(t_clipped),
-				"redwhiteblue" => red_white_blue(t_clipped),
-				"reds" => reds(t_clipped),
-				"viridis" => viridis(t_clipped),
-				"white" => white(t_clipped),
-				"yellows" => yellows(t_clipped),
-				"plasma" => plasma(t_clipped),
-				_ => viridis(t_clipped),
-			};
+		for (cat, color) in THEMED_CATEGORIES
+			.iter()
+			.copied()
+			.zip(sampled_colors.into_iter())
+		{
 			colors[cat as usize] = Some(color);
 		}
 
@@ -752,4 +747,46 @@ pub fn purple_greens(t: f32) -> Color {
 		t,
 		&[(0.35, 0.11, 0.48), (1.00, 1.00, 1.00), (0.15, 0.44, 0.12)],
 	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{Theme, plasma, viridis};
+	use crate::svp::highlight::TokenCategory;
+	use ratatui::style::Color;
+
+	fn color_for(theme: &Theme, category: TokenCategory) -> Color {
+		theme.syntax_colors[category as usize].expect("themed color")
+	}
+
+	#[test]
+	fn continuous_themes_default_to_full_domain() {
+		let theme = Theme::try_new("plasma").expect("plasma theme");
+
+		assert_eq!(color_for(&theme, TokenCategory::Keyword), plasma(0.0));
+		assert_eq!(color_for(&theme, TokenCategory::Whitespace), plasma(1.0));
+	}
+
+	#[test]
+	fn unordered_clip_and_reverse_modifiers_compose_after_sampling() {
+		let theme = Theme::try_new("viridis_cCr").expect("viridis_cCr theme");
+		let permuted = Theme::try_new("viridis_rcC").expect("viridis_rcC theme");
+
+		assert_eq!(color_for(&theme, TokenCategory::Keyword), viridis(0.8));
+		assert_eq!(color_for(&theme, TokenCategory::Whitespace), viridis(0.2));
+		assert_eq!(theme.syntax_colors, permuted.syntax_colors);
+	}
+
+	#[test]
+	fn discrete_themes_ignore_clip_modifiers_but_still_reverse() {
+		let reversed = Theme::try_new("classic_r").expect("classic_r theme");
+		let clipped_reversed = Theme::try_new("classic_rC").expect("classic_rC theme");
+
+		assert_eq!(reversed.syntax_colors, clipped_reversed.syntax_colors);
+	}
+
+	#[test]
+	fn rev_suffix_is_no_longer_supported() {
+		assert!(Theme::try_new("viridis_rev").is_err());
+	}
 }
