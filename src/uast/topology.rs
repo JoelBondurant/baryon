@@ -10,3 +10,16 @@ pub struct TreeEdges {
 	pub first_child: Option<NodeId>,
 	pub next_sibling: Option<NodeId>,
 }
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn test_tree_edges_size() {
+		assert_eq!(std::mem::size_of::<super::TreeEdges>(), 12);
+	}
+
+	#[test]
+	fn test_option_node_id_size() {
+		assert_eq!(std::mem::size_of::<Option<crate::ecs::NodeId>>(), 4);
+	}
+}
