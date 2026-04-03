@@ -218,8 +218,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let _ = self.tx_cmd.send(EditorCommand::SearchPrev);
 				self.clear_prefixes();
 			}
-			KeyCode::Backspace | KeyCode::Delete => {
+			KeyCode::Backspace => {
 				let _ = self.tx_cmd.send(EditorCommand::Backspace);
+				self.clear_prefixes();
+			}
+			KeyCode::Delete => {
+				let _ = self.tx_cmd.send(EditorCommand::Delete);
 				self.clear_prefixes();
 			}
 			KeyCode::Up => {

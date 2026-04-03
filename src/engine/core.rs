@@ -83,6 +83,7 @@ pub struct SubstituteFlags {
 pub enum EditorCommand {
 	InsertChar(char),
 	Backspace,
+	Delete,
 	Resize(u16, u16),
 	Scroll(i32),
 	ScrollViewport(i32),
@@ -1334,6 +1335,40 @@ fn build_parse_window_around_leaf(
 	})
 }
 
+fn delete_char_delta_at_cursor(
+	registry: &UastRegistry,
+	root: NodeId,
+	cursor_abs_byte_offset: DocByte,
+) -> Result<Option<TextDelta>, String> {
+	let file_size = registry.get_total_bytes(root);
+	if cursor_abs_byte_offset.get() >= file_size {
+		return Ok(None);
+	}
+
+	let preview_end = DocByte::new((cursor_abs_byte_offset.get() + 4).min(file_size));
+	let preview = registry
+		.read_loaded_slice(root, cursor_abs_byte_offset, preview_end)
+		.map_err(|msg| msg.to_string())?;
+	let delete_len = (1..=preview.len())
+		.find(|&len| {
+			std::str::from_utf8(&preview[..len])
+				.map(|text| text.chars().count() == 1)
+				.unwrap_or(false)
+		})
+		.ok_or_else(|| "Delete target is not valid UTF-8".to_string())?;
+	let deleted_text = std::str::from_utf8(&preview[..delete_len])
+		.expect("validated UTF-8 prefix")
+		.to_string();
+
+	Ok(Some(TextDelta {
+		global_byte_offset: cursor_abs_byte_offset,
+		deleted_text,
+		inserted_text: String::new(),
+		state_before: StateId::ZERO,
+		state_after: StateId::ZERO,
+	}))
+}
+
 fn word_object_delta_at_cursor(
 	registry: &UastRegistry,
 	root: NodeId,
@@ -2268,6 +2303,35 @@ impl Engine {
 									status_message = Some(msg);
 								}
 							}
+							Err(msg) => status_message = Some(msg),
+						}
+						needs_render = true;
+					}
+				}
+				EditorCommand::Delete => {
+					if let Some(rid) = root_id {
+						let cursor_abs_byte = registry.doc_byte_for_node_offset(
+							rid,
+							cursor_node,
+							NodeByteOffset::new(cursor_offset),
+						);
+						match delete_char_delta_at_cursor(&registry, rid, cursor_abs_byte) {
+							Ok(Some(delta)) => {
+								if let Err(msg) = apply_deltas_to_document(
+									&registry,
+									&mut root_id,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_line,
+									&mut cursor_abs_col,
+									&mut ledger,
+									&mut semantic_highlights,
+									vec![delta],
+								) {
+									status_message = Some(msg);
+								}
+							}
+							Ok(None) => {}
 							Err(msg) => status_message = Some(msg),
 						}
 						needs_render = true;
@@ -3448,14 +3512,15 @@ mod tests {
 		FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch, VisualKind, apply_deltas_to_document,
 		apply_deltas_to_document_internal, build_search_minimap_bands,
 		clamp_cursor_line_to_viewport, delete_to_line_end_delta, document_rewrite_delta,
-		first_non_whitespace_visual_col, line_col_from_doc_byte_sparse, line_end_visual_col,
-		linewise_put_insertion, next_word_end, next_word_start,
+		delete_char_delta_at_cursor, first_non_whitespace_visual_col,
+		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion,
+		next_word_end, next_word_start,
 		pan_scroll_y_to_keep_cursor_visible, prev_word_start,
 		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
 		resolve_visual_ranges, save_document_atomic, scroll_viewport, smart_home_visual_col,
 		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
 	};
-	use crate::core::{DocByte, DocLine, StateId, VisualCol};
+	use crate::core::{DocByte, DocLine, NodeByteOffset, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
 	use crate::engine::undo::{TextDelta, UndoLedger};
 	use crate::svp::SvpPointer;
@@ -3775,6 +3840,63 @@ mod tests {
 		assert_eq!(delta.global_byte_offset, DocByte::new(6));
 		assert_eq!(delta.deleted_text, "beta");
 		assert_eq!(delta.inserted_text, "");
+	}
+
+	#[test]
+	fn delete_char_delta_at_cursor_uses_utf8_width() {
+		let (registry, root) = build_document("aéz");
+		let delta = delete_char_delta_at_cursor(&registry, root, DocByte::new(1))
+			.expect("delete lookup should succeed")
+			.expect("expected delete delta");
+
+		assert_eq!(delta.global_byte_offset, DocByte::new(1));
+		assert_eq!(delta.deleted_text, "é");
+		assert_eq!(delta.inserted_text, "");
+	}
+
+	#[test]
+	fn forward_delete_keeps_cursor_logical_position() {
+		let (registry, root) = build_document("abcd");
+		let mut root_id = Some(root);
+		let target = registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::new(1));
+		let mut cursor_node = target.node_id;
+		let mut cursor_offset = target.node_byte.get();
+		let mut cursor_abs_line = DocLine::ZERO;
+		let mut cursor_abs_col = target.visual_col;
+		let mut ledger = UndoLedger::new();
+		let mut semantic_highlights = Vec::new();
+
+		let delta = delete_char_delta_at_cursor(&registry, root, DocByte::new(1))
+			.expect("delete lookup should succeed")
+			.expect("expected delete delta");
+		apply_deltas_to_document(
+			&registry,
+			&mut root_id,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+			&mut ledger,
+			&mut semantic_highlights,
+			vec![delta],
+		)
+		.expect("forward delete should apply");
+
+		let root = root_id.expect("mutated root");
+		let bytes = registry
+			.read_loaded_slice(
+				root,
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(root)),
+			)
+			.expect("collect mutated bytes");
+		assert_eq!(String::from_utf8(bytes).expect("utf8"), "acd");
+		assert_eq!(cursor_abs_line, DocLine::ZERO);
+		assert_eq!(cursor_abs_col, VisualCol::new(1));
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, cursor_node, NodeByteOffset::new(cursor_offset)),
+			DocByte::new(1),
+		);
 	}
 
 	#[test]

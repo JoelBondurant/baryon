@@ -24,8 +24,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 			KeyCode::Enter => {
 				let _ = self.tx_cmd.send(EditorCommand::InsertChar('\n'));
 			}
+			KeyCode::Tab => {
+				let _ = self.tx_cmd.send(EditorCommand::InsertChar('\t'));
+			}
 			KeyCode::Backspace => {
 				let _ = self.tx_cmd.send(EditorCommand::Backspace);
+			}
+			KeyCode::Delete => {
+				let _ = self.tx_cmd.send(EditorCommand::Delete);
 			}
 			KeyCode::Up => {
 				let _ = self

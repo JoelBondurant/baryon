@@ -95,22 +95,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 					self.status_message = Some(msg);
 				}
 				if let Some(mode) = view.mode_override.clone() {
-					self.current_mode = mode;
-					self.apply_cursor_style();
+					if self.current_mode != mode {
+						self.current_mode = mode;
+						self.apply_cursor_style();
+					}
 				}
 				self.current_viewport = Some(view);
 				got_new_view = true;
 			}
 
-			if got_new_view
-				|| self.needs_redraw
-				|| matches!(
-					self.current_mode,
-					EditorMode::Command
-						| EditorMode::Insert
-						| EditorMode::Search
-						| EditorMode::Confirm
-				) {
+			if got_new_view || self.needs_redraw {
 				self.needs_redraw = false;
 				self.draw()
 					.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;

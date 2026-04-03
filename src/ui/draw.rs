@@ -263,8 +263,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 						let visual_cursor_x = (view.cursor_abs_pos.col.get() as u16)
 							.checked_add(gutter_width)
 							.unwrap_or(text_right as u16);
-						if visual_cursor_y < max_height - 1 && visual_cursor_x < text_right as u16 {
-							cursor_to_set = Some((visual_cursor_x, visual_cursor_y));
+						if max_height > 1 && text_right > 0 {
+							let max_cursor_y = max_height.saturating_sub(2);
+							let max_cursor_x = text_right.saturating_sub(1) as u16;
+							cursor_to_set = Some((
+								visual_cursor_x.min(max_cursor_x),
+								visual_cursor_y.min(max_cursor_y),
+							));
 						}
 
 						if view.minimap.is_some()
@@ -483,9 +488,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 					}
 				}
 
-				if let Some(pos) = cursor_to_set {
-					f.set_cursor_position(pos);
-				}
+				f.set_cursor_position(cursor_to_set.unwrap_or((0, 0)));
 			})
 			.map(|_| ());
 
