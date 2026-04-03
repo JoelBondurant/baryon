@@ -1,9 +1,8 @@
 use crate::core::{CursorPosition, DocByte, DocLine, NodeByteOffset, TAB_SIZE, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
-use crate::svp::highlight::{HighlightSpan, TokenCategory};
+use crate::svp::highlight::{CATEGORY_COUNT, HighlightSpan};
 use crate::uast::kind::SemanticKind;
 use ratatui::style::Color;
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
@@ -55,7 +54,7 @@ pub struct Viewport {
 	pub selection_ranges: Vec<(DocByte, DocByte)>,
 	pub yank_flash: Option<(DocByte, DocByte)>,
 	pub minimap: Option<MinimapSnapshot>,
-	pub theme_colors: HashMap<TokenCategory, Color>,
+	pub theme_colors: [Option<Color>; CATEGORY_COUNT],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

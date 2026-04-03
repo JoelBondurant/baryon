@@ -1772,7 +1772,8 @@ impl Engine {
 		let mut cursor_abs_col = VisualCol::ZERO;
 		let mut scroll_y = 0u32;
 		let mut viewport_lines = 50;
-		let mut current_theme = Theme::try_new("onedark").unwrap_or_else(|_| Theme::try_new("viridis").unwrap());
+		let mut current_theme =
+			Theme::try_new("onedark").unwrap_or_else(|_| Theme::try_new("viridis").unwrap());
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
 
@@ -3527,10 +3528,9 @@ mod tests {
 	use super::{
 		FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch, VisualKind, apply_deltas_to_document,
 		apply_deltas_to_document_internal, build_search_minimap_bands,
-		clamp_cursor_line_to_viewport, delete_to_line_end_delta, document_rewrite_delta,
-		delete_char_delta_at_cursor, first_non_whitespace_visual_col,
-		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion,
-		next_word_end, next_word_start,
+		clamp_cursor_line_to_viewport, delete_char_delta_at_cursor, delete_to_line_end_delta,
+		document_rewrite_delta, first_non_whitespace_visual_col, line_col_from_doc_byte_sparse,
+		line_end_visual_col, linewise_put_insertion, next_word_end, next_word_start,
 		pan_scroll_y_to_keep_cursor_visible, prev_word_start,
 		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
 		resolve_visual_ranges, save_document_atomic, scroll_viewport, smart_home_visual_col,
@@ -3910,7 +3910,11 @@ mod tests {
 		assert_eq!(cursor_abs_line, DocLine::ZERO);
 		assert_eq!(cursor_abs_col, VisualCol::new(1));
 		assert_eq!(
-			registry.doc_byte_for_node_offset(root, cursor_node, NodeByteOffset::new(cursor_offset)),
+			registry.doc_byte_for_node_offset(
+				root,
+				cursor_node,
+				NodeByteOffset::new(cursor_offset)
+			),
 			DocByte::new(1),
 		);
 	}

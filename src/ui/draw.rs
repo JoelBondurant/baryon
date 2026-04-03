@@ -4,11 +4,7 @@ use crate::engine::{EditorMode, VisualKind};
 use crate::svp::projector::HighlightProjector;
 use crate::uast::kind::SemanticKind;
 use crate::ui::*;
-use ratatui::{
-	backend::Backend,
-	layout::Rect,
-	style::Style,
-};
+use ratatui::{backend::Backend, layout::Rect, style::Style};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 use std::io;
@@ -91,15 +87,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 								max_width.saturating_sub(minimap_width + separator_width);
 							for gy in 0..max_height.saturating_sub(1) {
 								if let Some(cell) = buf.cell_mut((separator_x, gy)) {
-									cell.set_char(' ').set_style(
-										Style::default().bg(MINIMAP_BG).fg(MINIMAP_BG),
-									);
+									cell.set_char(' ')
+										.set_style(Style::default().bg(MINIMAP_BG).fg(MINIMAP_BG));
 								}
 								for gx in minimap_area.x..(minimap_area.x + minimap_area.width) {
 									if let Some(cell) = buf.cell_mut((gx, gy)) {
-										cell.set_char(' ').set_style(
-											Style::default().bg(BG).fg(BG),
-										);
+										cell.set_char(' ')
+											.set_style(Style::default().bg(BG).fg(BG));
 									}
 								}
 							}
@@ -110,7 +104,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 						let render_height = (max_height as usize).saturating_sub(1);
 
 						let search_pat = view.search_pattern.as_deref().unwrap_or("");
-						let projector = HighlightProjector::new(view.highlights.clone(), view.theme_colors.clone());
+						let projector = HighlightProjector::new(
+							view.highlights.clone(),
+							view.theme_colors.clone(),
+						);
 						let mut current_global_byte = view.global_start_byte;
 
 						for token in &view.tokens {
@@ -125,9 +122,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 								&token.text
 							};
 
-							let highlight_style = Style::default()
-								.bg(SEARCH_MATCH_BG)
-								.fg(SEARCH_MATCH_FG);
+							let highlight_style =
+								Style::default().bg(SEARCH_MATCH_BG).fg(SEARCH_MATCH_FG);
 							let search_ci = view.search_case_insensitive;
 							let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
 							if !search_pat.is_empty() && !token.text.is_empty() {
@@ -177,9 +173,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 									if current_global_byte >= flash_start
 										&& current_global_byte < flash_end
 									{
-										style = Style::default()
-											.bg(MODE_NORMAL_BG)
-											.fg(MODE_TEXT_FG);
+										style =
+											Style::default().bg(MODE_NORMAL_BG).fg(MODE_TEXT_FG);
 									}
 								}
 
@@ -404,11 +399,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 									.unwrap_or(p)
 							})
 							.unwrap_or("[No File]");
-						let name_style = if dirty {
-							bar_bg.fg(DIRTY_FG)
-						} else {
-							bar_bg
-						};
+						let name_style = if dirty { bar_bg.fg(DIRTY_FG) } else { bar_bg };
 						for c in display_name.chars() {
 							if x >= w {
 								break;

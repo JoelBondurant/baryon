@@ -30,7 +30,12 @@ fn is_allowed_manifest_line(line: &str) -> bool {
 
 fn contains_forbidden_keyword(line: &str) -> bool {
 	line.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
-		.any(|token| matches!(token, "struct" | "enum" | "fn" | "const" | "impl" | "static"))
+		.any(|token| {
+			matches!(
+				token,
+				"struct" | "enum" | "fn" | "const" | "impl" | "static"
+			)
+		})
 }
 
 #[test]
@@ -101,7 +106,12 @@ fn test_mod_rs_files_are_manifests_only() {
 			} else {
 				format!("unexpected manifest content on line {}", line_no + 1)
 			};
-			violations.push(format!("{}: {}: {}", path.display(), reason, raw_line.trim()));
+			violations.push(format!(
+				"{}: {}: {}",
+				path.display(),
+				reason,
+				raw_line.trim()
+			));
 		}
 	}
 

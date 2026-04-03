@@ -3,6 +3,7 @@ use crate::svp::parse::ViewportTree;
 use ra_ap_syntax::SyntaxKind;
 
 #[allow(dead_code)]
+#[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TokenCategory {
 	Keyword,
@@ -27,6 +28,8 @@ pub enum TokenCategory {
 	Whitespace,
 	Unclassified,
 }
+
+pub const CATEGORY_COUNT: usize = TokenCategory::Unclassified as usize + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HighlightSpan {
