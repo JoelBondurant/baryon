@@ -35,6 +35,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let _ = self.tx_cmd.send(EditorCommand::LoadFile(
 						expanded.to_string_lossy().to_string(),
 					));
+				} else if self.command_buffer.starts_with("theme ") {
+					let name = self.command_buffer[6..].trim().to_string();
+					let _ = self.tx_cmd.send(EditorCommand::SetTheme(name));
 				} else if let Ok(line_num) = self.command_buffer.parse::<u32>() {
 					let _ = self.tx_cmd.send(EditorCommand::GotoLine(DocLine::new(
 						line_num.saturating_sub(1),

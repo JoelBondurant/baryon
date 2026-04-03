@@ -13,6 +13,7 @@ use crate::uast::{
 	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, UastMutation, UastProjection,
 	Viewport,
 };
+use crate::ui::Theme;
 use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -120,6 +121,7 @@ pub enum EditorCommand {
 	WriteFile,
 	WriteFileAs(String),
 	WriteAndQuit,
+	SetTheme(String),
 	SearchStart(String),
 	SearchNext,
 	SearchPrev,
@@ -1770,6 +1772,7 @@ impl Engine {
 		let mut cursor_abs_col = VisualCol::ZERO;
 		let mut scroll_y = 0u32;
 		let mut viewport_lines = 50;
+		let mut current_theme = Theme::new("viridis");
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
 
@@ -2553,6 +2556,11 @@ impl Engine {
 					} else {
 						status_message = Some("No file to write".to_string());
 					}
+					needs_render = true;
+				}
+				EditorCommand::SetTheme(name) => {
+					current_theme = Theme::new(&name);
+					status_message = Some(format!("Theme set to {}", name));
 					needs_render = true;
 				}
 				EditorCommand::SearchStart(pattern) => {
@@ -3463,6 +3471,7 @@ impl Engine {
 					selection_ranges,
 					yank_flash,
 					minimap,
+					theme_colors: current_theme.syntax_colors.clone(),
 				});
 
 				if pending_quit {

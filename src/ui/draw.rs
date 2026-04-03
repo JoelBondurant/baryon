@@ -1,12 +1,13 @@
 use super::Frontend;
 use crate::core::TAB_SIZE;
 use crate::engine::{EditorMode, VisualKind};
-use crate::svp::projector::{HighlightProjector, WHITESPACE_COLOR};
+use crate::svp::projector::HighlightProjector;
 use crate::uast::kind::SemanticKind;
+use crate::ui::*;
 use ratatui::{
 	backend::Backend,
 	layout::Rect,
-	style::{Color, Style},
+	style::Style,
 };
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -62,9 +63,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 						let digits = max_line_on_screen.max(1).ilog10() + 1;
 						let gutter_width: u16 = digits as u16 + 1;
-						let gutter_style = Style::default()
-							.bg(Color::Rgb(18, 18, 18))
-							.fg(Color::Indexed(242));
+						let gutter_style = Style::default().bg(GUTTER_BG).fg(GUTTER_FG);
 
 						for gy in 0..render_line_count {
 							for gx in 0..gutter_width {
@@ -93,17 +92,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 							for gy in 0..max_height.saturating_sub(1) {
 								if let Some(cell) = buf.cell_mut((separator_x, gy)) {
 									cell.set_char(' ').set_style(
-										Style::default()
-											.bg(Color::Rgb(16, 20, 28))
-											.fg(Color::Rgb(16, 20, 28)),
+										Style::default().bg(MINIMAP_BG).fg(MINIMAP_BG),
 									);
 								}
 								for gx in minimap_area.x..(minimap_area.x + minimap_area.width) {
 									if let Some(cell) = buf.cell_mut((gx, gy)) {
 										cell.set_char(' ').set_style(
-											Style::default()
-												.bg(Color::Rgb(18, 18, 18))
-												.fg(Color::Rgb(18, 18, 18)),
+											Style::default().bg(BG).fg(BG),
 										);
 									}
 								}
@@ -115,14 +110,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 						let render_height = (max_height as usize).saturating_sub(1);
 
 						let search_pat = view.search_pattern.as_deref().unwrap_or("");
-						let selection_bg = Color::Rgb(62, 68, 82);
-						let projector = HighlightProjector::new(view.highlights.clone());
+						let projector = HighlightProjector::new(view.highlights.clone(), view.theme_colors.clone());
 						let mut current_global_byte = view.global_start_byte;
 
 						for token in &view.tokens {
 							let base_style = match token.kind {
-								SemanticKind::Token => Style::default().fg(Color::Indexed(253)),
-								_ => Style::default().fg(Color::Indexed(253)),
+								SemanticKind::Token => Style::default().fg(TEXT_FG),
+								_ => Style::default().fg(TEXT_FG),
 							};
 							let virtual_style = base_style;
 							let text = if token.text.is_empty() {
@@ -132,8 +126,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 							};
 
 							let highlight_style = Style::default()
-								.bg(Color::Rgb(180, 140, 50))
-								.fg(Color::Black);
+								.bg(SEARCH_MATCH_BG)
+								.fg(SEARCH_MATCH_FG);
 							let search_ci = view.search_case_insensitive;
 							let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
 							if !search_pat.is_empty() && !token.text.is_empty() {
@@ -176,7 +170,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 										*start <= char_end_byte && *end >= char_start_byte
 									});
 								if in_selection {
-									style = style.bg(selection_bg);
+									style = style.bg(SELECTION_BG);
 								}
 
 								if let Some((flash_start, flash_end)) = view.yank_flash {
@@ -184,8 +178,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 										&& current_global_byte < flash_end
 									{
 										style = Style::default()
-											.bg(Color::Rgb(229, 192, 123))
-											.fg(Color::Black);
+											.bg(MODE_NORMAL_BG)
+											.fg(MODE_TEXT_FG);
 									}
 								}
 
@@ -202,7 +196,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 									break;
 								}
 
-								let ws_style = style.fg(WHITESPACE_COLOR);
+								let ws_style = style.fg(SYNTAX_WHITESPACE);
 
 								if c == '\n' {
 									if x < text_right {
@@ -294,7 +288,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 
 				let bar_y = max_height.saturating_sub(1);
-				let bar_bg = Style::default().bg(Color::Rgb(18, 18, 18)).fg(Color::White);
+				let bar_bg = Style::default().bg(STATUS_BAR_BG).fg(STATUS_BAR_FG);
 				let w = max_width as usize;
 				let buf = f.buffer_mut();
 
@@ -332,13 +326,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 							VisualKind::Block => "VIS-BL",
 						},
 					};
-					let mode_style = bar_bg.fg(Color::Rgb(0, 0, 0)).bg(match current_mode {
-						EditorMode::Normal => Color::Rgb(130, 170, 255),
-						EditorMode::Insert => Color::Rgb(180, 230, 130),
-						EditorMode::Command => Color::Rgb(255, 180, 100),
-						EditorMode::Search => Color::Rgb(200, 160, 255),
-						EditorMode::Confirm => Color::Rgb(255, 120, 120),
-						EditorMode::Visual { .. } => Color::Rgb(120, 200, 200),
+					let mode_style = bar_bg.fg(MODE_TEXT_FG).bg(match current_mode {
+						EditorMode::Normal => MODE_NORMAL_BG,
+						EditorMode::Insert => MODE_INSERT_BG,
+						EditorMode::Command => MODE_COMMAND_BG,
+						EditorMode::Search => MODE_SEARCH_BG,
+						EditorMode::Confirm => MODE_CONFIRM_BG,
+						EditorMode::Visual { .. } => MODE_VISUAL_BG,
 					});
 
 					let mut x = 0usize;
@@ -411,7 +405,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 							})
 							.unwrap_or("[No File]");
 						let name_style = if dirty {
-							bar_bg.fg(Color::Rgb(255, 200, 120))
+							bar_bg.fg(DIRTY_FG)
 						} else {
 							bar_bg
 						};
@@ -434,7 +428,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 							if x < w {
 								if let Some(cell) = buf.cell_mut((x as u16, bar_y)) {
 									cell.set_char('\u{25CF}')
-										.set_style(bar_bg.fg(Color::Rgb(255, 160, 80)));
+										.set_style(bar_bg.fg(DIRTY_BULLET_FG));
 								}
 								x += 1;
 							}
@@ -465,8 +459,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 					let right_start = w.saturating_sub(right_text.len());
 					if right_start > x {
-						let dim_style = bar_bg.fg(Color::Indexed(242));
-						let search_style = bar_bg.fg(Color::Rgb(200, 160, 255));
+						let dim_style = bar_bg.fg(SEARCH_DIM_FG);
+						let search_style = bar_bg.fg(SEARCH_INFO_FG);
 						for (i, c) in right_text.chars().enumerate() {
 							let rx = right_start + i;
 							if rx >= w {

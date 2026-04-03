@@ -86,9 +86,10 @@ fn minimap_worker_loop(picker: Picker, rx: Receiver<MinimapRequest>, tx: Sender<
 }
 
 fn render_snapshot_image(snapshot: &MinimapSnapshot, area: Rect) -> DynamicImage {
+	use crate::ui::*;
 	let width = (area.width as u32).saturating_mul(8).max(32);
 	let height = (snapshot.bands.len() as u32).max((area.height as u32).saturating_mul(8));
-	let mut image = RgbaImage::from_pixel(width, height, Rgba([18, 18, 18, 255]));
+	let mut image = RgbaImage::from_pixel(width, height, Rgba(MINIMAP_RGBA_BG));
 	let content_left = 0u32;
 	let marker_gutter = 2u32;
 	let content_right = width.saturating_sub(marker_gutter).max(content_left + 1);
@@ -99,8 +100,8 @@ fn render_snapshot_image(snapshot: &MinimapSnapshot, area: Rect) -> DynamicImage
 		let density = snapshot.bands[band_idx.min(snapshot.bands.len().saturating_sub(1))];
 		let line_width = ((density as u32).saturating_mul(content_width) / 255).max(1);
 		let band_color = match snapshot.mode {
-			MinimapMode::TextDensity => Rgba([110, 110, 110, 255]),
-			MinimapMode::ByteFallback => Rgba([76, 76, 76, 255]),
+			MinimapMode::TextDensity => Rgba(MINIMAP_RGBA_DENSITY),
+			MinimapMode::ByteFallback => Rgba(MINIMAP_RGBA_FALLBACK),
 		};
 		for x in content_left..(content_left + line_width.min(content_width)) {
 			image.put_pixel(x, y, band_color);
@@ -119,9 +120,9 @@ fn render_snapshot_image(snapshot: &MinimapSnapshot, area: Rect) -> DynamicImage
 			1
 		};
 		let color = if snapshot.active_search_band == Some(band_idx) {
-			Rgba([224, 224, 224, 255])
+			Rgba(MINIMAP_RGBA_SEARCH_ACTIVE)
 		} else {
-			Rgba([160, 160, 160, 255])
+			Rgba(MINIMAP_RGBA_SEARCH_INACTIVE)
 		};
 		let x_start = width.saturating_sub(marker_width);
 		for y in y0.min(height.saturating_sub(1))..y1.max(y0 + 1).min(height) {
@@ -161,20 +162,20 @@ fn render_snapshot_image(snapshot: &MinimapSnapshot, area: Rect) -> DynamicImage
 		image.put_pixel(
 			x.min(width.saturating_sub(1)),
 			frame_top,
-			Rgba([186, 186, 186, 255]),
+			Rgba(MINIMAP_RGBA_FRAME),
 		);
 		image.put_pixel(
 			x.min(width.saturating_sub(1)),
 			frame_bottom.min(height.saturating_sub(1)),
-			Rgba([186, 186, 186, 255]),
+			Rgba(MINIMAP_RGBA_FRAME),
 		);
 	}
 	for y in frame_top..=frame_bottom.min(height.saturating_sub(1)) {
-		image.put_pixel(content_left, y, Rgba([162, 162, 162, 255]));
+		image.put_pixel(content_left, y, Rgba(MINIMAP_RGBA_FRAME_SIDE));
 		image.put_pixel(
 			content_right.min(width.saturating_sub(1)),
 			y,
-			Rgba([162, 162, 162, 255]),
+			Rgba(MINIMAP_RGBA_FRAME_SIDE),
 		);
 	}
 
@@ -184,7 +185,7 @@ fn render_snapshot_image(snapshot: &MinimapSnapshot, area: Rect) -> DynamicImage
 		image.put_pixel(
 			x,
 			cursor_y.min(height.saturating_sub(1)),
-			Rgba([218, 218, 218, 255]),
+			Rgba(MINIMAP_RGBA_CURSOR),
 		);
 	}
 

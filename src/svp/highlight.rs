@@ -3,7 +3,7 @@ use crate::svp::parse::ViewportTree;
 use ra_ap_syntax::SyntaxKind;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TokenCategory {
 	Keyword,
 	String,

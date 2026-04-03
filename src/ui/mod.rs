@@ -1,5 +1,7 @@
 pub mod startup;
 
+mod colors;
+mod theme;
 mod command;
 mod core;
 mod draw;
@@ -10,3 +12,5 @@ mod normal;
 mod visual;
 
 pub use core::*;
+pub use colors::*;
+pub use theme::*;
