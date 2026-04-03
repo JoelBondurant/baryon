@@ -8,6 +8,8 @@ use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
 
+pub mod startup;
+
 mod command;
 mod draw;
 mod insert;
