@@ -29,7 +29,11 @@ pub struct Frontend<B: Backend + io::Write> {
 	pub(super) pending_register: Option<char>,
 	pub(super) status_message: Option<String>,
 	pub(super) needs_redraw: bool,
+	pub(super) command_history: Vec<String>,
+	pub(super) command_history_index: Option<usize>,
 	pub(super) search_buffer: String,
+	pub(super) search_history: Vec<String>,
+	pub(super) search_history_index: Option<usize>,
 	pub(super) minimap: MinimapController,
 }
 
@@ -53,7 +57,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 			pending_register: None,
 			status_message: None,
 			needs_redraw: false,
+			command_history: Vec::new(),
+			command_history_index: None,
 			search_buffer: String::new(),
+			search_history: Vec::new(),
+			search_history_index: None,
 			minimap: MinimapController::new(),
 		}
 	}

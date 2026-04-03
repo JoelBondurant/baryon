@@ -76,13 +76,34 @@ impl<B: Backend + io::Write> Frontend<B> {
 				} else if !self.command_buffer.is_empty() {
 					self.status_message = Some(format!("Unknown command: {}", self.command_buffer));
 				}
+				push_history_entry(
+					&self.command_buffer,
+					&mut self.command_history,
+					&mut self.command_history_index,
+				);
 				self.current_mode = EditorMode::Normal;
 			}
 			KeyCode::Esc => {
+				self.command_history_index = None;
 				self.current_mode = EditorMode::Normal;
+			}
+			KeyCode::Up => {
+				recall_history_up(
+					&mut self.command_buffer,
+					&self.command_history,
+					&mut self.command_history_index,
+				);
+			}
+			KeyCode::Down => {
+				recall_history_down(
+					&mut self.command_buffer,
+					&self.command_history,
+					&mut self.command_history_index,
+				);
 			}
 			KeyCode::Backspace => {
 				if self.command_buffer.is_empty() {
+					self.command_history_index = None;
 					self.current_mode = EditorMode::Normal;
 				} else {
 					self.command_buffer.pop();
@@ -114,13 +135,34 @@ impl<B: Backend + io::Write> Frontend<B> {
 						.tx_cmd
 						.send(EditorCommand::SearchStart(self.search_buffer.clone()));
 				}
+				push_history_entry(
+					&self.search_buffer,
+					&mut self.search_history,
+					&mut self.search_history_index,
+				);
 				self.current_mode = EditorMode::Normal;
 			}
 			KeyCode::Esc => {
+				self.search_history_index = None;
 				self.current_mode = EditorMode::Normal;
+			}
+			KeyCode::Up => {
+				recall_history_up(
+					&mut self.search_buffer,
+					&self.search_history,
+					&mut self.search_history_index,
+				);
+			}
+			KeyCode::Down => {
+				recall_history_down(
+					&mut self.search_buffer,
+					&self.search_history,
+					&mut self.search_history_index,
+				);
 			}
 			KeyCode::Backspace => {
 				if self.search_buffer.is_empty() {
+					self.search_history_index = None;
 					self.current_mode = EditorMode::Normal;
 				} else {
 					self.search_buffer.pop();
@@ -169,6 +211,51 @@ impl<B: Backend + io::Write> Frontend<B> {
 			_ => {}
 		}
 		false
+	}
+}
+
+fn push_history_entry(
+	buffer: &str,
+	history: &mut Vec<String>,
+	history_index: &mut Option<usize>,
+) {
+	if !buffer.is_empty() && history.last().is_none_or(|last| last != buffer) {
+		history.push(buffer.to_string());
+	}
+	*history_index = None;
+}
+
+fn recall_history_up(
+	buffer: &mut String,
+	history: &[String],
+	history_index: &mut Option<usize>,
+) {
+	if history.is_empty() {
+		return;
+	}
+
+	let new_index = match *history_index {
+		Some(idx) => idx.saturating_sub(1),
+		None => history.len() - 1,
+	};
+	*history_index = Some(new_index);
+	*buffer = history[new_index].clone();
+}
+
+fn recall_history_down(
+	buffer: &mut String,
+	history: &[String],
+	history_index: &mut Option<usize>,
+) {
+	if let Some(idx) = *history_index {
+		if idx + 1 < history.len() {
+			let new_index = idx + 1;
+			*history_index = Some(new_index);
+			*buffer = history[new_index].clone();
+		} else {
+			*history_index = None;
+			buffer.clear();
+		}
 	}
 }
 
