@@ -1772,7 +1772,7 @@ impl Engine {
 		let mut cursor_abs_col = VisualCol::ZERO;
 		let mut scroll_y = 0u32;
 		let mut viewport_lines = 50;
-		let mut current_theme = Theme::new("viridis");
+		let mut current_theme = Theme::try_new("onedark").unwrap_or_else(|_| Theme::try_new("viridis").unwrap());
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
 
@@ -2559,8 +2559,15 @@ impl Engine {
 					needs_render = true;
 				}
 				EditorCommand::SetTheme(name) => {
-					current_theme = Theme::new(&name);
-					status_message = Some(format!("Theme set to {}", name));
+					match Theme::try_new(&name) {
+						Ok(theme) => {
+							current_theme = theme;
+							status_message = Some(format!("Theme set to {}", name));
+						}
+						Err(e) => {
+							status_message = Some(e);
+						}
+					}
 					needs_render = true;
 				}
 				EditorCommand::SearchStart(pattern) => {

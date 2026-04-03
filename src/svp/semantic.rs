@@ -313,9 +313,12 @@ fn map_hl_tag(highlight: Highlight) -> TokenCategory {
 		HlTag::Symbol(SymbolKind::Local | SymbolKind::ValueParam | SymbolKind::Field) => {
 			TokenCategory::Variable
 		}
-		HlTag::Symbol(SymbolKind::Const | SymbolKind::Static | SymbolKind::ConstParam) => {
-			TokenCategory::Constant
-		}
+		HlTag::Symbol(
+			SymbolKind::Const
+				| SymbolKind::Static
+				| SymbolKind::ConstParam
+				| SymbolKind::Variant,
+		) => TokenCategory::Constant,
 		HlTag::Symbol(SymbolKind::Macro | SymbolKind::ProcMacro) => TokenCategory::Macro,
 		HlTag::Symbol(SymbolKind::Module | SymbolKind::CrateRoot | SymbolKind::ToolModule) => {
 			TokenCategory::Module

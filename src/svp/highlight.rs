@@ -89,7 +89,11 @@ fn classify_token(kind: SyntaxKind) -> TokenCategory {
 		| SyntaxKind::SEMICOLON
 		| SyntaxKind::COLON
 		| SyntaxKind::DOT
-		| SyntaxKind::EQ
+		| SyntaxKind::AT
+		| SyntaxKind::UNDERSCORE
+		| SyntaxKind::QUESTION => TokenCategory::Punctuation,
+
+		SyntaxKind::EQ
 		| SyntaxKind::FAT_ARROW
 		| SyntaxKind::THIN_ARROW
 		| SyntaxKind::BANG
@@ -116,10 +120,7 @@ fn classify_token(kind: SyntaxKind) -> TokenCategory {
 		| SyntaxKind::SHL
 		| SyntaxKind::SHLEQ
 		| SyntaxKind::SHR
-		| SyntaxKind::SHREQ
-		| SyntaxKind::AT
-		| SyntaxKind::UNDERSCORE
-		| SyntaxKind::QUESTION => TokenCategory::Punctuation,
+		| SyntaxKind::SHREQ => TokenCategory::Operator,
 
 		// Lexical fallback for names keeps edit-boundary characters from flashing
 		// white while semantic highlighting catches up asynchronously.
