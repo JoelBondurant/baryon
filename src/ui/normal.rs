@@ -1,4 +1,4 @@
-use super::{Frontend, PendingOperator};
+use super::{Frontend, core::PendingOperator};
 use crate::engine::{EditorCommand, EditorMode, MoveDirection, VisualKind};
 use crossterm::event::{self, KeyCode};
 use ratatui::backend::Backend;
