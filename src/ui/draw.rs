@@ -2,11 +2,17 @@ use super::Frontend;
 use super::minimap::render_byte_fallback_snapshot;
 use crate::core::TAB_SIZE;
 use crate::engine::{EditorMode, VisualKind};
-use crate::svp::projector::HighlightProjector;
+use crate::svp::diagnostic::DiagnosticSeverity;
+use crate::svp::projector::{DiagnosticProjector, HighlightProjector};
 use crate::uast::MinimapMode;
 use crate::uast::kind::SemanticKind;
 use crate::ui::*;
-use ratatui::{backend::Backend, buffer::Buffer, layout::Rect, style::Style};
+use ratatui::{
+	backend::Backend,
+	buffer::Buffer,
+	layout::Rect,
+	style::{Modifier, Style},
+};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 use std::io;
@@ -87,6 +93,15 @@ fn segment_overlaps(ranges: &[(usize, usize)], start: usize, len: usize) -> bool
 	ranges
 		.iter()
 		.any(|&(range_start, range_end)| range_start < end && range_end > start)
+}
+
+fn apply_diagnostic_style(style: Style, severity: Option<DiagnosticSeverity>) -> Style {
+	match severity {
+		Some(DiagnosticSeverity::Error) => style
+			.add_modifier(Modifier::UNDERLINED)
+			.underline_color(DIAGNOSTIC_ERROR_UNDERLINE),
+		Some(_) | None => style,
+	}
 }
 
 impl<B: Backend + io::Write> Frontend<B> {
@@ -182,6 +197,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 							view.highlights.clone(),
 							view.theme_colors.clone(),
 						);
+						let diagnostic_projector =
+							DiagnosticProjector::new(view.diagnostics.clone());
 						let mut current_global_byte = view.global_start_byte;
 
 						for token in &view.tokens {
@@ -224,9 +241,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 							if token.is_folded {
 								let mut style = virtual_style;
 								let folded_start = token.absolute_start_byte;
-								let folded_end = folded_start
-									.saturating_add(token.physical_byte_len as u64)
-									.saturating_sub(1);
+								let folded_end_exclusive =
+									folded_start.saturating_add(token.physical_byte_len as u64);
+								let folded_end = folded_end_exclusive.saturating_sub(1);
 								let in_selection =
 									view.selection_ranges.iter().any(|(start, end)| {
 										*start <= folded_end && *end >= folded_start
@@ -240,6 +257,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 											Style::default().bg(MODE_NORMAL_BG).fg(MODE_TEXT_FG);
 									}
 								}
+								style = apply_diagnostic_style(
+									style,
+									diagnostic_projector
+										.severity_for_range(folded_start, folded_end_exclusive),
+								);
 
 								let display = std::str::from_utf8(text).unwrap_or("[...]");
 								if !paint_wrapped_text(
@@ -314,9 +336,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 								if has_physical_bytes {
 									let chunk_start_byte = current_global_byte;
-									let chunk_end_byte = current_global_byte
-										.saturating_add(chunk_len as u64)
-										.saturating_sub(1);
+									let chunk_end_exclusive =
+										current_global_byte.saturating_add(chunk_len as u64);
+									let chunk_end_byte = chunk_end_exclusive.saturating_sub(1);
 									let in_selection =
 										view.selection_ranges.iter().any(|(start, end)| {
 											*start <= chunk_end_byte && *end >= chunk_start_byte
@@ -334,6 +356,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 												.fg(MODE_TEXT_FG);
 										}
 									}
+									style = apply_diagnostic_style(
+										style,
+										diagnostic_projector.severity_for_range(
+											chunk_start_byte,
+											chunk_end_exclusive,
+										),
+									);
 								}
 
 								match chunk_kind {
@@ -696,6 +725,21 @@ impl<B: Backend + io::Write> Frontend<B> {
 			(Ok(_), Err(err)) => Err(err),
 			(Ok(_), Ok(())) => Ok(()),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::apply_diagnostic_style;
+	use crate::svp::diagnostic::DiagnosticSeverity;
+	use crate::ui::DIAGNOSTIC_ERROR_UNDERLINE;
+	use ratatui::style::{Modifier, Style};
+
+	#[test]
+	fn error_diagnostics_apply_a_red_underline_overlay() {
+		let style = apply_diagnostic_style(Style::default(), Some(DiagnosticSeverity::Error));
+		assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+		assert_eq!(style.underline_color, Some(DIAGNOSTIC_ERROR_UNDERLINE));
 	}
 }
 

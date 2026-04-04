@@ -25,6 +25,7 @@ pub const SEARCH_DIM_FG: Color = Color::Indexed(242);
 
 pub const SEARCH_MATCH_BG: Color = Color::Rgb(180, 140, 50);
 pub const SEARCH_MATCH_FG: Color = Color::Black;
+pub const DIAGNOSTIC_ERROR_UNDERLINE: Color = Color::Rgb(255, 92, 92);
 
 pub const CURSOR_LINE_BG: Color = Color::Rgb(32, 32, 32);
 

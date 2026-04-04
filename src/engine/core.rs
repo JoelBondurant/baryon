@@ -10,6 +10,7 @@ use crate::engine::folding::nearest_foldable_boundary;
 use crate::engine::undo::{
 	TextDelta, UndoLedger, byte_offset_from_line_col, line_col_from_byte_offset,
 };
+use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::highlight::HighlightSpan;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest};
 use crate::svp::{RequestPriority, SvpPointer, SvpResolver, ingest_svp_file};
@@ -745,11 +746,51 @@ fn shift_byte_offset(byte_offset: DocByte, shift: i64) -> DocByte {
 	}
 }
 
-fn rebase_semantic_highlights_after_delta(
-	semantic_highlights: &mut Vec<HighlightSpan>,
-	delta: &TextDelta,
-) {
-	if semantic_highlights.is_empty() {
+trait RebasableByteSpan {
+	fn start(&self) -> DocByte;
+	fn end(&self) -> DocByte;
+	fn set_start(&mut self, start: DocByte);
+	fn set_end(&mut self, end: DocByte);
+}
+
+impl RebasableByteSpan for HighlightSpan {
+	fn start(&self) -> DocByte {
+		self.start
+	}
+
+	fn end(&self) -> DocByte {
+		self.end
+	}
+
+	fn set_start(&mut self, start: DocByte) {
+		self.start = start;
+	}
+
+	fn set_end(&mut self, end: DocByte) {
+		self.end = end;
+	}
+}
+
+impl RebasableByteSpan for DiagnosticSpan {
+	fn start(&self) -> DocByte {
+		self.start
+	}
+
+	fn end(&self) -> DocByte {
+		self.end
+	}
+
+	fn set_start(&mut self, start: DocByte) {
+		self.start = start;
+	}
+
+	fn set_end(&mut self, end: DocByte) {
+		self.end = end;
+	}
+}
+
+fn rebase_byte_spans_after_delta<T: RebasableByteSpan>(spans: &mut Vec<T>, delta: &TextDelta) {
+	if spans.is_empty() {
 		return;
 	}
 
@@ -757,14 +798,14 @@ fn rebase_semantic_highlights_after_delta(
 	let edit_end_before = edit_start.saturating_add(delta.deleted_text.len() as u64);
 	let shift = delta.inserted_text.len() as i64 - delta.deleted_text.len() as i64;
 
-	semantic_highlights.retain_mut(|span| {
-		if span.end <= edit_start {
+	spans.retain_mut(|span| {
+		if span.end() <= edit_start {
 			return true;
 		}
 
-		if span.start >= edit_end_before {
-			span.start = shift_byte_offset(span.start, shift);
-			span.end = shift_byte_offset(span.end, shift);
+		if span.start() >= edit_end_before {
+			span.set_start(shift_byte_offset(span.start(), shift));
+			span.set_end(shift_byte_offset(span.end(), shift));
 			return true;
 		}
 
@@ -772,13 +813,34 @@ fn rebase_semantic_highlights_after_delta(
 	});
 }
 
+fn rebase_byte_spans_after_deltas<T: RebasableByteSpan>(spans: &mut Vec<T>, deltas: &[TextDelta]) {
+	for delta in deltas {
+		rebase_byte_spans_after_delta(spans, delta);
+	}
+}
+
+#[cfg(test)]
+fn rebase_semantic_highlights_after_delta(
+	semantic_highlights: &mut Vec<HighlightSpan>,
+	delta: &TextDelta,
+) {
+	rebase_byte_spans_after_delta(semantic_highlights, delta);
+}
+
 fn rebase_semantic_highlights_after_deltas(
 	semantic_highlights: &mut Vec<HighlightSpan>,
 	deltas: &[TextDelta],
 ) {
-	for delta in deltas {
-		rebase_semantic_highlights_after_delta(semantic_highlights, delta);
-	}
+	rebase_byte_spans_after_deltas(semantic_highlights, deltas);
+}
+
+#[cfg(test)]
+fn rebase_diagnostics_after_delta(diagnostics: &mut Vec<DiagnosticSpan>, delta: &TextDelta) {
+	rebase_byte_spans_after_delta(diagnostics, delta);
+}
+
+fn rebase_diagnostics_after_deltas(diagnostics: &mut Vec<DiagnosticSpan>, deltas: &[TextDelta]) {
+	rebase_byte_spans_after_deltas(diagnostics, deltas);
 }
 
 #[cfg(test)]
@@ -1648,6 +1710,7 @@ fn apply_deltas_to_document_internal(
 	cursor_abs_col: &mut VisualCol,
 	ledger: &mut UndoLedger,
 	semantic_highlights: &mut Vec<HighlightSpan>,
+	diagnostics: &mut Vec<DiagnosticSpan>,
 	deltas: Vec<TextDelta>,
 	record_undo: bool,
 	cursor_byte_override: Option<DocByte>,
@@ -1692,6 +1755,7 @@ fn apply_deltas_to_document_internal(
 	let cursor_byte_after_edit = DocByte::new(cursor_byte_after_edit.get().min(file_size));
 
 	rebase_semantic_highlights_after_deltas(semantic_highlights, &deltas);
+	rebase_diagnostics_after_deltas(diagnostics, &deltas);
 	if record_undo {
 		ledger.push_group(deltas);
 	}
@@ -1722,6 +1786,7 @@ fn apply_deltas_to_document(
 	cursor_abs_col: &mut VisualCol,
 	ledger: &mut UndoLedger,
 	semantic_highlights: &mut Vec<HighlightSpan>,
+	diagnostics: &mut Vec<DiagnosticSpan>,
 	deltas: Vec<TextDelta>,
 ) -> Result<(), String> {
 	apply_deltas_to_document_internal(
@@ -1733,6 +1798,7 @@ fn apply_deltas_to_document(
 		cursor_abs_col,
 		ledger,
 		semantic_highlights,
+		diagnostics,
 		deltas,
 		true,
 		None,
@@ -1775,6 +1841,7 @@ impl Engine {
 		let tx_view = self.tx_view;
 		let reactor = self.reactor;
 		let mut semantic_highlights: Vec<HighlightSpan> = Vec::new();
+		let mut diagnostic_spans: Vec<DiagnosticSpan> = Vec::new();
 		let mut last_semantic_state: Option<StateId> = None;
 		let mut last_semantic_len: usize = usize::MAX;
 		let mut last_semantic_path: Option<String> = None;
@@ -2174,6 +2241,7 @@ impl Engine {
 											&mut cursor_abs_col,
 											&mut ledger,
 											&mut semantic_highlights,
+											&mut diagnostic_spans,
 											deltas,
 										) {
 											Ok(()) => {
@@ -2217,6 +2285,7 @@ impl Engine {
 									&mut cursor_abs_col,
 									&mut ledger,
 									&mut semantic_highlights,
+									&mut diagnostic_spans,
 									vec![delta],
 								) {
 									Ok(()) => {
@@ -2273,6 +2342,7 @@ impl Engine {
 										&mut cursor_abs_col,
 										&mut ledger,
 										&mut semantic_highlights,
+										&mut diagnostic_spans,
 										vec![delta],
 									) {
 										status_message = Some(msg);
@@ -2314,6 +2384,7 @@ impl Engine {
 							&mut cursor_abs_col,
 							&mut ledger,
 							&mut semantic_highlights,
+							&mut diagnostic_spans,
 							vec![delta],
 						) {
 							status_message = Some(msg);
@@ -2374,6 +2445,7 @@ impl Engine {
 									&mut cursor_abs_col,
 									&mut ledger,
 									&mut semantic_highlights,
+									&mut diagnostic_spans,
 									vec![delta],
 								) {
 									status_message = Some(msg);
@@ -2402,6 +2474,7 @@ impl Engine {
 									&mut cursor_abs_col,
 									&mut ledger,
 									&mut semantic_highlights,
+									&mut diagnostic_spans,
 									vec![delta],
 								) {
 									status_message = Some(msg);
@@ -2566,6 +2639,7 @@ impl Engine {
 						ledger.clear();
 						active_visual = None;
 						semantic_highlights.clear();
+						diagnostic_spans.clear();
 						last_semantic_state = None;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
@@ -2611,6 +2685,7 @@ impl Engine {
 						ledger.clear();
 						active_visual = None;
 						semantic_highlights.clear();
+						diagnostic_spans.clear();
 						last_semantic_state = None;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
@@ -2872,6 +2947,7 @@ impl Engine {
 											&mut cursor_abs_col,
 											&mut ledger,
 											&mut semantic_highlights,
+											&mut diagnostic_spans,
 											deltas,
 										) {
 											Ok(()) => {
@@ -3008,6 +3084,7 @@ impl Engine {
 										&mut cursor_abs_col,
 										&mut ledger,
 										&mut semantic_highlights,
+										&mut diagnostic_spans,
 										vec![delta],
 									) {
 										Ok(()) => true,
@@ -3174,6 +3251,7 @@ impl Engine {
 										&mut cursor_abs_col,
 										&mut ledger,
 										&mut semantic_highlights,
+										&mut diagnostic_spans,
 										deltas,
 									) {
 										Ok(()) => {
@@ -3271,6 +3349,7 @@ impl Engine {
 										&mut cursor_abs_col,
 										&mut ledger,
 										&mut semantic_highlights,
+										&mut diagnostic_spans,
 										vec![TextDelta {
 											global_byte_offset: insert_offset,
 											deleted_text: String::new(),
@@ -3316,6 +3395,7 @@ impl Engine {
 								&mut cursor_abs_col,
 								&mut ledger,
 								&mut semantic_highlights,
+								&mut diagnostic_spans,
 								inverse_deltas,
 								false,
 								Some(cursor_byte),
@@ -3341,6 +3421,7 @@ impl Engine {
 								&mut cursor_abs_col,
 								&mut ledger,
 								&mut semantic_highlights,
+								&mut diagnostic_spans,
 								redo_deltas,
 								false,
 								Some(cursor_byte),
@@ -3434,6 +3515,7 @@ impl Engine {
 								{
 									if live_len == 0 || live_len as u64 >= MAX_SEMANTIC_BYTES {
 										semantic_highlights.clear();
+										diagnostic_spans.clear();
 										last_semantic_state = Some(ledger.current_state_id);
 										last_semantic_len = live_len;
 										last_semantic_path = Some(path.clone());
@@ -3462,6 +3544,7 @@ impl Engine {
 							}
 						} else {
 							semantic_highlights.clear();
+							diagnostic_spans.clear();
 							last_semantic_state = Some(ledger.current_state_id);
 							last_semantic_len = 0;
 							last_semantic_path = Some(path.clone());
@@ -3469,6 +3552,7 @@ impl Engine {
 						}
 					} else {
 						semantic_highlights.clear();
+						diagnostic_spans.clear();
 						last_semantic_state = None;
 						last_semantic_len = usize::MAX;
 						last_semantic_path = None;
@@ -3476,6 +3560,7 @@ impl Engine {
 					}
 				} else {
 					semantic_highlights.clear();
+					diagnostic_spans.clear();
 					last_semantic_state = None;
 					last_semantic_len = usize::MAX;
 					last_semantic_path = None;
@@ -3488,6 +3573,7 @@ impl Engine {
 						&& response.state_id == ledger.current_state_id
 					{
 						semantic_highlights = response.highlights;
+						diagnostic_spans = response.diagnostics;
 						pending_semantic_request_id = None;
 					}
 				}
@@ -3634,6 +3720,7 @@ impl Engine {
 					mode_override: mode_override.take(),
 					global_start_byte,
 					highlights,
+					diagnostics: diagnostic_spans.clone(),
 					selection_ranges,
 					yank_flash,
 					minimap,
@@ -3693,16 +3780,17 @@ mod tests {
 		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion,
 		materialize_fold_boundary_at_cursor, nearest_foldable_boundary, next_word_end,
 		next_word_start, normalize_line_density, pan_scroll_y_to_keep_cursor_visible,
-		place_cursor_at_line_col, prev_word_start, rebase_semantic_highlights_after_delta,
-		rebind_document_spans_to_saved_file, resolve_fold_boundary_at_cursor,
-		resolve_visual_ranges, save_document_atomic, scroll_viewport, set_subtree_fold_state,
-		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
-		visual_line_index_for_doc_line, word_object_delta_at_cursor,
+		place_cursor_at_line_col, prev_word_start, rebase_diagnostics_after_delta,
+		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
+		resolve_fold_boundary_at_cursor, resolve_visual_ranges, save_document_atomic,
+		scroll_viewport, set_subtree_fold_state, smart_home_visual_col, step_left_visual_col,
+		step_right_visual_col, visual_line_index_for_doc_line, word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, NodeByteOffset, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
 	use crate::engine::undo::{TextDelta, UndoLedger, byte_offset_from_line_col};
 	use crate::svp::SvpPointer;
+	use crate::svp::diagnostic::{DiagnosticSeverity, DiagnosticSpan};
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
 	use crate::uast::UastProjection;
 	use crate::uast::kind::SemanticKind;
@@ -4176,6 +4264,7 @@ mod tests {
 		let mut cursor_abs_col = target.visual_col;
 		let mut ledger = UndoLedger::new();
 		let mut semantic_highlights = Vec::new();
+		let mut diagnostics = Vec::new();
 
 		let delta = delete_char_delta_at_cursor(&registry, root, DocByte::new(1))
 			.expect("delete lookup should succeed")
@@ -4189,6 +4278,7 @@ mod tests {
 			&mut cursor_abs_col,
 			&mut ledger,
 			&mut semantic_highlights,
+			&mut diagnostics,
 			vec![delta],
 		)
 		.expect("forward delete should apply");
@@ -5006,6 +5096,7 @@ mod tests {
 		let mut cursor_abs_col = cursor_target.visual_col;
 		let mut ledger = UndoLedger::new();
 		let mut semantic_highlights = Vec::new();
+		let mut diagnostics = Vec::new();
 		let insert_offset =
 			byte_offset_from_line_col(original.as_bytes(), DocLine::new(3), VisualCol::ZERO);
 
@@ -5018,6 +5109,7 @@ mod tests {
 			&mut cursor_abs_col,
 			&mut ledger,
 			&mut semantic_highlights,
+			&mut diagnostics,
 			vec![TextDelta {
 				global_byte_offset: insert_offset,
 				deleted_text: String::new(),
@@ -5049,6 +5141,7 @@ mod tests {
 			&mut cursor_abs_col,
 			&mut ledger,
 			&mut semantic_highlights,
+			&mut diagnostics,
 			undo_group,
 			false,
 			Some(undo_cursor_byte),
@@ -5075,6 +5168,7 @@ mod tests {
 			&mut cursor_abs_col,
 			&mut ledger,
 			&mut semantic_highlights,
+			&mut diagnostics,
 			redo_group,
 			false,
 			Some(redo_cursor_byte),
@@ -5152,6 +5246,7 @@ mod tests {
 		let mut cursor_abs_col = VisualCol::ZERO;
 		let mut ledger = UndoLedger::new();
 		let mut semantic_highlights = Vec::new();
+		let mut diagnostics = Vec::new();
 
 		apply_deltas_to_document(
 			&registry,
@@ -5162,6 +5257,7 @@ mod tests {
 			&mut cursor_abs_col,
 			&mut ledger,
 			&mut semantic_highlights,
+			&mut diagnostics,
 			vec![
 				TextDelta {
 					global_byte_offset: DocByte::new(12),
@@ -5214,6 +5310,7 @@ mod tests {
 			&mut cursor_abs_col,
 			&mut ledger,
 			&mut semantic_highlights,
+			&mut diagnostics,
 			undo_group,
 			false,
 			Some(undo_cursor_byte),
@@ -5246,6 +5343,7 @@ mod tests {
 			&mut cursor_abs_col,
 			&mut ledger,
 			&mut semantic_highlights,
+			&mut diagnostics,
 			redo_group,
 			false,
 			Some(redo_cursor_byte),
@@ -5365,6 +5463,37 @@ mod tests {
 				DocByte::new(15),
 				TokenCategory::Type,
 			)]
+		);
+	}
+
+	#[test]
+	fn diagnostic_cache_rebases_spans_after_backspace() {
+		let mut diagnostics = vec![
+			DiagnosticSpan::new(DocByte::new(2), DocByte::new(4), DiagnosticSeverity::Error),
+			DiagnosticSpan::new(
+				DocByte::new(10),
+				DocByte::new(14),
+				DiagnosticSeverity::Error,
+			),
+		];
+
+		rebase_diagnostics_after_delta(
+			&mut diagnostics,
+			&TextDelta {
+				global_byte_offset: DocByte::new(5),
+				deleted_text: "x".to_string(),
+				inserted_text: String::new(),
+				state_before: StateId::ZERO,
+				state_after: StateId::ZERO,
+			},
+		);
+
+		assert_eq!(
+			diagnostics,
+			vec![
+				DiagnosticSpan::new(DocByte::new(2), DocByte::new(4), DiagnosticSeverity::Error,),
+				DiagnosticSpan::new(DocByte::new(9), DocByte::new(13), DiagnosticSeverity::Error,),
+			]
 		);
 	}
 }

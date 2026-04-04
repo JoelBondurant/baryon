@@ -1,3 +1,4 @@
+pub mod diagnostic;
 pub mod highlight;
 pub mod ingest;
 pub mod parse;

@@ -6,8 +6,11 @@ use triomphe::Arc;
 
 use ra_ap_base_db::{CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Env, SourceRoot};
 use ra_ap_cfg::CfgOptions;
-use ra_ap_ide::{AnalysisHost, Highlight, HighlightConfig, HlMod, HlTag, SymbolKind};
-use ra_ap_ide_db::{ChangeWithProcMacros, MiniCore};
+use ra_ap_ide::{
+	Analysis, AnalysisHost, AssistResolveStrategy, Cancellable, DiagnosticsConfig, Highlight,
+	HighlightConfig, HlMod, HlTag, SymbolKind,
+};
+use ra_ap_ide_db::{ChangeWithProcMacros, MiniCore, Severity};
 use ra_ap_paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use ra_ap_project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSource};
 use ra_ap_syntax::Edition;
@@ -15,6 +18,7 @@ use ra_ap_vfs::{FileId, Vfs, VfsPath, file_set::FileSet};
 use rustc_hash::FxHashMap;
 
 use crate::core::{DocByte, RequestId, StateId};
+use crate::svp::diagnostic::{DiagnosticSeverity, DiagnosticSpan};
 use crate::svp::highlight::{HighlightSpan, TokenCategory};
 
 #[derive(Debug)]
@@ -31,12 +35,19 @@ pub struct SemanticResponse {
 	pub state_id: StateId,
 	pub request_id: RequestId,
 	pub highlights: Vec<HighlightSpan>,
+	pub diagnostics: Vec<DiagnosticSpan>,
 }
 
 pub struct SemanticReactor {
 	tx_in: mpsc::Sender<SemanticRequest>,
 	rx_out: mpsc::Receiver<SemanticResponse>,
 	_handle: thread::JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticCollectionMode {
+	Full,
+	SyntaxOnly,
 }
 
 impl SemanticReactor {
@@ -76,6 +87,8 @@ impl SemanticReactor {
 		let mut host: Option<AnalysisHost> = None;
 		let mut active_file_id = FileId::from_raw(0);
 		let mut current_file_path = String::new();
+		let diagnostics_config = diagnostics_config();
+		let mut diagnostic_mode = DiagnosticCollectionMode::SyntaxOnly;
 
 		while let Ok(first) = rx.recv() {
 			// Drain: collapse all pending messages, keep only the freshest.
@@ -86,10 +99,16 @@ impl SemanticReactor {
 
 			// (Re-)initialize when file changes or on first message.
 			if host.is_none() || request.file_path != current_file_path {
-				let (h, fid) = init_workspace(&request.file_path)
-					.unwrap_or_else(|| init_single_file(&request.content));
+				let (h, fid, mode) = match init_workspace(&request.file_path) {
+					Some((host, file_id)) => (host, file_id, DiagnosticCollectionMode::Full),
+					None => {
+						let (host, file_id) = init_single_file(&request.content);
+						(host, file_id, DiagnosticCollectionMode::SyntaxOnly)
+					}
+				};
 				host = Some(h);
 				active_file_id = fid;
+				diagnostic_mode = mode;
 				current_file_path = request.file_path.clone();
 			}
 
@@ -115,9 +134,19 @@ impl SemanticReactor {
 				minicore: MiniCore::default(),
 			};
 
-			match analysis.highlight(config, active_file_id) {
-				Ok(highlights) => {
-					let mapped = highlights
+			match (
+				analysis.highlight(config, active_file_id),
+				collect_error_diagnostics(
+					&analysis,
+					active_file_id,
+					&request.content,
+					request.global_offset,
+					&diagnostics_config,
+					diagnostic_mode,
+				),
+			) {
+				(Ok(highlights), Ok(diagnostics)) => {
+					let mapped_highlights = highlights
 						.into_iter()
 						.filter_map(|hl| {
 							let cat = map_hl_tag(hl.highlight);
@@ -136,16 +165,81 @@ impl SemanticReactor {
 					let _ = tx.send(SemanticResponse {
 						state_id: request.state_id,
 						request_id: request.request_id,
-						highlights: mapped,
+						highlights: mapped_highlights,
+						diagnostics,
 					});
 					let _ = tx_cmd.send(crate::engine::EditorCommand::InternalRefresh);
 				}
-				Err(_cancelled) => {
+				(Err(_cancelled), _) | (_, Err(_cancelled)) => {
 					// Salsa cancelled — will pick up next payload.
 				}
 			}
 		}
 	}
+}
+
+fn diagnostics_config() -> DiagnosticsConfig {
+	let mut config = DiagnosticsConfig::test_sample();
+	config.proc_macros_enabled = true;
+	config.proc_attr_macros_enabled = true;
+	config
+}
+
+fn collect_error_diagnostics(
+	analysis: &Analysis,
+	active_file_id: FileId,
+	content: &str,
+	global_offset: DocByte,
+	config: &DiagnosticsConfig,
+	mode: DiagnosticCollectionMode,
+) -> Cancellable<Vec<DiagnosticSpan>> {
+	let diagnostics = match mode {
+		DiagnosticCollectionMode::Full => {
+			analysis.full_diagnostics(config, AssistResolveStrategy::None, active_file_id)?
+		}
+		DiagnosticCollectionMode::SyntaxOnly => {
+			analysis.syntax_diagnostics(config, active_file_id)?
+		}
+	};
+	Ok(diagnostics
+		.into_iter()
+		.filter_map(|diagnostic| {
+			if diagnostic.range.file_id != active_file_id || diagnostic.severity != Severity::Error
+			{
+				return None;
+			}
+
+			let start = u32::from(diagnostic.range.range.start()) as usize;
+			let end = u32::from(diagnostic.range.range.end()) as usize;
+			let (start, end) = normalize_diagnostic_range(content, start, end)?;
+			Some(DiagnosticSpan::new(
+				global_offset.saturating_add(start as u64),
+				global_offset.saturating_add(end as u64),
+				DiagnosticSeverity::Error,
+			))
+		})
+		.collect())
+}
+
+fn normalize_diagnostic_range(content: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+	let len = content.len();
+	let start = start.min(len);
+	let end = end.min(len);
+	if end > start {
+		return Some((start, end));
+	}
+
+	if start < len {
+		let next = start + content[start..].chars().next()?.len_utf8();
+		return Some((start, next));
+	}
+
+	if start > 0 {
+		let prev = content[..start].char_indices().next_back()?.0;
+		return Some((prev, start));
+	}
+
+	None
 }
 
 /// Load a full Cargo workspace so rust-analyzer can resolve std, deps, etc.
@@ -342,5 +436,59 @@ fn map_hl_tag(highlight: Highlight) -> TokenCategory {
 		HlTag::Punctuation(_) => TokenCategory::Punctuation,
 		HlTag::AttributeBracket => TokenCategory::Attribute,
 		HlTag::UnresolvedReference | HlTag::None => TokenCategory::Unclassified,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{
+		DiagnosticCollectionMode, collect_error_diagnostics, diagnostics_config, init_single_file,
+		normalize_diagnostic_range,
+	};
+	use crate::core::DocByte;
+
+	#[test]
+	fn invalid_rust_produces_visible_error_diagnostic_spans() {
+		let source = "fn main() {\n";
+		let (host, file_id) = init_single_file(source);
+		let diagnostics = collect_error_diagnostics(
+			&host.analysis(),
+			file_id,
+			source,
+			DocByte::ZERO,
+			&diagnostics_config(),
+			DiagnosticCollectionMode::SyntaxOnly,
+		)
+		.expect("diagnostics should resolve");
+
+		assert!(!diagnostics.is_empty());
+		assert!(diagnostics.iter().all(|diag| diag.start < diag.end));
+	}
+
+	#[test]
+	fn valid_builtin_derives_do_not_produce_error_diagnostics() {
+		let source = "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nstruct Sample;\n";
+		let (host, file_id) = init_single_file(source);
+		let diagnostics = collect_error_diagnostics(
+			&host.analysis(),
+			file_id,
+			source,
+			DocByte::ZERO,
+			&diagnostics_config(),
+			DiagnosticCollectionMode::SyntaxOnly,
+		)
+		.expect("diagnostics should resolve");
+
+		assert!(
+			diagnostics.is_empty(),
+			"valid derive should not produce error diagnostics: {diagnostics:?}"
+		);
+	}
+
+	#[test]
+	fn empty_diagnostic_ranges_expand_to_a_visible_span() {
+		assert_eq!(normalize_diagnostic_range("abc", 3, 3), Some((2, 3)));
+		assert_eq!(normalize_diagnostic_range("abc", 1, 1), Some((1, 2)));
+		assert_eq!(normalize_diagnostic_range("", 0, 0), None);
 	}
 }

@@ -1,5 +1,6 @@
 use crate::core::{CursorPosition, DocByte, DocLine, NodeByteOffset, TAB_SIZE, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
+use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::highlight::{CATEGORY_COUNT, HighlightSpan};
 use crate::uast::kind::SemanticKind;
 use ratatui::style::Color;
@@ -55,6 +56,7 @@ pub struct Viewport {
 	pub mode_override: Option<crate::engine::EditorMode>,
 	pub global_start_byte: DocByte,
 	pub highlights: Vec<HighlightSpan>,
+	pub diagnostics: Vec<DiagnosticSpan>,
 	pub selection_ranges: Vec<(DocByte, DocByte)>,
 	pub yank_flash: Option<(DocByte, DocByte)>,
 	pub minimap: Option<MinimapSnapshot>,
@@ -533,7 +535,8 @@ impl UastProjection for UastRegistry {
 				if !text.is_empty() {
 					let to_skip = target_line.saturating_sub(line_accumulator.get());
 					let byte_offset = line_start_offset(&text, to_skip).unwrap_or(text.len());
-					if byte_offset == text.len() && self.next_node_skipping_children(node).is_some() {
+					if byte_offset == text.len() && self.next_node_skipping_children(node).is_some()
+					{
 						line_accumulator = node_end_line;
 						byte_accumulator = byte_accumulator.saturating_add(m.byte_length as u64);
 						visit = self.next_node_skipping_children(node);
@@ -1002,7 +1005,9 @@ mod tests {
 	#[test]
 	fn find_node_at_line_col_prefers_next_leaf_at_trailing_newline_boundary() {
 		let (registry, root) = build_document_with_leaves(&["head\n", "tail"]);
-		let second = registry.get_next_sibling(registry.get_first_child(root).unwrap()).unwrap();
+		let second = registry
+			.get_next_sibling(registry.get_first_child(root).unwrap())
+			.unwrap();
 
 		let target = registry.find_node_at_line_col(root, DocLine::new(1), VisualCol::ZERO);
 
@@ -1013,7 +1018,9 @@ mod tests {
 	#[test]
 	fn query_viewport_starts_with_next_leaf_after_trailing_newline_boundary() {
 		let (registry, root) = build_document_with_leaves(&["head\n", "tail"]);
-		let second = registry.get_next_sibling(registry.get_first_child(root).unwrap()).unwrap();
+		let second = registry
+			.get_next_sibling(registry.get_first_child(root).unwrap())
+			.unwrap();
 
 		let tokens = registry.query_viewport(root, DocLine::new(1), 1);
 
