@@ -798,7 +798,7 @@ fn render_preview_image(
 
 	let content_width_px = content_width as u32 * font_w;
 	let x_pad = (font_w / 10).max(1).min(2);
-	let sparse_line_px = (font_h / 6).clamp(2, 4);
+	let sparse_line_px = if total_rows <= 64 { 2 } else { 1 };
 	let use_sparse_preview = (total_rows as u32).saturating_mul(sparse_line_px) <= height_px;
 	let used_height_px = if use_sparse_preview {
 		(total_rows as u32).saturating_mul(sparse_line_px)
@@ -806,13 +806,20 @@ fn render_preview_image(
 		height_px
 	};
 	if use_sparse_preview {
-		let ink_top_pad = if sparse_line_px > 2 { 1 } else { 0 };
-		let ink_bottom_pad = if sparse_line_px > 3 { 1 } else { 0 };
+		let sparse_x_pad = if sparse_line_px <= 1 { 0 } else { x_pad };
+		let ink_top_pad = if sparse_line_px > 1 { 1 } else { 0 };
+		let ink_bottom_pad = if sparse_line_px > 2 { 1 } else { 0 };
+		let max_columns = snapshot.max_columns.max(1) as u32;
 
 		for (row_idx, row) in snapshot.rows.iter().enumerate() {
 			if row.logical_width == 0 {
 				continue;
 			}
+
+			let row_width_px = ((row.logical_width as u32).saturating_mul(content_width_px))
+				.div_ceil(max_columns)
+				.max(1)
+				.min(content_width_px);
 
 			let row_top = row_idx as u32 * sparse_line_px;
 			let row_bottom = (row_top + sparse_line_px).min(height_px);
@@ -829,17 +836,18 @@ fn render_preview_image(
 				ink_bottom
 			};
 
-			for x in 0..content_width_px {
+			for x in 0..row_width_px {
 				let within_cell = x % font_w;
-				if within_cell < x_pad || within_cell >= font_w.saturating_sub(x_pad) {
+				if within_cell < sparse_x_pad || within_cell >= font_w.saturating_sub(sparse_x_pad)
+				{
 					continue;
 				}
 
 				let bin = sample_preview_bin_range(
 					row,
-					x as usize,
-					(x as usize).saturating_add(1),
-					content_width_px as usize,
+					x.saturating_sub(1) as usize,
+					(x + 2).min(row_width_px) as usize,
+					row_width_px as usize,
 				);
 				let Some(color) = preview_bin_rgba(bin, theme_colors, base_bg) else {
 					continue;
@@ -1148,7 +1156,7 @@ mod tests {
 
 		let image = render_preview_image(&snapshot, area, &theme_colors, (10, 20)).to_rgba8();
 		let base_bg = image[(0, image.height() - 1)];
-		let top_has_ink = (0..image.width()).any(|x| image[(x, 5)] != base_bg);
+		let top_has_ink = (0..image.width()).any(|x| image[(x, 1)] != base_bg);
 		let lower_empty = (0..image.width()).all(|x| image[(x, image.height() - 5)] == base_bg);
 
 		assert!(top_has_ink);
@@ -1159,7 +1167,7 @@ mod tests {
 	fn preview_image_dense_files_use_full_vertical_extent() {
 		let area = Rect::new(0, 0, 12, 10);
 		let mut rows = Vec::new();
-		for row_idx in 0..200 {
+		for row_idx in 0..400 {
 			rows.push(PreviewRow {
 				logical_width: 8,
 				bins: {
@@ -1198,7 +1206,7 @@ mod tests {
 	#[test]
 	fn preview_image_dense_files_do_not_leave_periodic_empty_vertical_stripes() {
 		let area = Rect::new(0, 0, 12, 10);
-		let rows = (0..200)
+		let rows = (0..400)
 			.map(|_| PreviewRow {
 				logical_width: 8,
 				bins: vec![TokenCategory::Keyword as u8; PREVIEW_BIN_COLUMNS].into_boxed_slice(),
@@ -1206,7 +1214,7 @@ mod tests {
 			.collect();
 		let snapshot = PreviewSnapshot {
 			overlay: MinimapOverlay {
-				total_lines: 200,
+				total_lines: 400,
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLine::new(20),
 				viewport_line_count: 20,
@@ -1228,6 +1236,85 @@ mod tests {
 			let has_ink = (0..image.height()).any(|y| image[(x, y)] != base_bg);
 			assert!(has_ink, "column {x} rendered as an empty vertical stripe");
 		}
+	}
+
+	#[test]
+	fn preview_image_sparse_files_do_not_leave_periodic_empty_vertical_stripes() {
+		let area = Rect::new(0, 0, 12, 10);
+		let rows = (0..100)
+			.map(|_| PreviewRow {
+				logical_width: 8,
+				bins: vec![TokenCategory::Keyword as u8; PREVIEW_BIN_COLUMNS].into_boxed_slice(),
+			})
+			.collect();
+		let snapshot = PreviewSnapshot {
+			overlay: MinimapOverlay {
+				total_lines: 100,
+				viewport_start_line: DocLine::ZERO,
+				viewport_end_line: DocLine::new(20),
+				viewport_line_count: 20,
+				cursor_line: DocLine::new(10),
+				search_bands: vec![0; 256],
+				active_search_band: None,
+			},
+			max_columns: 8,
+			rows,
+		};
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::Keyword as usize] = Some(Color::Rgb(255, 0, 0));
+
+		let image = render_preview_image(&snapshot, area, &theme_colors, (10, 20)).to_rgba8();
+		let base_bg = image[(0, image.height() - 1)];
+		let content_width_px = (area.width.saturating_sub(1).max(1) as u32) * 10;
+
+		for x in 1..content_width_px.saturating_sub(1) {
+			let has_ink = (0..100u32).any(|y| image[(x, y)] != base_bg);
+			assert!(
+				has_ink,
+				"column {x} rendered as an empty sparse vertical stripe"
+			);
+		}
+	}
+
+	#[test]
+	fn preview_image_sparse_files_respect_relative_line_widths() {
+		let area = Rect::new(0, 0, 12, 10);
+		let snapshot = PreviewSnapshot {
+			overlay: MinimapOverlay {
+				total_lines: 100,
+				viewport_start_line: DocLine::new(90),
+				viewport_end_line: DocLine::new(95),
+				viewport_line_count: 5,
+				cursor_line: DocLine::new(92),
+				search_bands: vec![0; 256],
+				active_search_band: None,
+			},
+			max_columns: 32,
+			rows: vec![
+				PreviewRow {
+					logical_width: 8,
+					bins: vec![TokenCategory::Keyword as u8; PREVIEW_BIN_COLUMNS]
+						.into_boxed_slice(),
+				},
+				PreviewRow {
+					logical_width: 32,
+					bins: vec![TokenCategory::Keyword as u8; PREVIEW_BIN_COLUMNS]
+						.into_boxed_slice(),
+				},
+			],
+		};
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::Keyword as usize] = Some(Color::Rgb(255, 0, 0));
+
+		let image = render_preview_image(&snapshot, area, &theme_colors, (10, 20)).to_rgba8();
+		let base_bg = image[(0, image.height() - 1)];
+		let content_width_px = (area.width.saturating_sub(1).max(1) as u32) * 10;
+		let probe_x = content_width_px.saturating_sub(6);
+		let short_row_y = 1u32;
+		let long_row_y = 3u32;
+
+		assert_eq!(image[(probe_x, short_row_y)], base_bg);
+		assert_ne!(image[(probe_x, long_row_y)], base_bg);
 	}
 
 	#[test]
