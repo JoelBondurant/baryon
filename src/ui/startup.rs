@@ -1,4 +1,5 @@
 use crate::app;
+use crate::ui::settings;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 
@@ -23,7 +24,8 @@ where
 			Ok(())
 		}
 		StartupAction::Run { initial_file } => {
-			let app = app::App::new();
+			let settings = settings::load_settings();
+			let app = app::App::new(settings);
 			app.run(initial_file)
 		}
 	}

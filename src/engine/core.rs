@@ -18,7 +18,7 @@ use crate::uast::{
 	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, RootChildLineIndex,
 	UastMutation, UastProjection, Viewport,
 };
-use crate::ui::Theme;
+use crate::ui::{Theme, settings::persist_theme_name};
 use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -1839,6 +1839,9 @@ pub struct Engine {
 	tx_cmd: mpsc::Sender<EditorCommand>,
 	tx_view: mpsc::Sender<Viewport>,
 	reactor: SemanticReactor,
+	initial_theme_name: String,
+	settings_path: Option<PathBuf>,
+	startup_status: Option<String>,
 }
 
 impl Engine {
@@ -1848,6 +1851,9 @@ impl Engine {
 		rx_cmd: mpsc::Receiver<EditorCommand>,
 		tx_cmd: mpsc::Sender<EditorCommand>,
 		tx_view: mpsc::Sender<Viewport>,
+		initial_theme_name: String,
+		settings_path: Option<PathBuf>,
+		startup_status: Option<String>,
 	) -> Self {
 		let reactor = SemanticReactor::new(tx_cmd.clone());
 		Self {
@@ -1857,6 +1863,9 @@ impl Engine {
 			tx_cmd,
 			tx_view,
 			reactor,
+			initial_theme_name,
+			settings_path,
+			startup_status,
 		}
 	}
 
@@ -1867,6 +1876,9 @@ impl Engine {
 		let tx_cmd = self.tx_cmd;
 		let tx_view = self.tx_view;
 		let reactor = self.reactor;
+		let initial_theme_name = self.initial_theme_name;
+		let settings_path = self.settings_path;
+		let startup_status = self.startup_status;
 		let mut semantic_highlights: Vec<HighlightSpan> = Vec::new();
 		let mut diagnostic_spans: Vec<DiagnosticSpan> = Vec::new();
 		let mut last_semantic_state: Option<StateId> = None;
@@ -1888,12 +1900,12 @@ impl Engine {
 		let mut viewport_width = 80u16;
 		let mut viewport_lines: u32 = 50;
 		let mut wrap_enabled = true;
-		let mut current_theme =
-			Theme::try_new("onedark").unwrap_or_else(|_| Theme::try_new("viridis").unwrap());
+		let mut current_theme = Theme::try_new(&initial_theme_name)
+			.unwrap_or_else(|_| Theme::try_new("onedark").unwrap());
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
 
-		let mut status_message: Option<String> = None;
+		let mut status_message: Option<String> = startup_status;
 		let mut pending_quit = false;
 		let mut mode_override: Option<EditorMode> = None;
 		let mut active_visual: Option<(DocByte, VisualKind)> = None;
@@ -3011,7 +3023,17 @@ impl Engine {
 					match Theme::try_new(&name) {
 						Ok(theme) => {
 							current_theme = theme;
-							status_message = Some(format!("Theme set to {}", name));
+							match persist_theme_name(settings_path.as_deref(), &name) {
+								Ok(()) => {
+									status_message = Some(format!("Theme set to {}", name));
+								}
+								Err(err) => {
+									status_message = Some(format!(
+										"Theme set to {} (settings not saved: {})",
+										name, err
+									));
+								}
+							}
 						}
 						Err(e) => {
 							status_message = Some(e);

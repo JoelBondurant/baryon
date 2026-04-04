@@ -2,7 +2,7 @@ use crate::ecs::registry::UastRegistry;
 use crate::engine::{EditorCommand, Engine};
 use crate::svp::resolver::SvpResolver;
 use crate::uast::projection::Viewport;
-use crate::ui::Frontend;
+use crate::ui::{Frontend, settings::LoadedSettings};
 use crossterm::{
 	cursor::SetCursorStyle,
 	event::{DisableMouseCapture, EnableMouseCapture},
@@ -11,15 +11,24 @@ use crossterm::{
 };
 use ratatui::backend::CrosstermBackend;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
-pub struct App;
+pub struct App {
+	initial_theme_name: String,
+	settings_path: Option<PathBuf>,
+	startup_status: Option<String>,
+}
 
 impl App {
-	pub fn new() -> Self {
-		Self
+	pub(crate) fn new(settings: LoadedSettings) -> Self {
+		Self {
+			initial_theme_name: settings.theme_name,
+			settings_path: settings.settings_path,
+			startup_status: settings.startup_status,
+		}
 	}
 
 	pub fn run(&self, initial_file: Option<String>) -> Result<(), io::Error> {
@@ -46,6 +55,9 @@ impl App {
 			rx_cmd,
 			tx_cmd.clone(),
 			tx_view,
+			self.initial_theme_name.clone(),
+			self.settings_path.clone(),
+			self.startup_status.clone(),
 		);
 		thread::spawn(move || {
 			engine.run();
