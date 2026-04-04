@@ -15,8 +15,8 @@ use crate::svp::highlight::HighlightSpan;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest};
 use crate::svp::{RequestPriority, SvpPointer, SvpResolver, ingest_svp_file};
 use crate::uast::{
-	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, UastMutation, UastProjection,
-	Viewport,
+	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, RootChildLineIndex,
+	UastMutation, UastProjection, Viewport,
 };
 use crate::ui::Theme;
 use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
@@ -33,8 +33,8 @@ use std::sync::mpsc;
 use super::folding::{
 	clamp_cursor_line_to_viewport, doc_line_for_visual_index, max_visual_line_index,
 	pan_scroll_y_to_keep_cursor_visible, resolve_fold_boundary_at_cursor, reveal_line_col_target,
-	scroll_viewport, set_subtree_fold_state, snap_line_to_visible_boundary, unfold_ancestor_chain,
-	visual_line_index_for_doc_line,
+	scroll_viewport, set_subtree_fold_state, snap_line_to_visible_boundary,
+	subtree_has_folded_boundaries, unfold_ancestor_chain, visual_line_index_for_doc_line,
 };
 use super::layout::{
 	ViewportAnchor, clamp_cursor_to_viewport_anchor, collect_visible_rows, cursor_view_metrics,
@@ -859,6 +859,50 @@ fn read_document_snapshot(
 	Ok(bytes)
 }
 
+#[derive(Debug, Clone)]
+struct CachedRootChildLineIndex {
+	root: NodeId,
+	state_id: StateId,
+	total_lines: u32,
+	total_bytes: u64,
+	next_id: u32,
+	index: RootChildLineIndex,
+}
+
+fn root_child_line_index<'a>(
+	cache: &'a mut Option<CachedRootChildLineIndex>,
+	registry: &UastRegistry,
+	root: NodeId,
+	state_id: StateId,
+) -> &'a RootChildLineIndex {
+	let total_lines = registry.get_total_newlines(root);
+	let total_bytes = registry.get_total_bytes(root);
+	let next_id = registry.next_id.load(Ordering::Acquire);
+	let needs_rebuild = match cache {
+		Some(cached) => {
+			cached.root != root
+				|| cached.state_id != state_id
+				|| cached.total_lines != total_lines
+				|| cached.total_bytes != total_bytes
+				|| cached.next_id != next_id
+		}
+		None => true,
+	};
+
+	if needs_rebuild {
+		*cache = Some(CachedRootChildLineIndex {
+			root,
+			state_id,
+			total_lines,
+			total_bytes,
+			next_id,
+			index: registry.build_root_child_line_index(root),
+		});
+	}
+
+	&cache.as_ref().expect("line index must be cached").index
+}
+
 fn normalize_line_density(byte_len: usize) -> u8 {
 	let capped = byte_len.min(160) as u32;
 	((capped * 255) / 160) as u8
@@ -1127,8 +1171,41 @@ fn place_cursor_at_line_col(
 	cursor_abs_line: &mut DocLine,
 	cursor_abs_col: &mut VisualCol,
 ) {
+	place_cursor_at_line_col_with_root_line_index(
+		registry,
+		root,
+		target_line,
+		target_col,
+		None,
+		reveal_hidden,
+		cursor_node,
+		cursor_offset,
+		cursor_abs_line,
+		cursor_abs_col,
+	)
+}
+
+fn place_cursor_at_line_col_with_root_line_index(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	target_col: VisualCol,
+	line_index: Option<&RootChildLineIndex>,
+	reveal_hidden: bool,
+	cursor_node: &mut NodeId,
+	cursor_offset: &mut u32,
+	cursor_abs_line: &mut DocLine,
+	cursor_abs_col: &mut VisualCol,
+) {
 	let target = if reveal_hidden {
 		reveal_line_col_target(registry, root, target_line, target_col)
+	} else if let Some(line_index) = line_index {
+		registry.find_node_at_line_col_with_root_line_index(
+			root,
+			target_line,
+			target_col,
+			line_index,
+		)
 	} else {
 		registry.find_node_at_line_col(root, target_line, target_col)
 	};
@@ -1801,13 +1878,15 @@ impl Engine {
 		let mut last_minimap_state: Option<StateId> = None;
 		let mut last_minimap_total_lines: u32 = u32::MAX;
 		let mut last_minimap_path: Option<String> = None;
+		let mut cached_root_line_index: Option<CachedRootChildLineIndex> = None;
+		let mut has_closed_folds = false;
 
 		let mut cursor_abs_line = DocLine::ZERO;
 		let mut cursor_abs_col = VisualCol::ZERO;
 		let mut scroll_y = 0u32;
 		let mut scroll_row_offset = 0u32;
 		let mut viewport_width = 80u16;
-		let mut viewport_lines = 50;
+		let mut viewport_lines: u32 = 50;
 		let mut wrap_enabled = true;
 		let mut current_theme =
 			Theme::try_new("onedark").unwrap_or_else(|_| Theme::try_new("viridis").unwrap());
@@ -1850,6 +1929,7 @@ impl Engine {
 			match cmd {
 				EditorCommand::MoveCursor(dir) => {
 					if let Some(rid) = root_id {
+						let mut indexed_place = None;
 						match dir {
 							MoveDirection::Up => {
 								let total = registry.get_total_newlines(rid);
@@ -1944,26 +2024,55 @@ impl Engine {
 							}
 							MoveDirection::Bottom => {
 								let total = registry.get_total_newlines(rid);
-								cursor_abs_line = doc_line_for_visual_index(
+								let line_index = root_child_line_index(
+									&mut cached_root_line_index,
 									&registry,
 									rid,
-									max_visual_line_index(&registry, rid, total),
-									total,
+									ledger.current_state_id,
 								);
+								cursor_abs_line = if has_closed_folds {
+									doc_line_for_visual_index(
+										&registry,
+										rid,
+										max_visual_line_index(&registry, rid, total),
+										total,
+									)
+								} else {
+									DocLine::new(total)
+								};
 								cursor_abs_col = VisualCol::ZERO;
+								let bottom_margin = viewport_lines.saturating_sub(1);
+								scroll_y = cursor_abs_line.get().saturating_sub(bottom_margin);
+								scroll_row_offset = 0;
+								indexed_place = Some(line_index);
 							}
 						}
-						place_cursor_at_line_col(
-							&registry,
-							rid,
-							cursor_abs_line,
-							cursor_abs_col,
-							false,
-							&mut cursor_node,
-							&mut cursor_offset,
-							&mut cursor_abs_line,
-							&mut cursor_abs_col,
-						);
+						if let Some(line_index) = indexed_place {
+							place_cursor_at_line_col_with_root_line_index(
+								&registry,
+								rid,
+								cursor_abs_line,
+								cursor_abs_col,
+								Some(line_index),
+								false,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_line,
+								&mut cursor_abs_col,
+							);
+						} else {
+							place_cursor_at_line_col(
+								&registry,
+								rid,
+								cursor_abs_line,
+								cursor_abs_col,
+								false,
+								&mut cursor_node,
+								&mut cursor_offset,
+								&mut cursor_abs_line,
+								&mut cursor_abs_col,
+							);
+						}
 						needs_render = true;
 					}
 				}
@@ -1972,17 +2081,25 @@ impl Engine {
 						let total = registry.get_total_newlines(rid);
 						cursor_abs_line = DocLine::new(target.get().min(total));
 						cursor_abs_col = VisualCol::ZERO;
-						place_cursor_at_line_col(
+						let line_index = root_child_line_index(
+							&mut cached_root_line_index,
+							&registry,
+							rid,
+							ledger.current_state_id,
+						);
+						place_cursor_at_line_col_with_root_line_index(
 							&registry,
 							rid,
 							cursor_abs_line,
 							cursor_abs_col,
+							Some(line_index),
 							true,
 							&mut cursor_node,
 							&mut cursor_offset,
 							&mut cursor_abs_line,
 							&mut cursor_abs_col,
 						);
+						has_closed_folds = subtree_has_folded_boundaries(&registry, rid);
 						needs_render = true;
 					}
 				}
@@ -2682,6 +2799,7 @@ impl Engine {
 							&mut cursor_abs_line,
 							&mut cursor_abs_col,
 						);
+						has_closed_folds = subtree_has_folded_boundaries(&registry, rid);
 					}
 					needs_render = true;
 				}
@@ -2758,6 +2876,8 @@ impl Engine {
 						last_minimap_state = None;
 						last_minimap_total_lines = u32::MAX;
 						last_minimap_path = None;
+						cached_root_line_index = None;
+						has_closed_folds = false;
 						needs_render = true;
 					} else {
 						// New file — create empty document
@@ -2805,6 +2925,8 @@ impl Engine {
 						last_minimap_state = None;
 						last_minimap_total_lines = u32::MAX;
 						last_minimap_path = None;
+						cached_root_line_index = None;
+						has_closed_folds = false;
 						needs_render = true;
 					}
 				}
@@ -3561,6 +3683,12 @@ impl Engine {
 					root_id
 				{
 					let total_lines = registry.get_total_newlines(rid);
+					let line_index = root_child_line_index(
+						&mut cached_root_line_index,
+						&registry,
+						rid,
+						ledger.current_state_id,
+					);
 					let geometry = viewport_geometry(total_lines, viewport_width, true);
 					let viewport_anchor = if wrap_enabled {
 						pan_viewport_anchor_to_keep_cursor_visible(
@@ -3596,11 +3724,20 @@ impl Engine {
 					// 1. Virtual Query (Look-behind 60 lines, Look-ahead 120 lines total)
 					let virtual_start_line = scroll_line.saturating_sub(60);
 					let virtual_line_count = viewport_lines + 120;
-					let virtual_tokens =
-						registry.query_viewport(rid, virtual_start_line, virtual_line_count);
+					let virtual_tokens = registry.query_viewport_with_root_line_index(
+						rid,
+						virtual_start_line,
+						virtual_line_count,
+						Some(line_index),
+					);
 
 					// 2. Visible Query (The actual UI screen)
-					let visible_tokens = registry.query_viewport(rid, scroll_line, viewport_lines);
+					let visible_tokens = registry.query_viewport_with_root_line_index(
+						rid,
+						scroll_line,
+						viewport_lines,
+						Some(line_index),
+					);
 
 					for token in &visible_tokens {
 						if !token.is_virtual && token.text.is_empty() {
@@ -3958,8 +4095,8 @@ mod tests {
 		place_cursor_at_line_col, prev_word_start, read_document_snapshot,
 		rebase_diagnostics_after_delta, rebase_semantic_highlights_after_delta,
 		rebind_document_spans_to_saved_file, resolve_fold_boundary_at_cursor,
-		resolve_visual_ranges, save_document_atomic, scroll_viewport, set_subtree_fold_state,
-		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
+		resolve_visual_ranges, root_child_line_index, save_document_atomic, scroll_viewport,
+		set_subtree_fold_state, smart_home_visual_col, step_left_visual_col, step_right_visual_col,
 		visual_line_index_for_doc_line, word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, NodeByteOffset, StateId, VisualCol};
@@ -4865,7 +5002,7 @@ mod tests {
 	#[test]
 	fn materialize_fold_boundary_prefers_function_inside_trait_impl_over_parent_impl() {
 		let (registry, root) = build_document(
-			"impl UastProjection for UastRegistry {\n    fn query_viewport(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        line_count: u32,\n    ) -> Vec<RenderToken> {\n        let mut current_global_byte = DocByte::ZERO;\n        current_global_byte = current_global_byte.saturating_add(line_count as u64);\n        Vec::new()\n    }\n\n    fn find_node_at_line_col(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        target_col: VisualCol,\n    ) -> NodeCursorTarget {\n        self.find_node_at_line_col_internal(root, target_line, target_col, true)\n    }\n}\n",
+			"impl UastProjection for UastRegistry {\n    fn query_viewport(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        line_count: u32,\n    ) -> Vec<RenderToken> {\n        let mut current_global_byte = DocByte::ZERO;\n        current_global_byte = current_global_byte.saturating_add(line_count as u64);\n        Vec::new()\n    }\n\n    fn find_node_at_line_col(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        target_col: VisualCol,\n    ) -> NodeCursorTarget {\n        self.find_node_at_line_col_internal(root, target_line, target_col, true, None)\n    }\n}\n",
 		);
 
 		let fold = materialize_fold_boundary_at_cursor(
@@ -4913,7 +5050,7 @@ mod tests {
 	#[test]
 	fn materialize_fold_boundary_on_trait_impl_signature_indent_still_picks_function() {
 		let (registry, root) = build_document(
-			"impl UastProjection for UastRegistry {\n    fn query_viewport(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        line_count: u32,\n    ) -> Vec<RenderToken> {\n        let mut current_global_byte = DocByte::ZERO;\n        current_global_byte = current_global_byte.saturating_add(line_count as u64);\n        Vec::new()\n    }\n\n    fn find_node_at_line_col(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        target_col: VisualCol,\n    ) -> NodeCursorTarget {\n        self.find_node_at_line_col_internal(root, target_line, target_col, true)\n    }\n}\n",
+			"impl UastProjection for UastRegistry {\n    fn query_viewport(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        line_count: u32,\n    ) -> Vec<RenderToken> {\n        let mut current_global_byte = DocByte::ZERO;\n        current_global_byte = current_global_byte.saturating_add(line_count as u64);\n        Vec::new()\n    }\n\n    fn find_node_at_line_col(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        target_col: VisualCol,\n    ) -> NodeCursorTarget {\n        self.find_node_at_line_col_internal(root, target_line, target_col, true, None)\n    }\n}\n",
 		);
 
 		let fold =
@@ -4946,7 +5083,10 @@ mod tests {
 		let (registry, root) = build_document(text);
 		let samples = [
 			(
-				doc_line_of(text, "// PHASE 1: DESCENT (O(log N))"),
+				doc_line_of(
+					text,
+					"self.query_viewport_with_root_line_index(root, target_line, line_count, None)",
+				),
 				VisualCol::ZERO,
 				"\tfn query_viewport(",
 			),
@@ -4961,7 +5101,7 @@ mod tests {
 			(
 				doc_line_of(
 					text,
-					"self.find_node_at_line_col_internal(root, target_line, target_col, true)",
+					"self.find_node_at_line_col_internal(root, target_line, target_col, true, None)",
 				),
 				VisualCol::new(4),
 				"\tfn find_node_at_line_col(",
@@ -5034,7 +5174,10 @@ mod tests {
 		let trait_fold = materialize_fold_boundary_at_cursor(
 			&registry,
 			root,
-			doc_line_of(text, "// PHASE 1: DESCENT (O(log N))"),
+			doc_line_of(
+				text,
+				"self.query_viewport_with_root_line_index(root, target_line, line_count, None)",
+			),
 			VisualCol::ZERO,
 		)
 		.expect("trait impl method fold should still materialize");
@@ -5081,7 +5224,10 @@ mod tests {
 				.starts_with("impl UastProjection for UastRegistry {")
 		);
 
-		let cursor_line = doc_line_of(text, "// PHASE 1: DESCENT (O(log N))");
+		let cursor_line = doc_line_of(
+			text,
+			"self.query_viewport_with_root_line_index(root, target_line, line_count, None)",
+		);
 		let cursor = registry.find_node_at_line_col(root, cursor_line, VisualCol::ZERO);
 		let target = resolve_fold_boundary_at_cursor(
 			&registry,
@@ -5442,6 +5588,51 @@ mod tests {
 		assert!(reopened.iter().any(|token| {
 			!token.is_folded && String::from_utf8_lossy(&token.text).contains("epsilon();")
 		}));
+	}
+
+	#[test]
+	fn root_child_line_index_rebuilds_after_synthetic_fold_materialization() {
+		let (registry, root) = build_document(
+			"fn main() {\n    alpha();\n    beta();\n}\n\nfn outside() {\n    gamma();\n}\n",
+		);
+		let mut cache = None;
+		let initial_index =
+			root_child_line_index(&mut cache, &registry, root, StateId::ZERO).clone();
+		let initial_next_id = cache.as_ref().expect("cached index").next_id;
+
+		let fold =
+			materialize_fold_boundary_at_cursor(&registry, root, DocLine::ZERO, VisualCol::ZERO)
+				.expect("function fold should materialize");
+		registry.is_folded[fold.index()].store(true, Ordering::Release);
+
+		let rebuilt_index =
+			root_child_line_index(&mut cache, &registry, root, StateId::ZERO).clone();
+		let rebuilt_next_id = cache.as_ref().expect("rebuilt cached index").next_id;
+		assert!(rebuilt_next_id > initial_next_id);
+
+		let initial_tokens = registry.query_viewport_with_root_line_index(
+			root,
+			DocLine::ZERO,
+			20,
+			Some(&initial_index),
+		);
+		assert!(
+			!initial_tokens
+				.iter()
+				.any(|token| token.is_folded && token.node_id == fold)
+		);
+
+		let rebuilt_tokens = registry.query_viewport_with_root_line_index(
+			root,
+			DocLine::ZERO,
+			20,
+			Some(&rebuilt_index),
+		);
+		assert!(
+			rebuilt_tokens
+				.iter()
+				.any(|token| token.is_folded && token.node_id == fold)
+		);
 	}
 
 	#[test]

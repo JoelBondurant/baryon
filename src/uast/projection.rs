@@ -35,6 +35,19 @@ pub struct NodeByteTarget {
 	pub node_byte: NodeByteOffset,
 }
 
+#[derive(Debug, Clone)]
+pub struct RootChildLineIndex {
+	entries: Vec<RootChildLineIndexEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RootChildLineIndexEntry {
+	node_id: NodeId,
+	start_line: DocLine,
+	end_line: DocLine,
+	start_byte: DocByte,
+}
+
 pub struct Viewport {
 	pub tokens: Vec<RenderToken>,
 	pub scroll_y: u32,
@@ -177,6 +190,29 @@ pub trait UastProjection {
 }
 
 impl UastRegistry {
+	pub(crate) fn build_root_child_line_index(&self, root: NodeId) -> RootChildLineIndex {
+		let mut entries = Vec::new();
+		let mut line_accumulator = DocLine::ZERO;
+		let mut byte_accumulator = DocByte::ZERO;
+		let mut child = self.get_first_child(root);
+
+		while let Some(node) = child {
+			let metrics = unsafe { &*self.metrics[node.index()].get() };
+			let end_line = line_accumulator.saturating_add(metrics.newlines);
+			entries.push(RootChildLineIndexEntry {
+				node_id: node,
+				start_line: line_accumulator,
+				end_line,
+				start_byte: byte_accumulator,
+			});
+			line_accumulator = end_line;
+			byte_accumulator = byte_accumulator.saturating_add(metrics.byte_length as u64);
+			child = self.get_next_sibling(node);
+		}
+
+		RootChildLineIndex { entries }
+	}
+
 	pub(crate) fn next_node_skipping_children(&self, node: NodeId) -> Option<NodeId> {
 		unsafe {
 			let mut curr = node;
@@ -199,9 +235,10 @@ impl UastRegistry {
 		target_line: DocLine,
 		target_col: VisualCol,
 		respect_folds: bool,
+		line_index: Option<&RootChildLineIndex>,
 	) -> NodeCursorTarget {
-		let mut curr = Some(root);
-		let mut line_accumulator = DocLine::ZERO;
+		let (mut curr, mut line_accumulator, _) =
+			seek_root_child_for_line(self, root, target_line, line_index);
 		let mut last_effective_leaf: Option<NodeCursorTarget> = None;
 
 		while let Some(node) = curr {
@@ -352,7 +389,17 @@ impl UastRegistry {
 		target_line: DocLine,
 		target_col: VisualCol,
 	) -> NodeCursorTarget {
-		self.find_node_at_line_col_internal(root, target_line, target_col, false)
+		self.find_node_at_line_col_internal(root, target_line, target_col, false, None)
+	}
+
+	pub(crate) fn find_node_at_line_col_with_root_line_index(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		target_col: VisualCol,
+		line_index: &RootChildLineIndex,
+	) -> NodeCursorTarget {
+		self.find_node_at_line_col_internal(root, target_line, target_col, true, Some(line_index))
 	}
 
 	pub(crate) fn find_node_at_doc_byte_raw(
@@ -429,6 +476,28 @@ impl UastRegistry {
 	}
 }
 
+fn seek_root_child_for_line(
+	_registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	line_index: Option<&RootChildLineIndex>,
+) -> (Option<NodeId>, DocLine, DocByte) {
+	let Some(line_index) = line_index else {
+		return (Some(root), DocLine::ZERO, DocByte::ZERO);
+	};
+	if line_index.entries.is_empty() {
+		return (Some(root), DocLine::ZERO, DocByte::ZERO);
+	}
+
+	let target = target_line.get();
+	let index = line_index
+		.entries
+		.partition_point(|entry| entry.end_line.get() < target)
+		.min(line_index.entries.len().saturating_sub(1));
+	let entry = line_index.entries[index];
+	(Some(entry.node_id), entry.start_line, entry.start_byte)
+}
+
 impl UastProjection for UastRegistry {
 	fn query_viewport(
 		&self,
@@ -436,10 +505,106 @@ impl UastProjection for UastRegistry {
 		target_line: DocLine,
 		line_count: u32,
 	) -> Vec<RenderToken> {
+		self.query_viewport_with_root_line_index(root, target_line, line_count, None)
+	}
+
+	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId> {
+		unsafe {
+			if let Some(child) = (*self.edges[node.index()].get()).first_child {
+				return Some(child);
+			}
+
+			let mut curr = node;
+			loop {
+				if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {
+					return Some(sib);
+				}
+				if let Some(p) = (*self.edges[curr.index()].get()).parent {
+					curr = p;
+				} else {
+					return None;
+				}
+			}
+		}
+	}
+
+	fn find_node_at_line_col(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		target_col: VisualCol,
+	) -> NodeCursorTarget {
+		self.find_node_at_line_col_internal(root, target_line, target_col, true, None)
+	}
+
+	fn doc_byte_for_node_offset(
+		&self,
+		root: NodeId,
+		node: NodeId,
+		node_offset: NodeByteOffset,
+	) -> DocByte {
+		let mut absolute = DocByte::new(node_offset.get() as u64);
+		let mut curr = node;
+
+		while curr != root {
+			let Some(parent) = (unsafe { (*self.edges[curr.index()].get()).parent }) else {
+				break;
+			};
+
+			let mut sibling = unsafe { (*self.edges[parent.index()].get()).first_child };
+			while let Some(candidate) = sibling {
+				if candidate == curr {
+					break;
+				}
+
+				let sibling_len = unsafe { (*self.metrics[candidate.index()].get()).byte_length };
+				absolute = absolute.saturating_add(sibling_len as u64);
+				sibling = unsafe { (*self.edges[candidate.index()].get()).next_sibling };
+			}
+
+			curr = parent;
+		}
+
+		absolute
+	}
+
+	fn read_loaded_slice(
+		&self,
+		root: NodeId,
+		start: DocByte,
+		end: DocByte,
+	) -> Result<Vec<u8>, &'static str> {
+		let root_len = self.get_total_bytes(root);
+		let start = start.get().min(root_len);
+		let end = end.get().min(root_len);
+		let mut result = Vec::with_capacity((end.saturating_sub(start)) as usize);
+		self.for_each_loaded_slice_fragment(
+			root,
+			DocByte::new(start),
+			DocByte::new(end),
+			|fragment| {
+				result.extend_from_slice(fragment);
+			},
+		)?;
+		Ok(result)
+	}
+
+	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget {
+		self.find_node_at_doc_byte_internal(root, target_byte, true)
+	}
+}
+
+impl UastRegistry {
+	pub(crate) fn query_viewport_with_root_line_index(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		line_count: u32,
+		line_index: Option<&RootChildLineIndex>,
+	) -> Vec<RenderToken> {
 		let mut tokens = Vec::new();
-		let mut curr = Some(root);
-		let mut line_accumulator = DocLine::ZERO;
-		let mut byte_accumulator = DocByte::ZERO;
+		let (mut curr, mut line_accumulator, mut byte_accumulator) =
+			seek_root_child_for_line(self, root, target_line, line_index);
 		let line_count = line_count.max(1);
 
 		// PHASE 1: DESCENT (O(log N))
@@ -598,91 +763,6 @@ impl UastProjection for UastRegistry {
 		}
 
 		tokens
-	}
-
-	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId> {
-		unsafe {
-			if let Some(child) = (*self.edges[node.index()].get()).first_child {
-				return Some(child);
-			}
-
-			let mut curr = node;
-			loop {
-				if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {
-					return Some(sib);
-				}
-				if let Some(p) = (*self.edges[curr.index()].get()).parent {
-					curr = p;
-				} else {
-					return None;
-				}
-			}
-		}
-	}
-
-	fn find_node_at_line_col(
-		&self,
-		root: NodeId,
-		target_line: DocLine,
-		target_col: VisualCol,
-	) -> NodeCursorTarget {
-		self.find_node_at_line_col_internal(root, target_line, target_col, true)
-	}
-
-	fn doc_byte_for_node_offset(
-		&self,
-		root: NodeId,
-		node: NodeId,
-		node_offset: NodeByteOffset,
-	) -> DocByte {
-		let mut absolute = DocByte::new(node_offset.get() as u64);
-		let mut curr = node;
-
-		while curr != root {
-			let Some(parent) = (unsafe { (*self.edges[curr.index()].get()).parent }) else {
-				break;
-			};
-
-			let mut sibling = unsafe { (*self.edges[parent.index()].get()).first_child };
-			while let Some(candidate) = sibling {
-				if candidate == curr {
-					break;
-				}
-
-				let sibling_len = unsafe { (*self.metrics[candidate.index()].get()).byte_length };
-				absolute = absolute.saturating_add(sibling_len as u64);
-				sibling = unsafe { (*self.edges[candidate.index()].get()).next_sibling };
-			}
-
-			curr = parent;
-		}
-
-		absolute
-	}
-
-	fn read_loaded_slice(
-		&self,
-		root: NodeId,
-		start: DocByte,
-		end: DocByte,
-	) -> Result<Vec<u8>, &'static str> {
-		let root_len = self.get_total_bytes(root);
-		let start = start.get().min(root_len);
-		let end = end.get().min(root_len);
-		let mut result = Vec::with_capacity((end.saturating_sub(start)) as usize);
-		self.for_each_loaded_slice_fragment(
-			root,
-			DocByte::new(start),
-			DocByte::new(end),
-			|fragment| {
-				result.extend_from_slice(fragment);
-			},
-		)?;
-		Ok(result)
-	}
-
-	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget {
-		self.find_node_at_doc_byte_internal(root, target_byte, true)
 	}
 }
 
@@ -1070,6 +1150,48 @@ mod tests {
 		assert_eq!(tokens.len(), 1);
 		assert_eq!(tokens[0].absolute_start_byte, DocByte::new(3));
 		assert_eq!(tokens[0].text, b"\xffbb\ncc".to_vec());
+	}
+
+	#[test]
+	fn root_line_indexed_query_viewport_matches_plain_query_near_eof() {
+		let parts = ["head\n", "alpha\nbeta\n", "gamma\ndelta\n", "tail"];
+		let (registry, root) = build_document_with_leaves(&parts);
+		let line_index = registry.build_root_child_line_index(root);
+
+		let plain = registry.query_viewport(root, DocLine::new(4), 2);
+		let indexed = registry.query_viewport_with_root_line_index(
+			root,
+			DocLine::new(4),
+			2,
+			Some(&line_index),
+		);
+
+		assert_eq!(indexed.len(), plain.len());
+		for (left, right) in indexed.iter().zip(plain.iter()) {
+			assert_eq!(left.node_id, right.node_id);
+			assert_eq!(left.text, right.text);
+			assert_eq!(left.absolute_start_line, right.absolute_start_line);
+			assert_eq!(left.absolute_start_byte, right.absolute_start_byte);
+		}
+	}
+
+	#[test]
+	fn root_line_indexed_cursor_lookup_matches_plain_lookup_near_eof() {
+		let parts = ["head\n", "alpha\nbeta\n", "gamma\ndelta\n", "tail"];
+		let (registry, root) = build_document_with_leaves(&parts);
+		let line_index = registry.build_root_child_line_index(root);
+
+		let plain = registry.find_node_at_line_col(root, DocLine::new(4), VisualCol::new(2));
+		let indexed = registry.find_node_at_line_col_with_root_line_index(
+			root,
+			DocLine::new(4),
+			VisualCol::new(2),
+			&line_index,
+		);
+
+		assert_eq!(indexed.node_id, plain.node_id);
+		assert_eq!(indexed.node_byte, plain.node_byte);
+		assert_eq!(indexed.visual_col, plain.visual_col);
 	}
 
 	#[test]

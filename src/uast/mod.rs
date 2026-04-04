@@ -14,8 +14,8 @@ pub use metrics::SpanMetrics;
 pub use mutation::UastMutation;
 #[allow(unused_imports)]
 pub use projection::{
-	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, RenderToken, UastProjection,
-	Viewport,
+	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, RenderToken,
+	RootChildLineIndex, UastProjection, Viewport,
 };
 #[allow(unused_imports)]
 pub use topology::TreeEdges;

@@ -215,6 +215,19 @@ pub(crate) fn set_subtree_fold_state(registry: &UastRegistry, root: NodeId, fold
 	}
 }
 
+pub(crate) fn subtree_has_folded_boundaries(registry: &UastRegistry, root: NodeId) -> bool {
+	let mut visit = Some(root);
+	while let Some(node) = visit {
+		if node_is_foldable_boundary(registry, root, node)
+			&& registry.is_folded[node.index()].load(Ordering::Acquire)
+		{
+			return true;
+		}
+		visit = registry.get_next_node_in_walk(node);
+	}
+	false
+}
+
 pub(crate) fn unfold_ancestor_chain(registry: &UastRegistry, node: NodeId) {
 	let mut curr = unsafe { (*registry.edges[node.index()].get()).parent };
 	while let Some(parent) = curr {
