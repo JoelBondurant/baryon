@@ -1,5 +1,5 @@
-pub mod startup;
 pub mod settings;
+pub mod startup;
 
 mod colors;
 mod command;

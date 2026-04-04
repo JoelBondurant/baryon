@@ -42,6 +42,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let _ = self.tx_cmd.send(EditorCommand::ToggleWrap);
 				} else if self.command_buffer == "nowrap" {
 					let _ = self.tx_cmd.send(EditorCommand::SetWrap(false));
+				} else if self.command_buffer == "minimap" {
+					let _ = self.tx_cmd.send(EditorCommand::SetMinimap(true));
+				} else if self.command_buffer == "nominimap" {
+					let _ = self.tx_cmd.send(EditorCommand::SetMinimap(false));
 				} else if let Ok(line_num) = self.command_buffer.parse::<u32>() {
 					let _ = self.tx_cmd.send(EditorCommand::GotoLine(DocLine::new(
 						line_num.saturating_sub(1),
@@ -346,6 +350,36 @@ mod tests {
 		assert!(matches!(
 			rx_cmd.try_recv().expect(":nowrap should send a command"),
 			EditorCommand::SetWrap(false)
+		));
+	}
+
+	#[test]
+	fn minimap_command_forces_minimap_on() {
+		let (mut frontend, rx_cmd) = build_frontend();
+		let mut should_quit = false;
+		frontend.current_mode = EditorMode::Command;
+		frontend.command_buffer = "minimap".to_string();
+
+		assert!(!frontend.handle_command_key(KeyCode::Enter, KeyModifiers::NONE, &mut should_quit));
+
+		assert!(matches!(
+			rx_cmd.try_recv().expect(":minimap should send a command"),
+			EditorCommand::SetMinimap(true)
+		));
+	}
+
+	#[test]
+	fn nominimap_command_forces_minimap_off() {
+		let (mut frontend, rx_cmd) = build_frontend();
+		let mut should_quit = false;
+		frontend.current_mode = EditorMode::Command;
+		frontend.command_buffer = "nominimap".to_string();
+
+		assert!(!frontend.handle_command_key(KeyCode::Enter, KeyModifiers::NONE, &mut should_quit));
+
+		assert!(matches!(
+			rx_cmd.try_recv().expect(":nominimap should send a command"),
+			EditorCommand::SetMinimap(false)
 		));
 	}
 }

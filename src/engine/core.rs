@@ -17,7 +17,7 @@ use crate::svp::{RequestPriority, SvpPointer, SvpResolver, ingest_svp_file};
 use crate::uast::{
 	NodeByteTarget, NodeCursorTarget, RootChildLineIndex, UastMutation, UastProjection, Viewport,
 };
-use crate::ui::{Theme, settings::persist_theme_name};
+use crate::ui::{Theme, settings::persist_ui_settings};
 use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
@@ -31,13 +31,16 @@ use std::sync::mpsc;
 
 use super::folding::{
 	clamp_cursor_line_to_viewport, doc_line_for_visual_index, max_visual_line_index,
-	pan_scroll_y_to_keep_cursor_visible, resolve_fold_boundary_at_cursor, reveal_line_col_target,
-	scroll_viewport, set_subtree_fold_state, snap_line_to_visible_boundary,
-	subtree_has_folded_boundaries, unfold_ancestor_chain, visual_line_index_for_doc_line,
+	pan_scroll_y_to_keep_cursor_visible, resolve_fold_boundary_at_cursor,
+	reveal_line_col_target_with_root_line_index, scroll_viewport, set_subtree_fold_state,
+	snap_line_to_visible_boundary, subtree_has_folded_boundaries, unfold_ancestor_chain,
+	visual_line_index_for_doc_line,
 };
 use super::layout::{
-	ViewportAnchor, clamp_cursor_to_viewport_anchor, collect_visible_rows, cursor_view_metrics,
-	pan_viewport_anchor_to_keep_cursor_visible, scroll_viewport_anchor, viewport_geometry,
+	ViewportAnchor, clamp_cursor_to_viewport_anchor, collect_visible_rows_with_root_line_index,
+	cursor_view_metrics_with_root_line_index,
+	pan_viewport_anchor_to_keep_cursor_visible_with_root_line_index, scroll_viewport_anchor,
+	viewport_geometry_for_viewport,
 };
 #[cfg(test)]
 use super::minimap::MINIMAP_BANDS;
@@ -123,6 +126,7 @@ pub enum EditorCommand {
 	OpenAllFolds,
 	ToggleWrap,
 	SetWrap(bool),
+	SetMinimap(bool),
 	MoveCursor(MoveDirection),
 	MatchDelimiter,
 	ClickCursor(CursorPosition),
@@ -1058,7 +1062,13 @@ fn place_cursor_at_line_col_with_root_line_index(
 	cursor_abs_col: &mut VisualCol,
 ) {
 	let target = if reveal_hidden {
-		reveal_line_col_target(registry, root, target_line, target_col)
+		reveal_line_col_target_with_root_line_index(
+			registry,
+			root,
+			target_line,
+			target_col,
+			line_index,
+		)
 	} else if let Some(line_index) = line_index {
 		registry.find_node_at_line_col_with_root_line_index(
 			root,
@@ -1700,6 +1710,8 @@ pub struct Engine {
 	tx_view: mpsc::Sender<Viewport>,
 	reactor: SemanticReactor,
 	initial_theme_name: String,
+	initial_minimap_enabled: bool,
+	initial_wrap_enabled: bool,
 	settings_path: Option<PathBuf>,
 	startup_status: Option<String>,
 }
@@ -1712,6 +1724,8 @@ impl Engine {
 		tx_cmd: mpsc::Sender<EditorCommand>,
 		tx_view: mpsc::Sender<Viewport>,
 		initial_theme_name: String,
+		initial_minimap_enabled: bool,
+		initial_wrap_enabled: bool,
 		settings_path: Option<PathBuf>,
 		startup_status: Option<String>,
 	) -> Self {
@@ -1724,6 +1738,8 @@ impl Engine {
 			tx_view,
 			reactor,
 			initial_theme_name,
+			initial_minimap_enabled,
+			initial_wrap_enabled,
 			settings_path,
 			startup_status,
 		}
@@ -1737,6 +1753,8 @@ impl Engine {
 		let tx_view = self.tx_view;
 		let reactor = self.reactor;
 		let initial_theme_name = self.initial_theme_name;
+		let initial_minimap_enabled = self.initial_minimap_enabled;
+		let initial_wrap_enabled = self.initial_wrap_enabled;
 		let settings_path = self.settings_path;
 		let startup_status = self.startup_status;
 		let mut semantic_highlights: Vec<HighlightSpan> = Vec::new();
@@ -1759,9 +1777,13 @@ impl Engine {
 		let mut scroll_row_offset = 0u32;
 		let mut viewport_width = 80u16;
 		let mut viewport_lines: u32 = 50;
-		let mut wrap_enabled = true;
-		let mut current_theme = Theme::try_new(&initial_theme_name)
-			.unwrap_or_else(|_| Theme::try_new("onedark").unwrap());
+		let mut wrap_enabled = initial_wrap_enabled;
+		let (mut current_theme_name, mut current_theme) = match Theme::try_new(&initial_theme_name)
+		{
+			Ok(theme) => (initial_theme_name, theme),
+			Err(_) => ("onedark".to_string(), Theme::try_new("onedark").unwrap()),
+		};
+		let mut minimap_enabled = initial_minimap_enabled;
 		let mut root_id: Option<NodeId> = None;
 		let mut file_path: Option<String> = None;
 
@@ -2541,7 +2563,13 @@ impl Engine {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
 						if wrap_enabled {
-							let geometry = viewport_geometry(total, viewport_width, true);
+							let geometry = viewport_geometry_for_viewport(
+								DocLine::new(scroll_y),
+								viewport_lines,
+								total,
+								viewport_width,
+								minimap_enabled,
+							);
 							let anchor = scroll_viewport_anchor(
 								&registry,
 								rid,
@@ -2680,11 +2708,27 @@ impl Engine {
 					if !wrap_enabled {
 						scroll_row_offset = 0;
 					}
-					status_message = Some(if wrap_enabled {
-						"Wrap enabled".to_string()
-					} else {
-						"Wrap disabled".to_string()
-					});
+					match persist_ui_settings(
+						settings_path.as_deref(),
+						&current_theme_name,
+						minimap_enabled,
+						wrap_enabled,
+					) {
+						Ok(()) => {
+							status_message = Some(if wrap_enabled {
+								"Wrap enabled".to_string()
+							} else {
+								"Wrap disabled".to_string()
+							});
+						}
+						Err(err) => {
+							status_message = Some(format!(
+								"Wrap {} (settings not saved: {})",
+								if wrap_enabled { "enabled" } else { "disabled" },
+								err
+							));
+						}
+					}
 					needs_render = true;
 				}
 				EditorCommand::SetWrap(enabled) => {
@@ -2692,11 +2736,60 @@ impl Engine {
 					if !wrap_enabled {
 						scroll_row_offset = 0;
 					}
-					status_message = Some(if wrap_enabled {
-						"Wrap enabled".to_string()
-					} else {
-						"Wrap disabled".to_string()
-					});
+					match persist_ui_settings(
+						settings_path.as_deref(),
+						&current_theme_name,
+						minimap_enabled,
+						wrap_enabled,
+					) {
+						Ok(()) => {
+							status_message = Some(if wrap_enabled {
+								"Wrap enabled".to_string()
+							} else {
+								"Wrap disabled".to_string()
+							});
+						}
+						Err(err) => {
+							status_message = Some(format!(
+								"Wrap {} (settings not saved: {})",
+								if wrap_enabled { "enabled" } else { "disabled" },
+								err
+							));
+						}
+					}
+					needs_render = true;
+				}
+				EditorCommand::SetMinimap(enabled) => {
+					minimap_enabled = enabled;
+					cached_minimap = None;
+					last_minimap_state = None;
+					last_minimap_total_lines = u32::MAX;
+					last_minimap_path = None;
+					match persist_ui_settings(
+						settings_path.as_deref(),
+						&current_theme_name,
+						minimap_enabled,
+						wrap_enabled,
+					) {
+						Ok(()) => {
+							status_message = Some(if minimap_enabled {
+								"Minimap enabled".to_string()
+							} else {
+								"Minimap disabled".to_string()
+							});
+						}
+						Err(err) => {
+							status_message = Some(format!(
+								"Minimap {} (settings not saved: {})",
+								if minimap_enabled {
+									"enabled"
+								} else {
+									"disabled"
+								},
+								err
+							));
+						}
+					}
 					needs_render = true;
 				}
 				EditorCommand::ClickCursor(target_pos) => {
@@ -2883,11 +2976,17 @@ impl Engine {
 					match Theme::try_new(&name) {
 						Ok(theme) => {
 							current_theme = theme;
+							current_theme_name = name.clone();
 							cached_minimap = None;
 							last_minimap_state = None;
 							last_minimap_total_lines = u32::MAX;
 							last_minimap_path = None;
-							match persist_theme_name(settings_path.as_deref(), &name) {
+							match persist_ui_settings(
+								settings_path.as_deref(),
+								&current_theme_name,
+								minimap_enabled,
+								wrap_enabled,
+							) {
 								Ok(()) => {
 									status_message = Some(format!("Theme set to {}", name));
 								}
@@ -3565,9 +3664,15 @@ impl Engine {
 			}
 
 			if needs_render {
-				let (virtual_tokens, tokens, total_lines, viewport_anchor) = if let Some(rid) =
-					root_id
-				{
+				let (
+					virtual_tokens,
+					tokens,
+					total_lines,
+					viewport_anchor,
+					visible_rows,
+					cursor_visual_row,
+					cursor_screen_col,
+				) = if let Some(rid) = root_id {
 					let total_lines = registry.get_total_newlines(rid);
 					let line_index = root_child_line_index(
 						&mut cached_root_line_index,
@@ -3575,24 +3680,48 @@ impl Engine {
 						rid,
 						ledger.current_state_id,
 					);
-					let geometry = viewport_geometry(total_lines, viewport_width, true);
+					let mut geometry = viewport_geometry_for_viewport(
+						DocLine::new(scroll_y),
+						viewport_lines,
+						total_lines,
+						viewport_width,
+						minimap_enabled,
+					);
 					let viewport_anchor = if wrap_enabled {
-						pan_viewport_anchor_to_keep_cursor_visible(
-							&registry,
-							rid,
-							ViewportAnchor {
-								line: DocLine::new(scroll_y),
-								row_offset: scroll_row_offset,
-							},
-							cursor_abs_line,
-							cursor_abs_col,
-							total_lines,
-							viewport_lines,
-							true,
-							geometry.text_width,
-						)
+						let mut anchor = ViewportAnchor {
+							line: DocLine::new(scroll_y),
+							row_offset: scroll_row_offset,
+						};
+						for _ in 0..3 {
+							anchor =
+								pan_viewport_anchor_to_keep_cursor_visible_with_root_line_index(
+									&registry,
+									rid,
+									anchor,
+									cursor_abs_line,
+									cursor_abs_col,
+									total_lines,
+									viewport_lines,
+									true,
+									geometry.text_width,
+									Some(line_index),
+									has_closed_folds,
+								);
+							let adjusted_geometry = viewport_geometry_for_viewport(
+								anchor.line,
+								viewport_lines,
+								total_lines,
+								viewport_width,
+								minimap_enabled,
+							);
+							if adjusted_geometry.gutter_width == geometry.gutter_width {
+								break;
+							}
+							geometry = adjusted_geometry;
+						}
+						anchor
 					} else {
-						ViewportAnchor {
+						let anchor = ViewportAnchor {
 							line: DocLine::new(pan_scroll_y_to_keep_cursor_visible(
 								&registry,
 								rid,
@@ -3602,7 +3731,15 @@ impl Engine {
 								viewport_lines,
 							)),
 							row_offset: 0,
-						}
+						};
+						geometry = viewport_geometry_for_viewport(
+							anchor.line,
+							viewport_lines,
+							total_lines,
+							viewport_width,
+							minimap_enabled,
+						);
+						anchor
 					};
 					scroll_row_offset = viewport_anchor.row_offset;
 					let scroll_line = viewport_anchor.line;
@@ -3625,6 +3762,31 @@ impl Engine {
 						Some(line_index),
 					);
 
+					let visible_rows = collect_visible_rows_with_root_line_index(
+						&registry,
+						rid,
+						viewport_anchor,
+						total_lines,
+						viewport_lines,
+						wrap_enabled,
+						geometry.text_width,
+						Some(line_index),
+						has_closed_folds,
+					);
+					let (cursor_visual_row, cursor_screen_col) =
+						cursor_view_metrics_with_root_line_index(
+							&registry,
+							rid,
+							viewport_anchor,
+							cursor_abs_line,
+							cursor_abs_col,
+							total_lines,
+							wrap_enabled,
+							geometry.text_width,
+							Some(line_index),
+							has_closed_folds,
+						);
+
 					for token in &visible_tokens {
 						if !token.is_virtual && token.text.is_empty() {
 							let idx = token.node_id.index();
@@ -3636,7 +3798,15 @@ impl Engine {
 						}
 					}
 
-					(virtual_tokens, visible_tokens, total_lines, viewport_anchor)
+					(
+						virtual_tokens,
+						visible_tokens,
+						total_lines,
+						viewport_anchor,
+						visible_rows,
+						cursor_visual_row,
+						cursor_screen_col,
+					)
 				} else {
 					scroll_row_offset = 0;
 					(
@@ -3647,6 +3817,9 @@ impl Engine {
 							line: DocLine::ZERO,
 							row_offset: 0,
 						},
+						Vec::new(),
+						0,
+						VisualCol::ZERO,
 					)
 				};
 
@@ -3758,28 +3931,39 @@ impl Engine {
 					global_start_byte = first_visible.absolute_start_byte;
 				}
 
-				let (cursor_abs_byte, cursor_line_start_byte, file_size) =
-					if let Some(rid) = root_id {
-						let cursor_abs_byte = registry.doc_byte_for_node_offset(
-							rid,
-							cursor_node,
-							NodeByteOffset::new(cursor_offset),
-						);
-						let line_start_target =
-							registry.find_node_at_line_col(rid, cursor_abs_line, VisualCol::ZERO);
-						let cursor_line_start_byte = registry.doc_byte_for_node_offset(
-							rid,
-							line_start_target.node_id,
-							line_start_target.node_byte,
-						);
-						(
-							cursor_abs_byte,
-							cursor_line_start_byte,
-							registry.get_total_bytes(rid),
-						)
-					} else {
-						(DocByte::ZERO, DocByte::ZERO, 0)
-					};
+				let (cursor_abs_byte, cursor_line_start_byte, file_size) = if let Some(rid) =
+					root_id
+				{
+					let cursor_abs_byte = registry.doc_byte_for_node_offset(
+						rid,
+						cursor_node,
+						NodeByteOffset::new(cursor_offset),
+					);
+					let line_index = root_child_line_index(
+						&mut cached_root_line_index,
+						&registry,
+						rid,
+						ledger.current_state_id,
+					);
+					let line_start_target = registry.find_node_at_line_col_with_root_line_index(
+						rid,
+						cursor_abs_line,
+						VisualCol::ZERO,
+						line_index,
+					);
+					let cursor_line_start_byte = registry.doc_byte_for_node_offset(
+						rid,
+						line_start_target.node_id,
+						line_start_target.node_byte,
+					);
+					(
+						cursor_abs_byte,
+						cursor_line_start_byte,
+						registry.get_total_bytes(rid),
+					)
+				} else {
+					(DocByte::ZERO, DocByte::ZERO, 0)
+				};
 				let selection_ranges = match (active_visual, root_id) {
 					(Some((anchor, kind)), Some(rid)) => {
 						resolve_visual_ranges_sparse(&registry, rid, anchor, cursor_abs_byte, kind)
@@ -3789,20 +3973,6 @@ impl Engine {
 				};
 				let viewport_start_line = viewport_anchor.line;
 				scroll_y = viewport_start_line.get();
-				let geometry = viewport_geometry(total_lines, viewport_width, root_id.is_some());
-				let visible_rows = if let Some(rid) = root_id {
-					collect_visible_rows(
-						&registry,
-						rid,
-						viewport_anchor,
-						total_lines,
-						viewport_lines,
-						wrap_enabled,
-						geometry.text_width,
-					)
-				} else {
-					Vec::new()
-				};
 				let mut visible_line_starts = Vec::new();
 				for row in &visible_rows {
 					if visible_line_starts.last().copied() != Some(row.line) {
@@ -3814,70 +3984,67 @@ impl Engine {
 					.map(|row| row.line)
 					.unwrap_or(viewport_start_line)
 					.saturating_add(1);
-				let (cursor_visual_row, cursor_screen_col) = if let Some(rid) = root_id {
-					cursor_view_metrics(
-						&registry,
-						rid,
-						viewport_anchor,
-						cursor_abs_line,
-						cursor_abs_col,
-						total_lines,
-						wrap_enabled,
-						geometry.text_width,
-					)
-				} else {
-					(0, VisualCol::ZERO)
-				};
-				let minimap = if let Some(rid) = root_id {
-					let overlay =
-						MinimapOverlay::new(viewport_start_line, viewport_lines, cursor_abs_line);
-					let path_changed = last_minimap_path.as_deref() != file_path.as_deref();
-					let state_changed = last_minimap_state != Some(ledger.current_state_id);
-					let total_lines_changed = last_minimap_total_lines != total_lines;
-					if cached_minimap.is_none()
-						|| path_changed || state_changed
-						|| total_lines_changed
-					{
-						cached_minimap =
-							Some(if file_size > 0 && file_size <= MAX_MINIMAP_TEXT_BYTES {
-								match read_document_snapshot(
-									&registry,
-									rid,
-									file_path.as_deref().map(Path::new),
-								) {
-									Ok(bytes) => build_text_minimap_snapshot(
-										&bytes,
-										&semantic_highlights,
-										overlay,
-									),
-									Err(_) => build_byte_fallback_minimap_snapshot(
-										&registry, rid, overlay,
-									),
-								}
-							} else {
-								build_byte_fallback_minimap_snapshot(&registry, rid, overlay)
-							});
-						last_minimap_state = Some(ledger.current_state_id);
-						last_minimap_total_lines = total_lines;
-						last_minimap_path = file_path.clone();
-					}
-
-					cached_minimap.as_ref().map(|snapshot| {
-						let mut snapshot = snapshot.clone();
-						let (search_bands, active_search_band) = build_search_minimap_bands(
-							&search_matches,
-							search_match_index,
-							total_lines,
+				let minimap = if minimap_enabled {
+					if let Some(rid) = root_id {
+						let overlay = MinimapOverlay::new(
+							viewport_start_line,
+							viewport_lines,
+							cursor_abs_line,
 						);
-						let overlay = snapshot.overlay_mut();
-						overlay.viewport_start_line = viewport_start_line;
-						overlay.viewport_end_line = viewport_end_line;
-						overlay.viewport_line_count = viewport_lines;
-						overlay.cursor_line = cursor_abs_line;
-						overlay.search_bands = search_bands;
-						overlay.active_search_band = active_search_band;
-						snapshot
-					})
+						let path_changed = last_minimap_path.as_deref() != file_path.as_deref();
+						let state_changed = last_minimap_state != Some(ledger.current_state_id);
+						let total_lines_changed = last_minimap_total_lines != total_lines;
+						if cached_minimap.is_none()
+							|| path_changed || state_changed
+							|| total_lines_changed
+						{
+							cached_minimap =
+								Some(if file_size > 0 && file_size <= MAX_MINIMAP_TEXT_BYTES {
+									match read_document_snapshot(
+										&registry,
+										rid,
+										file_path.as_deref().map(Path::new),
+									) {
+										Ok(bytes) => build_text_minimap_snapshot(
+											&bytes,
+											&semantic_highlights,
+											overlay,
+										),
+										Err(_) => build_byte_fallback_minimap_snapshot(
+											&registry, rid, overlay,
+										),
+									}
+								} else {
+									build_byte_fallback_minimap_snapshot(&registry, rid, overlay)
+								});
+							last_minimap_state = Some(ledger.current_state_id);
+							last_minimap_total_lines = total_lines;
+							last_minimap_path = file_path.clone();
+						}
+
+						cached_minimap.as_ref().map(|snapshot| {
+							let mut snapshot = snapshot.clone();
+							let (search_bands, active_search_band) = build_search_minimap_bands(
+								&search_matches,
+								search_match_index,
+								total_lines,
+							);
+							let overlay = snapshot.overlay_mut();
+							overlay.viewport_start_line = viewport_start_line;
+							overlay.viewport_end_line = viewport_end_line;
+							overlay.viewport_line_count = viewport_lines;
+							overlay.cursor_line = cursor_abs_line;
+							overlay.search_bands = search_bands;
+							overlay.active_search_band = active_search_band;
+							snapshot
+						})
+					} else {
+						cached_minimap = None;
+						last_minimap_state = None;
+						last_minimap_total_lines = u32::MAX;
+						last_minimap_path = None;
+						None
+					}
 				} else {
 					cached_minimap = None;
 					last_minimap_state = None;
@@ -3965,33 +4132,36 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch, VisualKind, apply_deltas_to_document,
-		apply_deltas_to_document_internal, build_search_minimap_bands,
+		EditorCommand, Engine, FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch, VisualKind,
+		apply_deltas_to_document, apply_deltas_to_document_internal, build_search_minimap_bands,
 		clamp_cursor_line_to_viewport, delete_char_delta_at_cursor, delete_line_delta_sparse,
 		delete_to_line_end_delta, doc_line_for_visual_index, document_rewrite_delta,
 		find_matching_delimiter_byte, first_non_whitespace_visual_col,
 		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion,
 		materialize_fold_boundary_at_cursor, nearest_foldable_boundary, next_word_end,
 		next_word_start, pan_scroll_y_to_keep_cursor_visible, place_cursor_at_line_col,
-		prev_word_start, read_document_snapshot, rebase_diagnostics_after_delta,
-		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
-		resolve_fold_boundary_at_cursor, resolve_visual_ranges, root_child_line_index,
-		save_document_atomic, scroll_viewport, set_subtree_fold_state, smart_home_visual_col,
-		step_left_visual_col, step_right_visual_col, visual_line_index_for_doc_line,
-		word_object_delta_at_cursor,
+		place_cursor_at_line_col_with_root_line_index, prev_word_start, read_document_snapshot,
+		rebase_diagnostics_after_delta, rebase_semantic_highlights_after_delta,
+		rebind_document_spans_to_saved_file, resolve_fold_boundary_at_cursor,
+		resolve_visual_ranges, root_child_line_index, save_document_atomic, scroll_viewport,
+		set_subtree_fold_state, smart_home_visual_col, step_left_visual_col, step_right_visual_col,
+		visual_line_index_for_doc_line, word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, NodeByteOffset, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
 	use crate::engine::undo::{TextDelta, UndoLedger, byte_offset_from_line_col};
 	use crate::svp::SvpPointer;
+	use crate::svp::SvpResolver;
 	use crate::svp::diagnostic::{DiagnosticSeverity, DiagnosticSpan};
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
-	use crate::uast::UastProjection;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
+	use crate::uast::{UastProjection, Viewport};
 	use std::path::PathBuf;
 	use std::sync::atomic::Ordering;
-	use std::time::{SystemTime, UNIX_EPOCH};
+	use std::sync::{Arc, mpsc};
+	use std::thread;
+	use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 	fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
 		let registry = UastRegistry::new(32);
@@ -4195,6 +4365,100 @@ mod tests {
 			.expect("time should move forward")
 			.as_nanos();
 		std::env::temp_dir().join(format!("baryon-{}-{}-{}", name, std::process::id(), nanos))
+	}
+
+	fn build_exact_metric_physical_document(
+		chunks: &[&str],
+	) -> (UastRegistry, crate::ecs::NodeId, PathBuf) {
+		let path = temp_test_path("core-exact-metric-physical");
+		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
+		let mut chunk = registry
+			.reserve_chunk((chunks.len() + 1) as u32)
+			.expect("OOM");
+		let total_len = chunks.iter().map(|part| part.len() as u32).sum();
+		let total_newlines = chunks
+			.iter()
+			.map(|part| part.bytes().filter(|&b| b == b'\n').count() as u32)
+			.sum();
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: total_len,
+				newlines: total_newlines,
+			},
+		);
+
+		let mut byte_offset = 0u64;
+		for part in chunks {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				Some(SvpPointer {
+					lba: byte_offset / 512,
+					byte_length: part.len() as u32,
+					device_id: 78,
+					head_trim: (byte_offset % 512) as u16,
+				}),
+				SpanMetrics {
+					byte_length: part.len() as u32,
+					newlines: part.bytes().filter(|&b| b == b'\n').count() as u32,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			byte_offset += part.len() as u64;
+		}
+
+		std::fs::write(&path, chunks.concat()).expect("write temp file");
+		registry.register_device_path(78, path.to_str().expect("utf8 path"));
+		(registry, root, path)
+	}
+
+	fn inflated_leaf_count(registry: &UastRegistry, root: crate::ecs::NodeId) -> usize {
+		let mut count = 0usize;
+		let mut leaf = registry.get_first_child(root);
+		while let Some(node) = leaf {
+			if registry.metrics_inflated[node.index()].load(Ordering::Acquire) {
+				count += 1;
+			}
+			leaf = registry.get_next_sibling(node);
+		}
+		count
+	}
+
+	fn spawn_test_engine(
+		initial_minimap_enabled: bool,
+		initial_wrap_enabled: bool,
+		settings_path: Option<PathBuf>,
+	) -> (
+		mpsc::Sender<EditorCommand>,
+		mpsc::Receiver<Viewport>,
+		thread::JoinHandle<()>,
+	) {
+		let (tx_cmd, rx_cmd) = mpsc::channel::<EditorCommand>();
+		let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+		let (tx_io_notify, _rx_io_notify) = mpsc::channel::<()>();
+		let registry = Arc::new(UastRegistry::new(1_000_000));
+		let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
+		let engine = Engine::new(
+			registry,
+			resolver,
+			rx_cmd,
+			tx_cmd.clone(),
+			tx_view,
+			"onedark".to_string(),
+			initial_minimap_enabled,
+			initial_wrap_enabled,
+			settings_path,
+			None,
+		);
+		let handle = thread::spawn(move || engine.run());
+		(tx_cmd, rx_view, handle)
+	}
+
+	fn recv_view(rx_view: &mpsc::Receiver<Viewport>) -> Viewport {
+		rx_view
+			.recv_timeout(Duration::from_secs(2))
+			.expect("expected viewport update")
 	}
 
 	fn build_mixed_save_document() -> (UastRegistry, crate::ecs::NodeId) {
@@ -4716,6 +4980,82 @@ mod tests {
 	}
 
 	#[test]
+	fn set_minimap_command_disables_view_minimap_and_persists_setting() {
+		let settings_path = temp_test_path("minimap-settings");
+		let scratch_path = temp_test_path("scratch-buffer");
+		let scratch_name = scratch_path.to_string_lossy().to_string();
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(true, true, Some(settings_path.clone()));
+
+		tx_cmd
+			.send(EditorCommand::LoadFile(scratch_name.clone()))
+			.expect("load scratch buffer");
+		let initial_view = recv_view(&rx_view);
+		assert_eq!(
+			initial_view.file_name.as_deref(),
+			Some(scratch_name.as_str())
+		);
+		assert!(initial_view.minimap.is_some());
+
+		tx_cmd
+			.send(EditorCommand::SetMinimap(false))
+			.expect("disable minimap");
+		let disabled_view = recv_view(&rx_view);
+		assert_eq!(
+			disabled_view.file_name.as_deref(),
+			Some(scratch_name.as_str())
+		);
+		assert!(disabled_view.minimap.is_none());
+
+		let written = std::fs::read_to_string(&settings_path).expect("read settings");
+		assert_eq!(
+			written,
+			"[ui]\ntheme = \"onedark\"\nminimap = false\nwrap = true\n"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("join engine");
+		let _ = std::fs::remove_file(settings_path);
+	}
+
+	#[test]
+	fn set_wrap_command_disables_view_wrap_and_persists_setting() {
+		let settings_path = temp_test_path("wrap-settings");
+		let scratch_path = temp_test_path("wrap-scratch-buffer");
+		let scratch_name = scratch_path.to_string_lossy().to_string();
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(true, true, Some(settings_path.clone()));
+
+		tx_cmd
+			.send(EditorCommand::LoadFile(scratch_name.clone()))
+			.expect("load scratch buffer");
+		let initial_view = recv_view(&rx_view);
+		assert_eq!(
+			initial_view.file_name.as_deref(),
+			Some(scratch_name.as_str())
+		);
+		assert!(initial_view.wrap_enabled);
+
+		tx_cmd
+			.send(EditorCommand::SetWrap(false))
+			.expect("disable wrap");
+		let disabled_view = recv_view(&rx_view);
+		assert_eq!(
+			disabled_view.file_name.as_deref(),
+			Some(scratch_name.as_str())
+		);
+		assert!(!disabled_view.wrap_enabled);
+
+		let written = std::fs::read_to_string(&settings_path).expect("read settings");
+		assert_eq!(
+			written,
+			"[ui]\ntheme = \"onedark\"\nminimap = true\nwrap = false\n"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("join engine");
+		let _ = std::fs::remove_file(settings_path);
+	}
+
+	#[test]
 	fn materialize_fold_boundary_builds_nested_block_inside_single_leaf_document() {
 		let (registry, root) = build_document(
 			"fn main() {\n    if true {\n        alpha();\n        beta();\n    }\n    gamma();\n}\n",
@@ -5219,6 +5559,42 @@ mod tests {
 		assert!(!registry.is_folded[fold.index()].load(Ordering::Acquire));
 		assert_eq!(cursor_abs_line, DocLine::new(3));
 		assert_ne!(cursor_node, fold);
+	}
+
+	#[test]
+	fn indexed_reveal_line_lookup_near_eof_avoids_inflating_prefix_leaves() {
+		let chunk_count = 128usize;
+		let mut chunks = vec!["x\n"; chunk_count];
+		chunks[chunk_count - 1] = "x";
+		let (registry, root, path) = build_exact_metric_physical_document(&chunks);
+		let line_index = registry.build_root_child_line_index(root);
+		let target_line = DocLine::new((chunk_count - 2) as u32);
+		let mut cursor_node = registry.get_first_child(root).expect("first leaf");
+		let mut cursor_offset = 0;
+		let mut cursor_abs_line = DocLine::ZERO;
+		let mut cursor_abs_col = VisualCol::ZERO;
+
+		place_cursor_at_line_col_with_root_line_index(
+			&registry,
+			root,
+			target_line,
+			VisualCol::ZERO,
+			Some(&line_index),
+			true,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+		);
+
+		assert_eq!(cursor_abs_line, target_line);
+		assert_eq!(cursor_node.index(), chunk_count - 1);
+		assert!(
+			inflated_leaf_count(&registry, root) <= 2,
+			"indexed reveal lookup should only inflate the target chunk and, at most, one boundary predecessor"
+		);
+
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]

@@ -1,7 +1,7 @@
 use super::Frontend;
 use super::minimap::render_minimap_snapshot;
 use crate::core::TAB_SIZE;
-use crate::engine::{EditorMode, MinimapSnapshot, VisualKind, viewport_geometry};
+use crate::engine::{EditorMode, MinimapSnapshot, VisualKind, viewport_geometry_for_viewport};
 use crate::svp::diagnostic::DiagnosticSeverity;
 use crate::svp::projector::{DiagnosticProjector, HighlightProjector};
 use crate::uast::kind::SemanticKind;
@@ -162,6 +162,10 @@ fn status_right_text(
 	}
 }
 
+fn should_render_preview_snapshot_fallback(rendered_preview: bool, preview_pending: bool) -> bool {
+	!rendered_preview && !preview_pending
+}
+
 impl<B: Backend + io::Write> Frontend<B> {
 	pub(super) fn draw(&mut self) -> Result<(), B::Error> {
 		let current_viewport = &self.current_viewport;
@@ -189,8 +193,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 				{
 					let buf = f.buffer_mut();
 					if let Some(view) = current_viewport {
-						let geometry =
-							viewport_geometry(view.total_lines, max_width, view.minimap.is_some());
+						let geometry = viewport_geometry_for_viewport(
+							view.viewport_start_line,
+							view.viewport_line_count,
+							view.total_lines,
+							max_width,
+							view.minimap.is_some(),
+						);
 						let minimap_width = geometry.minimap_width;
 						let separator_width = geometry.separator_width;
 						let gutter_width = geometry.gutter_width;
@@ -589,7 +598,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 					match snapshot {
 						MinimapSnapshot::Preview(preview) => {
 							minimap.request_preview(preview, minimap_area, view.theme_colors);
-							if !minimap.render(f, minimap_area) {
+							let rendered_preview = minimap.render(f, minimap_area);
+							if should_render_preview_snapshot_fallback(
+								rendered_preview,
+								minimap.has_pending_preview(),
+							) {
 								let buf = f.buffer_mut();
 								render_minimap_snapshot(
 									buf,
@@ -828,7 +841,8 @@ impl<B: Backend + io::Write> Frontend<B> {
 mod tests {
 	use super::{
 		apply_diagnostic_style, cursor_gutter_line_number_style, folded_placeholder_style,
-		gutter_fill_style, gutter_line_number_style, status_right_text,
+		gutter_fill_style, gutter_line_number_style, should_render_preview_snapshot_fallback,
+		status_right_text,
 	};
 	use crate::core::DocLine;
 	use crate::svp::diagnostic::DiagnosticSeverity;
@@ -882,6 +896,13 @@ mod tests {
 			status_right_text(Some("3/9"), false, 1024, 4, 8),
 			"3/9 | NOWRAP | 1.0 KB | UTF-8 | 4:8 "
 		);
+	}
+
+	#[test]
+	fn preview_snapshot_fallback_waits_for_async_preview() {
+		assert!(!should_render_preview_snapshot_fallback(false, true));
+		assert!(should_render_preview_snapshot_fallback(false, false));
+		assert!(!should_render_preview_snapshot_fallback(true, true));
 	}
 }
 

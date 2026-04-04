@@ -1,6 +1,6 @@
 use super::Frontend;
 use crate::core::{CursorPosition, DocLine, VisualCol};
-use crate::engine::EditorCommand;
+use crate::engine::{EditorCommand, gutter_width_for_max_line, viewport_max_line_on_screen};
 use crossterm::event::{self, MouseButton, MouseEventKind};
 use ratatui::backend::Backend;
 use std::io;
@@ -29,8 +29,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 				if mouse.row >= render_line_count {
 					return;
 				}
-				let digits = view.total_lines.max(1).ilog10() + 1;
-				let gutter_width = digits as u16 + 1;
+				let gutter_width = gutter_width_for_max_line(viewport_max_line_on_screen(
+					view.viewport_start_line,
+					view.viewport_line_count,
+					view.total_lines,
+				));
 
 				let click_x = mouse.column;
 				let click_y = mouse.row;

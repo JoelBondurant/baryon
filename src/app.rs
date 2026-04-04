@@ -18,6 +18,8 @@ use std::thread;
 
 pub struct App {
 	initial_theme_name: String,
+	initial_minimap_enabled: bool,
+	initial_wrap_enabled: bool,
 	settings_path: Option<PathBuf>,
 	startup_status: Option<String>,
 }
@@ -26,6 +28,8 @@ impl App {
 	pub(crate) fn new(settings: LoadedSettings) -> Self {
 		Self {
 			initial_theme_name: settings.theme_name,
+			initial_minimap_enabled: settings.minimap_enabled,
+			initial_wrap_enabled: settings.wrap_enabled,
 			settings_path: settings.settings_path,
 			startup_status: settings.startup_status,
 		}
@@ -56,6 +60,8 @@ impl App {
 			tx_cmd.clone(),
 			tx_view,
 			self.initial_theme_name.clone(),
+			self.initial_minimap_enabled,
+			self.initial_wrap_enabled,
 			self.settings_path.clone(),
 			self.startup_status.clone(),
 		);

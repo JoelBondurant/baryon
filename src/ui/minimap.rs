@@ -140,6 +140,10 @@ impl MinimapController {
 		frame.render_widget(Image::new(protocol), area);
 		true
 	}
+
+	pub fn has_pending_preview(&self) -> bool {
+		self.pending_fingerprint.is_some()
+	}
 }
 
 fn render_preview_protocol(

@@ -4,10 +4,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_THEME_NAME: &str = "onedark";
+const DEFAULT_MINIMAP_ENABLED: bool = true;
+const DEFAULT_WRAP_ENABLED: bool = true;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParsedSettings {
+	theme_name: Option<String>,
+	minimap_enabled: Option<bool>,
+	wrap_enabled: Option<bool>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoadedSettings {
 	pub(crate) theme_name: String,
+	pub(crate) minimap_enabled: bool,
+	pub(crate) wrap_enabled: bool,
 	pub(crate) settings_path: Option<PathBuf>,
 	pub(crate) startup_status: Option<String>,
 }
@@ -20,6 +31,8 @@ fn load_settings_from_path(settings_path: Option<PathBuf>) -> LoadedSettings {
 	let Some(path) = settings_path.clone() else {
 		return LoadedSettings {
 			theme_name: DEFAULT_THEME_NAME.to_string(),
+			minimap_enabled: DEFAULT_MINIMAP_ENABLED,
+			wrap_enabled: DEFAULT_WRAP_ENABLED,
 			settings_path: None,
 			startup_status: None,
 		};
@@ -27,59 +40,90 @@ fn load_settings_from_path(settings_path: Option<PathBuf>) -> LoadedSettings {
 
 	match fs::read_to_string(&path) {
 		Ok(contents) => match parse_settings(&contents) {
-			Ok(Some(theme_name)) => {
-				if Theme::try_new(&theme_name).is_ok() {
-					LoadedSettings {
-						theme_name,
+			Ok(parsed) => {
+				let minimap_enabled = parsed.minimap_enabled.unwrap_or(DEFAULT_MINIMAP_ENABLED);
+				let wrap_enabled = parsed.wrap_enabled.unwrap_or(DEFAULT_WRAP_ENABLED);
+				match parsed.theme_name {
+					Some(theme_name) => {
+						if Theme::try_new(&theme_name).is_ok() {
+							LoadedSettings {
+								theme_name,
+								minimap_enabled,
+								wrap_enabled,
+								settings_path: Some(path),
+								startup_status: None,
+							}
+						} else {
+							LoadedSettings {
+								theme_name: DEFAULT_THEME_NAME.to_string(),
+								minimap_enabled,
+								wrap_enabled,
+								settings_path: Some(path),
+								startup_status: Some(format!(
+									"Invalid theme in settings.toml; using {}",
+									DEFAULT_THEME_NAME
+								)),
+							}
+						}
+					}
+					None => LoadedSettings {
+						theme_name: DEFAULT_THEME_NAME.to_string(),
+						minimap_enabled,
+						wrap_enabled,
 						settings_path: Some(path),
 						startup_status: None,
-					}
-				} else {
-					LoadedSettings {
-						theme_name: DEFAULT_THEME_NAME.to_string(),
-						settings_path: Some(path),
-						startup_status: Some(format!(
-							"Invalid theme in settings.toml; using {}",
-							DEFAULT_THEME_NAME
-						)),
-					}
+					},
 				}
 			}
-			Ok(None) => LoadedSettings {
-				theme_name: DEFAULT_THEME_NAME.to_string(),
-				settings_path: Some(path),
-				startup_status: None,
-			},
 			Err(err) => LoadedSettings {
 				theme_name: DEFAULT_THEME_NAME.to_string(),
+				minimap_enabled: DEFAULT_MINIMAP_ENABLED,
+				wrap_enabled: DEFAULT_WRAP_ENABLED,
 				settings_path: Some(path),
 				startup_status: Some(format!("Settings error: {err}")),
 			},
 		},
 		Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadedSettings {
 			theme_name: DEFAULT_THEME_NAME.to_string(),
+			minimap_enabled: DEFAULT_MINIMAP_ENABLED,
+			wrap_enabled: DEFAULT_WRAP_ENABLED,
 			settings_path: Some(path),
 			startup_status: None,
 		},
 		Err(err) => LoadedSettings {
 			theme_name: DEFAULT_THEME_NAME.to_string(),
+			minimap_enabled: DEFAULT_MINIMAP_ENABLED,
+			wrap_enabled: DEFAULT_WRAP_ENABLED,
 			settings_path: Some(path),
 			startup_status: Some(format!("Settings error: {err}")),
 		},
 	}
 }
 
-pub(crate) fn persist_theme_name(settings_path: Option<&Path>, theme_name: &str) -> Result<(), String> {
+pub(crate) fn persist_ui_settings(
+	settings_path: Option<&Path>,
+	theme_name: &str,
+	minimap_enabled: bool,
+	wrap_enabled: bool,
+) -> Result<(), String> {
 	let path = settings_path.ok_or_else(|| "No config directory available".to_string())?;
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
 	}
-	fs::write(path, render_settings(theme_name))
-		.map_err(|e| format!("Failed to write settings.toml: {e}"))
+	fs::write(
+		path,
+		render_settings(theme_name, minimap_enabled, wrap_enabled),
+	)
+	.map_err(|e| format!("Failed to write settings.toml: {e}"))
 }
 
-fn render_settings(theme_name: &str) -> String {
-	format!("[ui]\ntheme = \"{}\"\n", escape_toml_string(theme_name))
+fn render_settings(theme_name: &str, minimap_enabled: bool, wrap_enabled: bool) -> String {
+	format!(
+		"[ui]\ntheme = \"{}\"\nminimap = {}\nwrap = {}\n",
+		escape_toml_string(theme_name),
+		if minimap_enabled { "true" } else { "false" },
+		if wrap_enabled { "true" } else { "false" }
+	)
 }
 
 fn default_settings_path() -> Option<PathBuf> {
@@ -98,9 +142,9 @@ fn default_settings_path_from_env(
 		.map(|home| home.join(".config").join("baryon").join("settings.toml"))
 }
 
-fn parse_settings(contents: &str) -> Result<Option<String>, String> {
+fn parse_settings(contents: &str) -> Result<ParsedSettings, String> {
 	let mut in_ui_section = false;
-	let mut theme_name = None;
+	let mut parsed = ParsedSettings::default();
 
 	for (idx, raw_line) in contents.lines().enumerate() {
 		let line_no = idx + 1;
@@ -125,14 +169,21 @@ fn parse_settings(contents: &str) -> Result<Option<String>, String> {
 		let Some((key, value)) = line.split_once('=') else {
 			return Err(format!("line {line_no}: expected key = value"));
 		};
-		if key.trim() != "theme" {
-			continue;
+		match key.trim() {
+			"theme" => {
+				parsed.theme_name = Some(parse_toml_string(value.trim(), line_no)?);
+			}
+			"minimap" => {
+				parsed.minimap_enabled = Some(parse_toml_bool(value.trim(), line_no)?);
+			}
+			"wrap" => {
+				parsed.wrap_enabled = Some(parse_toml_bool(value.trim(), line_no)?);
+			}
+			_ => {}
 		}
-
-		theme_name = Some(parse_toml_string(value.trim(), line_no)?);
 	}
 
-	Ok(theme_name)
+	Ok(parsed)
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -204,6 +255,14 @@ fn parse_toml_string(value: &str, line_no: usize) -> Result<String, String> {
 	Err(format!("line {line_no}: unterminated string"))
 }
 
+fn parse_toml_bool(value: &str, line_no: usize) -> Result<bool, String> {
+	match value {
+		"true" => Ok(true),
+		"false" => Ok(false),
+		_ => Err(format!("line {line_no}: minimap must be true or false")),
+	}
+}
+
 fn escape_toml_string(value: &str) -> String {
 	let mut escaped = String::with_capacity(value.len());
 	for ch in value.chars() {
@@ -222,9 +281,9 @@ fn escape_toml_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::{
-		DEFAULT_THEME_NAME, default_settings_path_from_env, load_settings_from_path,
-		parse_settings,
-		persist_theme_name,
+		DEFAULT_MINIMAP_ENABLED, DEFAULT_THEME_NAME, DEFAULT_WRAP_ENABLED,
+		default_settings_path_from_env, load_settings_from_path, parse_settings,
+		persist_ui_settings,
 	};
 	use std::ffi::OsString;
 	use std::path::PathBuf;
@@ -254,7 +313,10 @@ mod tests {
 	fn home_settings_path_is_used_when_xdg_is_missing() {
 		let path = default_settings_path_from_env(None, Some(OsString::from("/home/test")))
 			.expect("settings path");
-		assert_eq!(path, PathBuf::from("/home/test/.config/baryon/settings.toml"));
+		assert_eq!(
+			path,
+			PathBuf::from("/home/test/.config/baryon/settings.toml")
+		);
 	}
 
 	#[test]
@@ -264,10 +326,14 @@ mod tests {
 				# comment
 				[ui]
 				theme = "gruvbox" # trailing
+				minimap = false
+				wrap = false
 			"#,
 		)
 		.expect("parse settings");
-		assert_eq!(settings.as_deref(), Some("gruvbox"));
+		assert_eq!(settings.theme_name.as_deref(), Some("gruvbox"));
+		assert_eq!(settings.minimap_enabled, Some(false));
+		assert_eq!(settings.wrap_enabled, Some(false));
 	}
 
 	#[test]
@@ -277,23 +343,52 @@ mod tests {
 	}
 
 	#[test]
-	fn persist_theme_name_writes_canonical_toml() {
+	fn parse_settings_rejects_invalid_minimap_value() {
+		let err = parse_settings("[ui]\nminimap = maybe\n").expect_err("invalid parse");
+		assert!(err.contains("true or false"));
+	}
+
+	#[test]
+	fn persist_ui_settings_writes_canonical_toml() {
 		let path = temp_settings_path("persist");
-		persist_theme_name(Some(&path), "tokyonight").expect("persist settings");
+		persist_ui_settings(Some(&path), "tokyonight", false, false).expect("persist settings");
 		let written = std::fs::read_to_string(&path).expect("read settings");
-		assert_eq!(written, "[ui]\ntheme = \"tokyonight\"\n");
+		assert_eq!(
+			written,
+			"[ui]\ntheme = \"tokyonight\"\nminimap = false\nwrap = false\n"
+		);
 		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
-	fn load_settings_falls_back_on_invalid_theme_name() {
+	fn load_settings_falls_back_on_invalid_theme_name_and_keeps_preferences() {
 		let path = temp_settings_path("invalid");
-		persist_theme_name(Some(&path), "onedark").expect("write canonical settings");
-		std::fs::write(&path, "[ui]\ntheme = \"not-a-theme\"\n").expect("write invalid settings");
+		persist_ui_settings(Some(&path), "onedark", false, false)
+			.expect("write canonical settings");
+		std::fs::write(
+			&path,
+			"[ui]\ntheme = \"not-a-theme\"\nminimap = false\nwrap = false\n",
+		)
+		.expect("write invalid settings");
 
 		let loaded = load_settings_from_path(Some(path.clone()));
 		assert_eq!(loaded.theme_name, DEFAULT_THEME_NAME);
+		assert!(!loaded.minimap_enabled);
+		assert!(!loaded.wrap_enabled);
 		assert!(loaded.startup_status.is_some());
+
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn load_settings_defaults_bools_when_not_present() {
+		let path = temp_settings_path("default-bools");
+		std::fs::write(&path, "[ui]\ntheme = \"onedark\"\n").expect("write settings");
+
+		let loaded = load_settings_from_path(Some(path.clone()));
+		assert_eq!(loaded.theme_name, DEFAULT_THEME_NAME);
+		assert_eq!(loaded.minimap_enabled, DEFAULT_MINIMAP_ENABLED);
+		assert_eq!(loaded.wrap_enabled, DEFAULT_WRAP_ENABLED);
 
 		let _ = std::fs::remove_file(path);
 	}

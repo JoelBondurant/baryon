@@ -2,13 +2,13 @@ use super::support::{
 	first_non_whitespace_visual_col, line_byte_range, line_content_slice,
 	select_structural_token_at_offset,
 };
-use crate::core::{DocByte, DocLine, NodeByteOffset, VisualCol};
+use crate::core::{DocByte, DocLine, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::undo::line_col_from_byte_offset;
 use crate::uast::kind::SemanticKind;
 use crate::uast::metrics::SpanMetrics;
 use crate::uast::topology::TreeEdges;
-use crate::uast::{NodeCursorTarget, UastProjection};
+use crate::uast::{NodeCursorTarget, RootChildLineIndex, UastProjection};
 use ra_ap_syntax::{AstNode, Edition, SourceFile, SyntaxKind, TextSize};
 use std::sync::atomic::Ordering;
 
@@ -236,15 +236,34 @@ pub(crate) fn unfold_ancestor_chain(registry: &UastRegistry, node: NodeId) {
 	}
 }
 
-pub(crate) fn reveal_line_col_target(
+pub(crate) fn reveal_line_col_target_with_root_line_index(
 	registry: &UastRegistry,
 	root: NodeId,
 	target_line: DocLine,
 	target_col: VisualCol,
+	line_index: Option<&RootChildLineIndex>,
 ) -> NodeCursorTarget {
-	let raw_target = registry.find_node_at_line_col_raw(root, target_line, target_col);
+	let raw_target = if let Some(line_index) = line_index {
+		registry.find_node_at_line_col_raw_with_root_line_index(
+			root,
+			target_line,
+			target_col,
+			line_index,
+		)
+	} else {
+		registry.find_node_at_line_col_raw(root, target_line, target_col)
+	};
 	unfold_ancestor_chain(registry, raw_target.node_id);
-	registry.find_node_at_line_col(root, target_line, target_col)
+	if let Some(line_index) = line_index {
+		registry.find_node_at_line_col_with_root_line_index(
+			root,
+			target_line,
+			target_col,
+			line_index,
+		)
+	} else {
+		registry.find_node_at_line_col(root, target_line, target_col)
+	}
 }
 
 fn count_newlines(bytes: &[u8]) -> u32 {
@@ -543,22 +562,35 @@ struct SyntheticFoldPlan {
 
 fn collect_parent_child_bytes(
 	registry: &UastRegistry,
-	root: NodeId,
 	parent: NodeId,
 ) -> Result<Vec<MaterializeNodeSlice>, String> {
+	fn read_subtree_bytes_sync(registry: &UastRegistry, node: NodeId) -> Result<Vec<u8>, String> {
+		let idx = node.index();
+		let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
+		if !has_children {
+			return registry
+				.read_node_bytes_sync(node)
+				.map_err(|err| err.to_string());
+		}
+
+		let byte_length = unsafe { (*registry.metrics[idx].get()).byte_length as usize };
+		let mut bytes = Vec::with_capacity(byte_length);
+		let mut child = registry.get_first_child(node);
+		while let Some(current) = child {
+			bytes.extend_from_slice(&read_subtree_bytes_sync(registry, current)?);
+			child = registry.get_next_sibling(current);
+		}
+		Ok(bytes)
+	}
+
 	let Some(mut child) = registry.get_first_child(parent) else {
 		return Ok(Vec::new());
 	};
-	let mut absolute_start = registry.doc_byte_for_node_offset(root, child, NodeByteOffset::ZERO);
 	let mut offset = 0usize;
 	let mut slices = Vec::new();
 
 	loop {
-		let byte_len = registry.get_total_bytes(child);
-		let absolute_end = absolute_start.saturating_add(byte_len);
-		let bytes = registry
-			.read_loaded_slice(root, absolute_start, absolute_end)
-			.map_err(|msg| msg.to_string())?;
+		let bytes = read_subtree_bytes_sync(registry, child)?;
 		let start = offset;
 		offset += bytes.len();
 		slices.push(MaterializeNodeSlice {
@@ -572,7 +604,6 @@ fn collect_parent_child_bytes(
 			break;
 		};
 		child = next;
-		absolute_start = absolute_end;
 	}
 
 	Ok(slices)
@@ -776,7 +807,7 @@ fn preview_synthetic_fold_plan_at_cursor(
 ) -> Option<SyntheticFoldPlan> {
 	let target = registry.find_node_at_line_col_raw(root, cursor_line, cursor_col);
 	let parent = unsafe { (*registry.edges[target.node_id.index()].get()).parent }?;
-	let slices = collect_parent_child_bytes(registry, root, parent).ok()?;
+	let slices = collect_parent_child_bytes(registry, parent).ok()?;
 	let target_slice = slices.iter().find(|slice| slice.node == target.node_id)?;
 	let bytes: Vec<u8> = slices
 		.iter()
@@ -850,5 +881,106 @@ pub(crate) fn resolve_fold_boundary_at_cursor(
 		(Some(existing), None) => Some(existing),
 		(None, Some(plan)) => materialize_synthetic_fold_plan(registry, plan),
 		(None, None) => None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::materialize_fold_boundary_at_cursor;
+	use crate::core::{DocLine, VisualCol};
+	use crate::ecs::UastRegistry;
+	use crate::svp::pointer::SvpPointer;
+	use crate::svp::resolver::DMA_CHUNK_SIZE;
+	use crate::uast::kind::SemanticKind;
+	use crate::uast::metrics::SpanMetrics;
+	use std::fmt::Write as _;
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	fn temp_test_path(name: &str) -> std::path::PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("time should move forward")
+			.as_nanos();
+		std::env::temp_dir().join(format!("baryon-{}-{}-{}", name, std::process::id(), nanos))
+	}
+
+	fn build_source_backed_document(
+		text: &str,
+	) -> (UastRegistry, crate::ecs::NodeId, std::path::PathBuf) {
+		let path = temp_test_path("folding-source-backed");
+		let bytes = text.as_bytes();
+		let chunk_count = bytes.len().div_ceil(DMA_CHUNK_SIZE).max(1);
+		let newlines = bytes.iter().filter(|&&byte| byte == b'\n').count() as u32;
+		let registry = UastRegistry::new(chunk_count as u32 + 4);
+		let mut chunk = registry.reserve_chunk(chunk_count as u32 + 1).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: bytes.len() as u32,
+				newlines,
+			},
+		);
+
+		let mut byte_offset = 0usize;
+		for fragment in bytes.chunks(DMA_CHUNK_SIZE) {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				Some(SvpPointer {
+					lba: (byte_offset as u64) / 512,
+					byte_length: fragment.len() as u32,
+					device_id: 91,
+					head_trim: ((byte_offset as u64) % 512) as u16,
+				}),
+				SpanMetrics {
+					byte_length: fragment.len() as u32,
+					newlines: fragment.iter().filter(|&&byte| byte == b'\n').count() as u32,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			byte_offset += fragment.len();
+		}
+
+		std::fs::write(&path, bytes).expect("write temp file");
+		registry.register_device_path(91, path.to_str().expect("utf8 path"));
+		(registry, root, path)
+	}
+
+	#[test]
+	fn materialize_fold_boundary_works_for_multichunk_source_backed_rust_file() {
+		let filler_line = "// filler filler filler filler filler filler filler filler filler\n";
+		let filler_count = 3_000usize;
+		let mut text = String::with_capacity(filler_line.len() * filler_count + 256);
+		for _ in 0..filler_count {
+			text.push_str(filler_line);
+		}
+		text.push('\n');
+		let target_line = DocLine::new(filler_count as u32 + 1);
+		writeln!(
+			&mut text,
+			"fn target() {{\n    if cond {{\n        alpha();\n        beta();\n    }}\n}}"
+		)
+		.expect("append target function");
+
+		let (registry, root, path) = build_source_backed_document(&text);
+		let fold =
+			materialize_fold_boundary_at_cursor(&registry, root, target_line, VisualCol::ZERO)
+				.expect("source-backed multi-chunk function fold should materialize");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+		let folded_text = std::str::from_utf8(&folded_text).expect("folded text should be utf8");
+		let trimmed = folded_text.trim_start_matches(['\n', '\r']);
+		assert!(
+			trimmed.starts_with("fn target() {\n"),
+			"expected target function fold, got:\n{folded_text}"
+		);
+		assert!(folded_text.contains("alpha();"));
+		assert!(folded_text.contains("beta();"));
+
+		let _ = std::fs::remove_file(path);
 	}
 }

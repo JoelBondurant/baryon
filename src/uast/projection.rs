@@ -246,10 +246,9 @@ impl UastRegistry {
 					visual_col: VisualCol::ZERO,
 				}
 			} else {
-				let bytes = self.read_node_bytes_sync(node).unwrap_or_default();
 				NodeCursorTarget {
 					node_id: node,
-					node_byte: NodeByteOffset::new(bytes.len() as u32),
+					node_byte: NodeByteOffset::new(metrics.byte_length),
 					visual_col: VisualCol::ZERO,
 				}
 			});
@@ -371,6 +370,16 @@ impl UastRegistry {
 		target_col: VisualCol,
 	) -> NodeCursorTarget {
 		self.find_node_at_line_col_internal(root, target_line, target_col, false, None)
+	}
+
+	pub(crate) fn find_node_at_line_col_raw_with_root_line_index(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		target_col: VisualCol,
+		line_index: &RootChildLineIndex,
+	) -> NodeCursorTarget {
+		self.find_node_at_line_col_internal(root, target_line, target_col, false, Some(line_index))
 	}
 
 	pub(crate) fn find_node_at_line_col_with_root_line_index(
@@ -955,6 +964,59 @@ mod tests {
 		(registry, root)
 	}
 
+	fn build_exact_metric_physical_document(chunks: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
+		let mut chunk = registry
+			.reserve_chunk((chunks.len() + 1) as u32)
+			.expect("OOM");
+		let total_len = chunks.iter().map(|part| part.len() as u32).sum();
+		let total_newlines = chunks
+			.iter()
+			.map(|part| part.bytes().filter(|&b| b == b'\n').count() as u32)
+			.sum();
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: total_len,
+				newlines: total_newlines,
+			},
+		);
+
+		let mut byte_offset = 0u64;
+		for part in chunks {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				Some(SvpPointer {
+					lba: byte_offset / 512,
+					byte_length: part.len() as u32,
+					device_id: 77,
+					head_trim: (byte_offset % 512) as u16,
+				}),
+				SpanMetrics {
+					byte_length: part.len() as u32,
+					newlines: part.bytes().filter(|&b| b == b'\n').count() as u32,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			byte_offset += part.len() as u64;
+		}
+
+		(registry, root)
+	}
+
+	fn inflated_leaf_count(registry: &UastRegistry, root: crate::ecs::NodeId) -> usize {
+		let mut count = 0usize;
+		let mut leaf = registry.get_first_child(root);
+		while let Some(node) = leaf {
+			if registry.metrics_inflated[node.index()].load(Ordering::Acquire) {
+				count += 1;
+			}
+			leaf = registry.get_next_sibling(node);
+		}
+		count
+	}
+
 	fn visual_boundaries_for_line(text: &str) -> Vec<VisualCol> {
 		let mut boundaries = vec![VisualCol::ZERO];
 		let mut col = VisualCol::ZERO;
@@ -1270,6 +1332,36 @@ mod tests {
 		);
 		assert!(registry.metrics_inflated[first_leaf.index()].load(Ordering::Acquire));
 		assert!(registry.metrics_inflated[second_leaf.index()].load(Ordering::Acquire));
+
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn indexed_raw_line_lookup_near_eof_avoids_inflating_prefix_leaves() {
+		let path = temp_test_path("projection-indexed-raw");
+		let chunk_count = 128usize;
+		let mut chunks = vec!["x\n"; chunk_count];
+		chunks[chunk_count - 1] = "x";
+		let content = chunks.concat();
+		std::fs::write(&path, &content).expect("write temp file");
+
+		let (registry, root) = build_exact_metric_physical_document(&chunks);
+		registry.register_device_path(77, path.to_str().expect("utf8 path"));
+		let line_index = registry.build_root_child_line_index(root);
+		let target_line = DocLine::new((chunk_count - 2) as u32);
+
+		let target = registry.find_node_at_line_col_raw_with_root_line_index(
+			root,
+			target_line,
+			VisualCol::ZERO,
+			&line_index,
+		);
+
+		assert_eq!(target.node_id.index(), chunk_count - 1);
+		assert!(
+			inflated_leaf_count(&registry, root) <= 2,
+			"indexed raw lookup should only inflate the target chunk and, at most, one boundary predecessor"
+		);
 
 		let _ = std::fs::remove_file(path);
 	}

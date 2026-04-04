@@ -1,6 +1,6 @@
 use crate::core::{DocByte, DocLine, TAB_SIZE, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
-use crate::uast::UastProjection;
+use crate::uast::{RootChildLineIndex, UastProjection};
 use ra_ap_syntax::{Direction, Edition, SyntaxKind, SyntaxToken, TextSize};
 
 pub(crate) fn line_byte_range(
@@ -73,7 +73,25 @@ pub(crate) fn line_start_byte_sparse(
 	root: NodeId,
 	target_line: DocLine,
 ) -> DocByte {
-	let target = registry.find_node_at_line_col_raw(root, target_line, VisualCol::ZERO);
+	line_start_byte_sparse_with_root_line_index(registry, root, target_line, None)
+}
+
+pub(crate) fn line_start_byte_sparse_with_root_line_index(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	line_index: Option<&RootChildLineIndex>,
+) -> DocByte {
+	let target = if let Some(line_index) = line_index {
+		registry.find_node_at_line_col_raw_with_root_line_index(
+			root,
+			target_line,
+			VisualCol::ZERO,
+			line_index,
+		)
+	} else {
+		registry.find_node_at_line_col_raw(root, target_line, VisualCol::ZERO)
+	};
 	registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte)
 }
 
@@ -83,7 +101,26 @@ pub(crate) fn line_end_byte_sparse(
 	target_line: DocLine,
 	include_newline: bool,
 ) -> Result<DocByte, String> {
-	let line_start_target = registry.find_node_at_line_col_raw(root, target_line, VisualCol::ZERO);
+	line_end_byte_sparse_with_root_line_index(registry, root, target_line, include_newline, None)
+}
+
+pub(crate) fn line_end_byte_sparse_with_root_line_index(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	include_newline: bool,
+	line_index: Option<&RootChildLineIndex>,
+) -> Result<DocByte, String> {
+	let line_start_target = if let Some(line_index) = line_index {
+		registry.find_node_at_line_col_raw_with_root_line_index(
+			root,
+			target_line,
+			VisualCol::ZERO,
+			line_index,
+		)
+	} else {
+		registry.find_node_at_line_col_raw(root, target_line, VisualCol::ZERO)
+	};
 	let mut node = line_start_target.node_id;
 	let mut node_offset = line_start_target.node_byte.get() as usize;
 	let mut absolute = registry.doc_byte_for_node_offset(
@@ -124,8 +161,25 @@ pub(crate) fn read_line_bytes_sparse(
 	target_line: DocLine,
 	include_newline: bool,
 ) -> Result<Vec<u8>, String> {
-	let start = line_start_byte_sparse(registry, root, target_line);
-	let end = line_end_byte_sparse(registry, root, target_line, include_newline)?;
+	read_line_bytes_sparse_with_root_line_index(registry, root, target_line, include_newline, None)
+}
+
+pub(crate) fn read_line_bytes_sparse_with_root_line_index(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	include_newline: bool,
+	line_index: Option<&RootChildLineIndex>,
+) -> Result<Vec<u8>, String> {
+	let start =
+		line_start_byte_sparse_with_root_line_index(registry, root, target_line, line_index);
+	let end = line_end_byte_sparse_with_root_line_index(
+		registry,
+		root,
+		target_line,
+		include_newline,
+		line_index,
+	)?;
 	registry
 		.read_loaded_slice(root, start, end)
 		.map_err(|msg| msg.to_string())
