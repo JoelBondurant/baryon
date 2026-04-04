@@ -83,7 +83,7 @@ pub struct MinimapSnapshot {
 	pub cursor_line: DocLine,
 }
 
-const FOLDED_TOKEN_TEXT: &[u8] = b"[...]";
+const FOLDED_TOKEN_TEXT: &str = "❯❯❯";
 
 fn advance_visual_col(col: &mut VisualCol, byte: u8) {
 	if byte == b'\t' {
@@ -500,7 +500,7 @@ impl UastProjection for UastRegistry {
 			}
 
 			let text = if is_folded {
-				FOLDED_TOKEN_TEXT.to_vec()
+				FOLDED_TOKEN_TEXT.as_bytes().to_vec()
 			} else {
 				self.resolve_physical_bytes(node)
 			};
@@ -1077,7 +1077,7 @@ mod tests {
 		assert_eq!(tokens[0].text, b"head\n".to_vec());
 		assert!(tokens[1].is_folded);
 		assert_eq!(tokens[1].node_id, folded);
-		assert_eq!(tokens[1].text, b"[...]".to_vec());
+		assert_eq!(tokens[1].text, "❯❯❯".as_bytes().to_vec());
 		assert_eq!(tokens[1].absolute_start_line, DocLine::new(1));
 		assert_eq!(tokens[1].absolute_start_byte, DocByte::new(5));
 		assert_eq!(tokens[1].physical_byte_len, 8);

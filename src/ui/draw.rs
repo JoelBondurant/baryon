@@ -104,6 +104,13 @@ fn apply_diagnostic_style(style: Style, severity: Option<DiagnosticSeverity>) ->
 	}
 }
 
+fn folded_placeholder_style() -> Style {
+	Style::default()
+		.fg(FOLDED_PLACEHOLDER_FG)
+		.bg(FOLDED_PLACEHOLDER_BG)
+		.add_modifier(Modifier::BOLD)
+}
+
 impl<B: Backend + io::Write> Frontend<B> {
 	pub(super) fn draw(&mut self) -> Result<(), B::Error> {
 		let current_viewport = &self.current_viewport;
@@ -239,7 +246,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 							};
 
 							if token.is_folded {
-								let mut style = virtual_style;
+								let mut style = folded_placeholder_style();
 								let folded_start = token.absolute_start_byte;
 								let folded_end_exclusive =
 									folded_start.saturating_add(token.physical_byte_len as u64);
@@ -263,7 +270,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 										.severity_for_range(folded_start, folded_end_exclusive),
 								);
 
-								let display = std::str::from_utf8(text).unwrap_or("[...]");
+								let display = std::str::from_utf8(text).unwrap_or("❯❯❯");
 								if !paint_wrapped_text(
 									buf,
 									&mut x,
@@ -730,9 +737,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 #[cfg(test)]
 mod tests {
-	use super::apply_diagnostic_style;
+	use super::{apply_diagnostic_style, folded_placeholder_style};
 	use crate::svp::diagnostic::DiagnosticSeverity;
-	use crate::ui::DIAGNOSTIC_ERROR_UNDERLINE;
+	use crate::ui::{DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG, FOLDED_PLACEHOLDER_FG};
 	use ratatui::style::{Modifier, Style};
 
 	#[test]
@@ -740,6 +747,14 @@ mod tests {
 		let style = apply_diagnostic_style(Style::default(), Some(DiagnosticSeverity::Error));
 		assert!(style.add_modifier.contains(Modifier::UNDERLINED));
 		assert_eq!(style.underline_color, Some(DIAGNOSTIC_ERROR_UNDERLINE));
+	}
+
+	#[test]
+	fn folded_placeholder_uses_dedicated_palette() {
+		let style = folded_placeholder_style();
+		assert_eq!(style.fg, Some(FOLDED_PLACEHOLDER_FG));
+		assert_eq!(style.bg, Some(FOLDED_PLACEHOLDER_BG));
+		assert!(style.add_modifier.contains(Modifier::BOLD));
 	}
 }
 
