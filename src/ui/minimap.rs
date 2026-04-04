@@ -169,8 +169,10 @@ pub(super) fn render_byte_fallback_snapshot(
 
 	let total_lines = snapshot.total_lines.max(1);
 	let viewport_start = snapshot.viewport_start_line.get().min(total_lines - 1);
-	let viewport_end = viewport_start
-		.saturating_add(snapshot.viewport_line_count.max(1))
+	let viewport_end = snapshot
+		.viewport_end_line
+		.get()
+		.max(viewport_start.saturating_add(1))
 		.min(total_lines);
 	let viewport_top = ((viewport_start as u64) * area.height as u64 / total_lines as u64) as u16;
 	let viewport_bottom = ((viewport_end as u64) * area.height as u64 / total_lines as u64) as u16;
@@ -265,8 +267,10 @@ fn render_snapshot_image(snapshot: &MinimapSnapshot, area: Rect) -> DynamicImage
 
 	let total_lines = snapshot.total_lines.max(1);
 	let viewport_start = snapshot.viewport_start_line.get().min(total_lines - 1);
-	let viewport_end = viewport_start
-		.saturating_add(snapshot.viewport_line_count.max(1))
+	let viewport_end = snapshot
+		.viewport_end_line
+		.get()
+		.max(viewport_start.saturating_add(1))
 		.min(total_lines);
 	let viewport_top = ((viewport_start as u64) * height as u64 / total_lines as u64) as u32;
 	let viewport_bottom = ((viewport_end as u64) * height as u64 / total_lines as u64) as u32;
@@ -341,6 +345,7 @@ mod tests {
 			active_search_band: None,
 			total_lines: 1_000,
 			viewport_start_line: DocLine::new(500),
+			viewport_end_line: DocLine::new(501),
 			viewport_line_count: 1,
 			cursor_line: DocLine::new(500),
 		};

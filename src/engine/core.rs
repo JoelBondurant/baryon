@@ -9,6 +9,9 @@ use crate::engine::undo::{
 use crate::svp::highlight::HighlightSpan;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest};
 use crate::svp::{RequestPriority, SvpPointer, SvpResolver, ingest_svp_file};
+use crate::uast::kind::SemanticKind;
+use crate::uast::metrics::SpanMetrics;
+use crate::uast::topology::TreeEdges;
 use crate::uast::{
 	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, UastMutation, UastProjection,
 	Viewport,
@@ -88,6 +91,11 @@ pub enum EditorCommand {
 	Resize(u16, u16),
 	Scroll(i32),
 	ScrollViewport(i32),
+	ToggleFold,
+	CloseFold,
+	OpenFold,
+	CloseAllFolds,
+	OpenAllFolds,
 	MoveCursor(MoveDirection),
 	ClickCursor(CursorPosition),
 	GotoLine(DocLine),
@@ -424,52 +432,848 @@ fn page_motion_step(viewport_lines: u32) -> u32 {
 	}
 }
 
-fn max_scroll_y(total_lines: u32, viewport_lines: u32) -> u32 {
-	total_lines.saturating_sub(viewport_lines.max(1).saturating_sub(1))
+fn visual_line_index_for_doc_line(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+) -> u32 {
+	let mut visual_index = 0u32;
+	let mut line_accumulator = DocLine::ZERO;
+	let mut visit = Some(root);
+
+	while let Some(node) = visit {
+		let idx = node.index();
+		let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
+		let is_folded = has_children && registry.is_folded[idx].load(Ordering::Acquire);
+		if has_children && !is_folded {
+			visit = registry.get_first_child(node);
+			continue;
+		}
+
+		let metrics = unsafe { &*registry.metrics[idx].get() };
+		let node_end_line = line_accumulator.saturating_add(metrics.newlines);
+		let contains_target_line = target_line < node_end_line
+			|| (target_line == node_end_line
+				&& (!is_folded || registry.next_node_skipping_children(node).is_none()));
+		if contains_target_line {
+			if is_folded {
+				return visual_index;
+			}
+			return visual_index
+				.saturating_add(target_line.saturating_sub(line_accumulator.get()).get());
+		}
+
+		if is_folded {
+			visual_index = visual_index.saturating_add(1);
+		} else {
+			visual_index = visual_index.saturating_add(metrics.newlines);
+		}
+		line_accumulator = node_end_line;
+		visit = registry.next_node_skipping_children(node);
+	}
+
+	visual_index
 }
 
-fn clamp_scroll_y(scroll_y: u32, total_lines: u32, viewport_lines: u32) -> u32 {
-	scroll_y.min(max_scroll_y(total_lines, viewport_lines))
+fn max_visual_line_index(registry: &UastRegistry, root: NodeId, total_lines: u32) -> u32 {
+	visual_line_index_for_doc_line(registry, root, DocLine::new(total_lines))
 }
 
-fn viewport_bottom_line(scroll_y: u32, total_lines: u32, viewport_lines: u32) -> u32 {
-	clamp_scroll_y(scroll_y, total_lines, viewport_lines)
-		.saturating_add(viewport_lines.max(1).saturating_sub(1))
-		.min(total_lines)
+fn doc_line_for_visual_index(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_visual_index: u32,
+	total_lines: u32,
+) -> DocLine {
+	let mut visual_index = 0u32;
+	let mut line_accumulator = DocLine::ZERO;
+	let mut visit = Some(root);
+
+	while let Some(node) = visit {
+		let idx = node.index();
+		let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
+		let is_folded = has_children && registry.is_folded[idx].load(Ordering::Acquire);
+		if has_children && !is_folded {
+			visit = registry.get_first_child(node);
+			continue;
+		}
+
+		let metrics = unsafe { &*registry.metrics[idx].get() };
+		if is_folded {
+			if visual_index >= target_visual_index {
+				return line_accumulator;
+			}
+			visual_index = visual_index.saturating_add(1);
+		} else {
+			let next_visual = visual_index.saturating_add(metrics.newlines);
+			if target_visual_index <= next_visual {
+				return line_accumulator
+					.saturating_add(target_visual_index.saturating_sub(visual_index));
+			}
+			visual_index = next_visual;
+		}
+
+		line_accumulator = line_accumulator.saturating_add(metrics.newlines);
+		visit = registry.next_node_skipping_children(node);
+	}
+
+	DocLine::new(total_lines)
+}
+
+fn snap_line_to_visible_boundary(registry: &UastRegistry, root: NodeId, line: DocLine) -> DocLine {
+	let visual_index = visual_line_index_for_doc_line(registry, root, line);
+	let total_lines = registry.get_total_newlines(root);
+	doc_line_for_visual_index(registry, root, visual_index, total_lines)
 }
 
 fn pan_scroll_y_to_keep_cursor_visible(
+	registry: &UastRegistry,
+	root: NodeId,
 	scroll_y: u32,
 	cursor_line: DocLine,
 	total_lines: u32,
 	viewport_lines: u32,
 ) -> u32 {
 	let viewport_lines = viewport_lines.max(1);
-	let mut scroll_y = clamp_scroll_y(scroll_y, total_lines, viewport_lines);
-	if cursor_line.get() < scroll_y {
-		scroll_y = cursor_line.get();
-	} else if cursor_line.get() >= scroll_y.saturating_add(viewport_lines) {
-		scroll_y = cursor_line
-			.get()
-			.saturating_sub(viewport_lines.saturating_sub(1));
+	let max_visual = max_visual_line_index(registry, root, total_lines);
+	let mut top_visual =
+		visual_line_index_for_doc_line(registry, root, DocLine::new(scroll_y.min(total_lines)));
+	let cursor_visual = visual_line_index_for_doc_line(registry, root, cursor_line);
+
+	if cursor_visual < top_visual {
+		top_visual = cursor_visual;
+	} else if cursor_visual >= top_visual.saturating_add(viewport_lines) {
+		top_visual = cursor_visual.saturating_sub(viewport_lines.saturating_sub(1));
 	}
-	clamp_scroll_y(scroll_y, total_lines, viewport_lines)
+
+	doc_line_for_visual_index(registry, root, top_visual.min(max_visual), total_lines).get()
 }
 
-fn scroll_viewport(scroll_y: u32, delta: i32, total_lines: u32, viewport_lines: u32) -> u32 {
-	let scroll_y = (scroll_y as i64 + delta as i64).max(0) as u32;
-	clamp_scroll_y(scroll_y, total_lines, viewport_lines)
+fn scroll_viewport(
+	registry: &UastRegistry,
+	root: NodeId,
+	scroll_y: u32,
+	delta: i32,
+	total_lines: u32,
+	_viewport_lines: u32,
+) -> u32 {
+	let max_visual = max_visual_line_index(registry, root, total_lines);
+	let top_visual =
+		visual_line_index_for_doc_line(registry, root, DocLine::new(scroll_y.min(total_lines)));
+	let new_visual = (top_visual as i64 + delta as i64).clamp(0, max_visual as i64) as u32;
+	doc_line_for_visual_index(registry, root, new_visual, total_lines).get()
 }
 
 fn clamp_cursor_line_to_viewport(
+	registry: &UastRegistry,
+	root: NodeId,
 	cursor_line: DocLine,
 	scroll_y: u32,
 	total_lines: u32,
 	viewport_lines: u32,
 ) -> DocLine {
-	let top = clamp_scroll_y(scroll_y, total_lines, viewport_lines);
-	let bottom = viewport_bottom_line(top, total_lines, viewport_lines);
-	DocLine::new(cursor_line.get().clamp(top, bottom))
+	let viewport_lines = viewport_lines.max(1);
+	let max_visual = max_visual_line_index(registry, root, total_lines);
+	let top_visual =
+		visual_line_index_for_doc_line(registry, root, DocLine::new(scroll_y.min(total_lines)));
+	let bottom_visual = top_visual
+		.saturating_add(viewport_lines.saturating_sub(1))
+		.min(max_visual);
+	let cursor_visual = visual_line_index_for_doc_line(registry, root, cursor_line);
+	if cursor_visual < top_visual {
+		doc_line_for_visual_index(registry, root, top_visual, total_lines)
+	} else if cursor_visual > bottom_visual {
+		doc_line_for_visual_index(registry, root, bottom_visual, total_lines)
+	} else {
+		snap_line_to_visible_boundary(registry, root, cursor_line)
+	}
+}
+
+fn node_is_foldable_boundary(registry: &UastRegistry, root: NodeId, node: NodeId) -> bool {
+	if node == root {
+		return false;
+	}
+
+	let idx = node.index();
+	let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
+	has_children
+		&& !matches!(
+			unsafe { *registry.kinds[idx].get() },
+			crate::uast::SemanticKind::Token
+		)
+}
+
+fn nearest_foldable_boundary(
+	registry: &UastRegistry,
+	root: NodeId,
+	start: NodeId,
+) -> Option<NodeId> {
+	let mut curr = Some(start);
+	while let Some(node) = curr {
+		if node_is_foldable_boundary(registry, root, node) {
+			return Some(node);
+		}
+		curr = unsafe { (*registry.edges[node.index()].get()).parent };
+	}
+	None
+}
+
+fn set_subtree_fold_state(registry: &UastRegistry, root: NodeId, folded: bool) {
+	let mut visit = Some(root);
+	while let Some(node) = visit {
+		if node_is_foldable_boundary(registry, root, node) {
+			registry.is_folded[node.index()].store(folded, Ordering::Release);
+		}
+		visit = registry.get_next_node_in_walk(node);
+	}
+}
+
+fn unfold_ancestor_chain(registry: &UastRegistry, node: NodeId) {
+	let mut curr = unsafe { (*registry.edges[node.index()].get()).parent };
+	while let Some(parent) = curr {
+		registry.is_folded[parent.index()].store(false, Ordering::Release);
+		curr = unsafe { (*registry.edges[parent.index()].get()).parent };
+	}
+}
+
+fn reveal_line_col_target(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	target_col: VisualCol,
+) -> NodeCursorTarget {
+	let raw_target = registry.find_node_at_line_col_raw(root, target_line, target_col);
+	unfold_ancestor_chain(registry, raw_target.node_id);
+	registry.find_node_at_line_col(root, target_line, target_col)
+}
+
+fn collect_visible_line_starts(tokens: &[crate::uast::RenderToken]) -> Vec<DocLine> {
+	let mut lines = Vec::new();
+	for token in tokens {
+		if lines.last().copied() != Some(token.absolute_start_line) {
+			lines.push(token.absolute_start_line);
+		}
+		if token.is_folded {
+			continue;
+		}
+
+		let mut line = token.absolute_start_line;
+		for &byte in &token.text {
+			if byte == b'\n' {
+				line = line.saturating_add(1);
+				if lines.last().copied() != Some(line) {
+					lines.push(line);
+				}
+			}
+		}
+	}
+	lines
+}
+
+fn count_newlines(bytes: &[u8]) -> u32 {
+	bytes.iter().filter(|&&byte| byte == b'\n').count() as u32
+}
+
+fn init_virtual_token_node(
+	registry: &UastRegistry,
+	node: NodeId,
+	parent: NodeId,
+	next_sibling: Option<NodeId>,
+	bytes: &[u8],
+) {
+	let idx = node.index();
+	unsafe {
+		*registry.kinds[idx].get() = SemanticKind::Token;
+		*registry.spans[idx].get() = None;
+		*registry.metrics[idx].get() = SpanMetrics {
+			byte_length: bytes.len() as u32,
+			newlines: count_newlines(bytes),
+		};
+		*registry.edges[idx].get() = TreeEdges {
+			parent: Some(parent),
+			first_child: None,
+			next_sibling,
+		};
+		*registry.child_tails[idx].get() = None;
+		*registry.virtual_data[idx].get() = Some(bytes.to_vec());
+	}
+	registry.dma_in_flight[idx].store(false, Ordering::Relaxed);
+	registry.metric_inflating[idx].store(false, Ordering::Relaxed);
+	registry.metrics_inflated[idx].store(true, Ordering::Relaxed);
+	registry.is_folded[idx].store(false, Ordering::Relaxed);
+}
+
+fn init_fold_boundary_node(
+	registry: &UastRegistry,
+	node: NodeId,
+	parent: NodeId,
+	next_sibling: Option<NodeId>,
+	child: NodeId,
+	metrics: SpanMetrics,
+) {
+	let idx = node.index();
+	unsafe {
+		*registry.kinds[idx].get() = SemanticKind::RelationalRow;
+		*registry.spans[idx].get() = None;
+		*registry.metrics[idx].get() = metrics;
+		*registry.edges[idx].get() = TreeEdges {
+			parent: Some(parent),
+			first_child: Some(child),
+			next_sibling,
+		};
+		*registry.child_tails[idx].get() = Some(child);
+		*registry.virtual_data[idx].get() = None;
+	}
+	registry.dma_in_flight[idx].store(false, Ordering::Relaxed);
+	registry.metric_inflating[idx].store(false, Ordering::Relaxed);
+	registry.metrics_inflated[idx].store(true, Ordering::Relaxed);
+	registry.is_folded[idx].store(false, Ordering::Relaxed);
+}
+
+fn trim_horizontal_whitespace(mut bytes: &[u8]) -> &[u8] {
+	while matches!(bytes.first(), Some(b' ' | b'\t' | b'\r')) {
+		bytes = &bytes[1..];
+	}
+	while matches!(bytes.last(), Some(b' ' | b'\t' | b'\r')) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
+}
+
+fn preceding_attribute_block_start_line(bytes: &[u8], start_line: DocLine) -> DocLine {
+	if start_line == DocLine::ZERO {
+		return start_line;
+	}
+
+	let mut lines = Vec::new();
+	let mut current = start_line.get();
+	while current > 0 {
+		current -= 1;
+		let line = DocLine::new(current);
+		let trimmed = trim_horizontal_whitespace(line_content_slice(bytes, line));
+		if trimmed.is_empty() {
+			break;
+		}
+		lines.push(line);
+	}
+
+	if lines.is_empty() {
+		return start_line;
+	}
+
+	lines.reverse();
+	let mut bracket_depth = 0i32;
+	for &line in &lines {
+		let trimmed = trim_horizontal_whitespace(line_content_slice(bytes, line));
+		let starts_attr = trimmed.starts_with(b"#[") || trimmed.starts_with(b"#![");
+		if bracket_depth == 0 && !starts_attr {
+			return start_line;
+		}
+		for &byte in trimmed {
+			if byte == b'[' {
+				bracket_depth += 1;
+			} else if byte == b']' {
+				bracket_depth = bracket_depth.saturating_sub(1);
+			}
+		}
+	}
+
+	if bracket_depth == 0 {
+		lines.first().copied().unwrap_or(start_line)
+	} else {
+		start_line
+	}
+}
+
+fn multiline_node_range(bytes: &[u8], node: &ra_ap_syntax::SyntaxNode) -> Option<(usize, usize)> {
+	let range = node.text_range();
+	let start = u32::from(range.start()) as usize;
+	let end = u32::from(range.end()) as usize;
+	if end <= start {
+		return None;
+	}
+
+	let start_line = line_col_from_byte_offset(bytes, DocByte::new(start as u64)).0;
+	let end_line = line_col_from_byte_offset(bytes, DocByte::new(end.saturating_sub(1) as u64)).0;
+	if end_line <= start_line {
+		return None;
+	}
+
+	let start_line = preceding_attribute_block_start_line(bytes, start_line);
+	let (line_start, line_end) = line_byte_range(bytes, start_line, end_line);
+	(line_end > line_start).then_some((line_start, line_end))
+}
+
+fn find_syntax_fold_range(bytes: &[u8], cursor_local_byte: usize) -> Option<(usize, usize)> {
+	let text = std::str::from_utf8(bytes).ok()?;
+	if text.is_empty() {
+		return None;
+	}
+
+	let parse = SourceFile::parse(text, Edition::Edition2024);
+	let syntax = parse.tree().syntax().clone();
+	let offset = TextSize::from(fold_anchor_offset(bytes, cursor_local_byte) as u32);
+	let token = select_structural_token_at_offset(&syntax, offset).or_else(|| {
+		syntax
+			.token_at_offset(offset)
+			.left_biased()
+			.or_else(|| syntax.token_at_offset(offset).right_biased())
+	})?;
+
+	let mut node = token.parent();
+	let mut fallback_range = None;
+	let mut fn_candidate_in_impl = None;
+	while let Some(current) = node {
+		if current.kind() == SyntaxKind::SOURCE_FILE {
+			break;
+		}
+
+		if let Some(range) = multiline_node_range(bytes, &current) {
+			if fallback_range.is_none() {
+				fallback_range = Some(range);
+			}
+			if current.kind() == SyntaxKind::FN && fn_candidate_in_impl.is_none() {
+				fn_candidate_in_impl = Some(range);
+			}
+		}
+
+		if current.kind() == SyntaxKind::IMPL {
+			if let Some(range) = fn_candidate_in_impl {
+				return Some(range);
+			}
+		}
+
+		node = current.parent();
+	}
+
+	fallback_range
+}
+
+fn is_blank_line(doc: &[u8], line: DocLine) -> bool {
+	line_content_slice(doc, line)
+		.iter()
+		.all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+}
+
+fn is_scope_closer_line(doc: &[u8], line: DocLine) -> bool {
+	let slice = line_content_slice(doc, line);
+	let Some(start) = slice
+		.iter()
+		.position(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+	else {
+		return false;
+	};
+	let end = slice
+		.iter()
+		.rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+		.expect("trimmed non-blank line must have an end")
+		+ 1;
+	slice[start..end]
+		.iter()
+		.all(|byte| matches!(byte, b'}' | b')' | b']' | b';' | b','))
+}
+
+fn first_significant_byte_on_line(doc: &[u8], line: DocLine) -> Option<usize> {
+	let (line_start, _) = line_byte_range(doc, line, line);
+	line_content_slice(doc, line)
+		.iter()
+		.position(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+		.map(|offset| line_start + offset)
+}
+
+fn fold_anchor_offset(bytes: &[u8], cursor_local_byte: usize) -> usize {
+	if bytes.is_empty() {
+		return 0;
+	}
+
+	let clamped = cursor_local_byte.min(bytes.len().saturating_sub(1));
+	let current_line = line_col_from_byte_offset(bytes, DocByte::new(clamped as u64)).0;
+	if !is_blank_line(bytes, current_line) && !is_scope_closer_line(bytes, current_line) {
+		return clamped;
+	}
+
+	let mut search_line = current_line.get();
+	while search_line > 0 {
+		search_line -= 1;
+		let line = DocLine::new(search_line);
+		if is_blank_line(bytes, line) || is_scope_closer_line(bytes, line) {
+			continue;
+		}
+		if let Some(anchor) = first_significant_byte_on_line(bytes, line) {
+			return anchor;
+		}
+	}
+
+	clamped
+}
+
+fn find_indentation_fold_range(bytes: &[u8], cursor_line: DocLine) -> Option<(usize, usize)> {
+	let total_lines = count_newlines(bytes);
+	let mut start_line = cursor_line.min(DocLine::new(total_lines));
+	while start_line > DocLine::ZERO && is_blank_line(bytes, start_line) {
+		start_line -= 1;
+	}
+	if is_blank_line(bytes, start_line) {
+		return None;
+	}
+
+	let base_indent = first_non_whitespace_visual_col(bytes, start_line);
+	let mut end_line = start_line;
+	let mut saw_nested_line = false;
+
+	for line_idx in start_line.get().saturating_add(1)..=total_lines {
+		let line = DocLine::new(line_idx);
+		if is_blank_line(bytes, line) {
+			if saw_nested_line {
+				end_line = line;
+			}
+			continue;
+		}
+
+		let indent = first_non_whitespace_visual_col(bytes, line);
+		if indent > base_indent {
+			saw_nested_line = true;
+			end_line = line;
+			continue;
+		}
+
+		break;
+	}
+
+	if !saw_nested_line || end_line == start_line {
+		return None;
+	}
+
+	Some(line_byte_range(bytes, start_line, end_line))
+}
+
+#[derive(Clone)]
+struct MaterializeNodeSlice {
+	node: NodeId,
+	start: usize,
+	end: usize,
+	bytes: Vec<u8>,
+}
+
+struct SyntheticFoldPlan {
+	parent: NodeId,
+	start_slice: MaterializeNodeSlice,
+	start_offset: usize,
+	end_slice: MaterializeNodeSlice,
+	end_offset: usize,
+	metrics: SpanMetrics,
+}
+
+fn collect_parent_child_bytes(
+	registry: &UastRegistry,
+	root: NodeId,
+	parent: NodeId,
+) -> Result<Vec<MaterializeNodeSlice>, String> {
+	let Some(mut child) = registry.get_first_child(parent) else {
+		return Ok(Vec::new());
+	};
+	let mut absolute_start = registry.doc_byte_for_node_offset(root, child, NodeByteOffset::ZERO);
+	let mut offset = 0usize;
+	let mut slices = Vec::new();
+
+	loop {
+		let byte_len = registry.get_total_bytes(child);
+		let absolute_end = absolute_start.saturating_add(byte_len);
+		let bytes = registry
+			.read_loaded_slice(root, absolute_start, absolute_end)
+			.map_err(|msg| msg.to_string())?;
+		let start = offset;
+		offset += bytes.len();
+		slices.push(MaterializeNodeSlice {
+			node: child,
+			start,
+			end: offset,
+			bytes,
+		});
+
+		let Some(next) = registry.get_next_sibling(child) else {
+			break;
+		};
+		child = next;
+		absolute_start = absolute_end;
+	}
+
+	Ok(slices)
+}
+
+fn locate_materialize_start(
+	slices: &[MaterializeNodeSlice],
+	offset: usize,
+) -> Option<(&MaterializeNodeSlice, usize)> {
+	slices
+		.iter()
+		.find(|slice| offset >= slice.start && offset < slice.end)
+		.map(|slice| (slice, offset - slice.start))
+		.or_else(|| {
+			slices
+				.iter()
+				.find(|slice| offset == slice.start)
+				.map(|slice| (slice, 0))
+		})
+}
+
+fn locate_materialize_end(
+	slices: &[MaterializeNodeSlice],
+	offset: usize,
+) -> Option<(&MaterializeNodeSlice, usize)> {
+	slices
+		.iter()
+		.find(|slice| offset > slice.start && offset <= slice.end)
+		.map(|slice| (slice, offset - slice.start))
+		.or_else(|| {
+			slices
+				.windows(2)
+				.find(|pair| offset == pair[1].start)
+				.map(|pair| (&pair[0], pair[0].bytes.len()))
+		})
+}
+
+fn materialize_synthetic_fold_plan(
+	registry: &UastRegistry,
+	plan: SyntheticFoldPlan,
+) -> Option<NodeId> {
+	let SyntheticFoldPlan {
+		parent,
+		start_slice,
+		start_offset,
+		end_slice,
+		end_offset,
+		metrics,
+	} = plan;
+	if start_slice.start > end_slice.start
+		|| start_offset > start_slice.bytes.len()
+		|| end_offset > end_slice.bytes.len()
+		|| (start_slice.node == end_slice.node && start_offset >= end_offset)
+	{
+		return None;
+	}
+
+	if start_offset > 0
+		&& unsafe {
+			(*registry.edges[start_slice.node.index()].get())
+				.first_child
+				.is_some()
+		} {
+		return None;
+	}
+	if end_offset < end_slice.bytes.len()
+		&& unsafe {
+			(*registry.edges[end_slice.node.index()].get())
+				.first_child
+				.is_some()
+		} {
+		return None;
+	}
+
+	let prev = registry.get_prev_sibling(start_slice.node);
+	let next = registry.get_next_sibling(end_slice.node);
+	let old_was_tail =
+		unsafe { *registry.child_tails[parent.index()].get() == Some(end_slice.node) };
+	let fold_node = registry.alloc_node_internal();
+	let prefix = &start_slice.bytes[..start_offset];
+	let suffix = &end_slice.bytes[end_offset..];
+
+	let prefix_node = if prefix.is_empty() {
+		None
+	} else {
+		let node = registry.alloc_node_internal();
+		init_virtual_token_node(registry, node, parent, Some(fold_node), prefix);
+		Some(node)
+	};
+
+	let suffix_node = if suffix.is_empty() {
+		None
+	} else {
+		let node = registry.alloc_node_internal();
+		init_virtual_token_node(registry, node, parent, next, suffix);
+		Some(node)
+	};
+
+	let mut first_fold_child: Option<NodeId> = None;
+	let mut last_fold_child: Option<NodeId> = None;
+	let mut append_child = |child: NodeId| {
+		unsafe {
+			(*registry.edges[child.index()].get()).parent = Some(fold_node);
+			(*registry.edges[child.index()].get()).next_sibling = None;
+		}
+		if let Some(last) = last_fold_child {
+			unsafe {
+				(*registry.edges[last.index()].get()).next_sibling = Some(child);
+			}
+		} else {
+			first_fold_child = Some(child);
+		}
+		last_fold_child = Some(child);
+	};
+
+	if start_slice.node == end_slice.node {
+		let selected = &start_slice.bytes[start_offset..end_offset];
+		if selected.is_empty() {
+			return None;
+		}
+		if start_offset == 0 && end_offset == start_slice.bytes.len() {
+			append_child(start_slice.node);
+		} else {
+			let node = registry.alloc_node_internal();
+			init_virtual_token_node(registry, node, fold_node, None, selected);
+			append_child(node);
+		}
+	} else {
+		let mut current = registry.get_next_sibling(start_slice.node);
+		if start_offset == 0 {
+			append_child(start_slice.node);
+		} else {
+			let node = registry.alloc_node_internal();
+			init_virtual_token_node(
+				registry,
+				node,
+				fold_node,
+				None,
+				&start_slice.bytes[start_offset..],
+			);
+			append_child(node);
+		}
+
+		while let Some(node) = current {
+			if node == end_slice.node {
+				break;
+			}
+			current = registry.get_next_sibling(node);
+			append_child(node);
+		}
+
+		if end_offset == end_slice.bytes.len() {
+			append_child(end_slice.node);
+		} else {
+			let node = registry.alloc_node_internal();
+			init_virtual_token_node(
+				registry,
+				node,
+				fold_node,
+				None,
+				&end_slice.bytes[..end_offset],
+			);
+			append_child(node);
+		}
+	}
+
+	let first_fold_child = first_fold_child?;
+	init_fold_boundary_node(
+		registry,
+		fold_node,
+		parent,
+		suffix_node.or(next),
+		first_fold_child,
+		metrics,
+	);
+	unsafe {
+		*registry.child_tails[fold_node.index()].get() = last_fold_child;
+	}
+
+	let replacement_start = prefix_node.unwrap_or(fold_node);
+	let replacement_end = suffix_node.unwrap_or(fold_node);
+	unsafe {
+		if let Some(prev_sibling) = prev {
+			(*registry.edges[prev_sibling.index()].get()).next_sibling = Some(replacement_start);
+		} else {
+			(*registry.edges[parent.index()].get()).first_child = Some(replacement_start);
+		}
+		if old_was_tail {
+			*registry.child_tails[parent.index()].get() = Some(replacement_end);
+		}
+	}
+
+	Some(fold_node)
+}
+
+fn preview_synthetic_fold_plan_at_cursor(
+	registry: &UastRegistry,
+	root: NodeId,
+	cursor_line: DocLine,
+	cursor_col: VisualCol,
+) -> Option<SyntheticFoldPlan> {
+	let target = registry.find_node_at_line_col_raw(root, cursor_line, cursor_col);
+	let parent = unsafe { (*registry.edges[target.node_id.index()].get()).parent }?;
+	let slices = collect_parent_child_bytes(registry, root, parent).ok()?;
+	let target_slice = slices.iter().find(|slice| slice.node == target.node_id)?;
+	let bytes: Vec<u8> = slices
+		.iter()
+		.flat_map(|slice| slice.bytes.iter().copied())
+		.collect();
+	let cursor_offset = target_slice.start + target.node_byte.get() as usize;
+	let fold_range = find_syntax_fold_range(&bytes, cursor_offset).or_else(|| {
+		let local_line = line_col_from_byte_offset(&bytes, DocByte::new(cursor_offset as u64)).0;
+		find_indentation_fold_range(&bytes, local_line)
+	})?;
+
+	if fold_range.0 == 0
+		&& fold_range.1 == bytes.len()
+		&& registry.get_prev_sibling(target.node_id).is_none()
+		&& registry.get_next_sibling(target.node_id).is_none()
+	{
+		return None;
+	}
+
+	let (start_slice, start_offset) = locate_materialize_start(&slices, fold_range.0)?;
+	let (end_slice, end_offset) = locate_materialize_end(&slices, fold_range.1)?;
+	let selected = &bytes[fold_range.0..fold_range.1];
+	Some(SyntheticFoldPlan {
+		parent,
+		start_slice: start_slice.clone(),
+		start_offset,
+		end_slice: end_slice.clone(),
+		end_offset,
+		metrics: SpanMetrics {
+			byte_length: selected.len() as u32,
+			newlines: count_newlines(selected),
+		},
+	})
+}
+
+#[cfg(test)]
+fn materialize_fold_boundary_at_cursor(
+	registry: &UastRegistry,
+	root: NodeId,
+	cursor_line: DocLine,
+	cursor_col: VisualCol,
+) -> Option<NodeId> {
+	let plan = preview_synthetic_fold_plan_at_cursor(registry, root, cursor_line, cursor_col)?;
+	materialize_synthetic_fold_plan(registry, plan)
+}
+
+fn resolve_fold_boundary_at_cursor(
+	registry: &UastRegistry,
+	root: NodeId,
+	cursor_node: NodeId,
+	cursor_line: DocLine,
+	cursor_col: VisualCol,
+	allow_materialize: bool,
+) -> Option<NodeId> {
+	let existing_target = nearest_foldable_boundary(registry, root, cursor_node);
+	if !allow_materialize {
+		return existing_target;
+	}
+
+	let synthetic_plan =
+		preview_synthetic_fold_plan_at_cursor(registry, root, cursor_line, cursor_col);
+	match (existing_target, synthetic_plan) {
+		(Some(existing), Some(plan)) => {
+			let existing_len = unsafe { (*registry.metrics[existing.index()].get()).byte_length };
+			if plan.metrics.byte_length < existing_len {
+				materialize_synthetic_fold_plan(registry, plan).or(Some(existing))
+			} else {
+				Some(existing)
+			}
+		}
+		(Some(existing), None) => Some(existing),
+		(None, Some(plan)) => materialize_synthetic_fold_plan(registry, plan),
+		(None, None) => None,
+	}
 }
 
 fn resolve_byte_range(
@@ -901,6 +1705,9 @@ fn build_text_minimap_snapshot(
 		active_search_band: None,
 		total_lines: doc_lines,
 		viewport_start_line,
+		viewport_end_line: viewport_start_line
+			.saturating_add(viewport_line_count.saturating_sub(1))
+			.saturating_add(1),
 		viewport_line_count,
 		cursor_line,
 	}
@@ -950,6 +1757,9 @@ fn build_byte_fallback_minimap_snapshot(
 		active_search_band: None,
 		total_lines: doc_lines,
 		viewport_start_line,
+		viewport_end_line: viewport_start_line
+			.saturating_add(viewport_line_count.saturating_sub(1))
+			.saturating_add(1),
 		viewport_line_count,
 		cursor_line,
 	}
@@ -998,11 +1808,11 @@ fn insert_text_sparse(
 		return Err("Edit range exceeded document bounds".to_string());
 	}
 	if text.is_empty() {
-		let target = registry.find_node_at_doc_byte(root, byte_offset);
+		let target = registry.find_node_at_doc_byte_raw(root, byte_offset);
 		return Ok((target.node_id, target.node_byte.get()));
 	}
 
-	let target = registry.find_node_at_doc_byte(root, byte_offset);
+	let target = registry.find_node_at_doc_byte_raw(root, byte_offset);
 	Ok(registry.insert_text(target.node_id, target.node_byte.get(), text.as_bytes()))
 }
 
@@ -1013,7 +1823,7 @@ fn delete_text_sparse(
 	expected_deleted: &str,
 ) -> Result<(NodeId, u32), String> {
 	if expected_deleted.is_empty() {
-		let target = registry.find_node_at_doc_byte(root, byte_offset);
+		let target = registry.find_node_at_doc_byte_raw(root, byte_offset);
 		return Ok((target.node_id, target.node_byte.get()));
 	}
 
@@ -1031,7 +1841,7 @@ fn delete_text_sparse(
 		return Err("Edit range no longer matches live document".to_string());
 	}
 
-	let mut target = registry.find_node_at_doc_byte(root, delete_end);
+	let mut target = registry.find_node_at_doc_byte_raw(root, delete_end);
 	let mut current_byte =
 		registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte);
 	while current_byte > byte_offset {
@@ -1054,7 +1864,7 @@ fn delete_text_sparse(
 }
 
 fn line_start_byte_sparse(registry: &UastRegistry, root: NodeId, target_line: DocLine) -> DocByte {
-	let target = registry.find_node_at_line_col(root, target_line, VisualCol::ZERO);
+	let target = registry.find_node_at_line_col_raw(root, target_line, VisualCol::ZERO);
 	registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte)
 }
 
@@ -1064,7 +1874,7 @@ fn line_end_byte_sparse(
 	target_line: DocLine,
 	include_newline: bool,
 ) -> Result<DocByte, String> {
-	let line_start_target = registry.find_node_at_line_col(root, target_line, VisualCol::ZERO);
+	let line_start_target = registry.find_node_at_line_col_raw(root, target_line, VisualCol::ZERO);
 	let mut node = line_start_target.node_id;
 	let mut node_offset = line_start_target.node_byte.get() as usize;
 	let mut absolute = registry.doc_byte_for_node_offset(
@@ -1159,12 +1969,36 @@ fn apply_cursor_target(
 	*cursor_abs_col = target.visual_col;
 }
 
+fn place_cursor_at_line_col(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	target_col: VisualCol,
+	reveal_hidden: bool,
+	cursor_node: &mut NodeId,
+	cursor_offset: &mut u32,
+	cursor_abs_line: &mut DocLine,
+	cursor_abs_col: &mut VisualCol,
+) {
+	let target = if reveal_hidden {
+		reveal_line_col_target(registry, root, target_line, target_col)
+	} else {
+		registry.find_node_at_line_col(root, target_line, target_col)
+	};
+	*cursor_abs_line = if reveal_hidden {
+		target_line
+	} else {
+		snap_line_to_visible_boundary(registry, root, target_line)
+	};
+	apply_cursor_target(target, cursor_node, cursor_offset, cursor_abs_col);
+}
+
 fn line_col_from_doc_byte_sparse(
 	registry: &UastRegistry,
 	root: NodeId,
 	target_byte: DocByte,
 ) -> Result<(DocLine, VisualCol), String> {
-	let leaf = registry.find_node_at_doc_byte(root, target_byte);
+	let leaf = registry.find_node_at_doc_byte_raw(root, target_byte);
 	let mut line = DocLine::ZERO;
 	let mut visit = registry.get_first_child(root);
 
@@ -1373,7 +2207,7 @@ fn word_object_delta_at_cursor(
 	root: NodeId,
 	cursor_abs_byte_offset: DocByte,
 ) -> Result<Option<TextDelta>, String> {
-	let leaf = registry.find_node_at_doc_byte(root, cursor_abs_byte_offset);
+	let leaf = registry.find_node_at_doc_byte_raw(root, cursor_abs_byte_offset);
 	let parse_window = build_parse_window_around_leaf(registry, leaf)?;
 	let parse = SourceFile::parse(&parse_window.text, Edition::Edition2024);
 	let syntax = parse.tree().syntax().clone();
@@ -1655,6 +2489,16 @@ fn apply_deltas_to_document_internal(
 	}
 
 	let rid = (*root_id).ok_or_else(|| "No file loaded".to_string())?;
+	let total_bytes_before = registry.get_total_bytes(rid);
+	if total_bytes_before > 0 {
+		for delta in &deltas {
+			let target_byte = delta
+				.global_byte_offset
+				.min(DocByte::new(total_bytes_before));
+			let target = registry.find_node_at_doc_byte_raw(rid, target_byte);
+			unfold_ancestor_chain(registry, target.node_id);
+		}
+	}
 
 	for delta in &deltas {
 		if !delta.deleted_text.is_empty() {
@@ -1686,9 +2530,17 @@ fn apply_deltas_to_document_internal(
 	*root_id = Some(rid);
 
 	let (line, col) = line_col_from_doc_byte_sparse(registry, rid, cursor_byte_after_edit)?;
-	*cursor_abs_line = line;
-	let target = registry.find_node_at_line_col(rid, line, col);
-	apply_cursor_target(target, cursor_node, cursor_offset, cursor_abs_col);
+	place_cursor_at_line_col(
+		registry,
+		rid,
+		line,
+		col,
+		true,
+		cursor_node,
+		cursor_offset,
+		cursor_abs_line,
+		cursor_abs_col,
+	);
 
 	Ok(())
 }
@@ -1812,13 +2664,27 @@ impl Engine {
 					if let Some(rid) = root_id {
 						match dir {
 							MoveDirection::Up => {
-								cursor_abs_line = cursor_abs_line.saturating_sub(1)
+								let total = registry.get_total_newlines(rid);
+								let current_visual =
+									visual_line_index_for_doc_line(&registry, rid, cursor_abs_line);
+								cursor_abs_line = doc_line_for_visual_index(
+									&registry,
+									rid,
+									current_visual.saturating_sub(1),
+									total,
+								);
 							}
 							MoveDirection::Down => {
 								let total = registry.get_total_newlines(rid);
-								if cursor_abs_line.get() < total {
-									cursor_abs_line += 1;
-								}
+								let current_visual =
+									visual_line_index_for_doc_line(&registry, rid, cursor_abs_line);
+								let max_visual = max_visual_line_index(&registry, rid, total);
+								cursor_abs_line = doc_line_for_visual_index(
+									&registry,
+									rid,
+									current_visual.saturating_add(1).min(max_visual),
+									total,
+								);
 							}
 							MoveDirection::Left => {
 								if let Ok(line_bytes) =
@@ -1880,20 +2746,34 @@ impl Engine {
 								}
 							}
 							MoveDirection::Top => {
-								cursor_abs_line = DocLine::ZERO;
+								cursor_abs_line = doc_line_for_visual_index(
+									&registry,
+									rid,
+									0,
+									registry.get_total_newlines(rid),
+								);
 								cursor_abs_col = VisualCol::ZERO;
 							}
 							MoveDirection::Bottom => {
-								cursor_abs_line = DocLine::new(registry.get_total_newlines(rid));
+								let total = registry.get_total_newlines(rid);
+								cursor_abs_line = doc_line_for_visual_index(
+									&registry,
+									rid,
+									max_visual_line_index(&registry, rid, total),
+									total,
+								);
 								cursor_abs_col = VisualCol::ZERO;
 							}
 						}
-						let target =
-							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						apply_cursor_target(
-							target,
+						place_cursor_at_line_col(
+							&registry,
+							rid,
+							cursor_abs_line,
+							cursor_abs_col,
+							false,
 							&mut cursor_node,
 							&mut cursor_offset,
+							&mut cursor_abs_line,
 							&mut cursor_abs_col,
 						);
 						needs_render = true;
@@ -1904,12 +2784,15 @@ impl Engine {
 						let total = registry.get_total_newlines(rid);
 						cursor_abs_line = DocLine::new(target.get().min(total));
 						cursor_abs_col = VisualCol::ZERO;
-						let target =
-							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						apply_cursor_target(
-							target,
+						place_cursor_at_line_col(
+							&registry,
+							rid,
+							cursor_abs_line,
+							cursor_abs_col,
+							true,
 							&mut cursor_node,
 							&mut cursor_offset,
+							&mut cursor_abs_line,
 							&mut cursor_abs_col,
 						);
 						needs_render = true;
@@ -1938,12 +2821,15 @@ impl Engine {
 								),
 								_ => unreachable!(),
 							};
-							let target =
-								registry.find_node_at_line_col(rid, cursor_abs_line, target_col);
-							apply_cursor_target(
-								target,
+							place_cursor_at_line_col(
+								&registry,
+								rid,
+								cursor_abs_line,
+								target_col,
+								false,
 								&mut cursor_node,
 								&mut cursor_offset,
+								&mut cursor_abs_line,
 								&mut cursor_abs_col,
 							);
 							needs_render = true;
@@ -1952,14 +2838,24 @@ impl Engine {
 				}
 				EditorCommand::PageUp => {
 					if let Some(rid) = root_id {
-						cursor_abs_line =
-							cursor_abs_line.saturating_sub(page_motion_step(viewport_lines));
-						let target =
-							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						apply_cursor_target(
-							target,
+						let total = registry.get_total_newlines(rid);
+						let current_visual =
+							visual_line_index_for_doc_line(&registry, rid, cursor_abs_line);
+						cursor_abs_line = doc_line_for_visual_index(
+							&registry,
+							rid,
+							current_visual.saturating_sub(page_motion_step(viewport_lines)),
+							total,
+						);
+						place_cursor_at_line_col(
+							&registry,
+							rid,
+							cursor_abs_line,
+							cursor_abs_col,
+							false,
 							&mut cursor_node,
 							&mut cursor_offset,
+							&mut cursor_abs_line,
 							&mut cursor_abs_col,
 						);
 						needs_render = true;
@@ -1968,15 +2864,26 @@ impl Engine {
 				EditorCommand::PageDown => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						let target_line =
-							cursor_abs_line.saturating_add(page_motion_step(viewport_lines));
-						cursor_abs_line = DocLine::new(target_line.get().min(total));
-						let target =
-							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						apply_cursor_target(
-							target,
+						let current_visual =
+							visual_line_index_for_doc_line(&registry, rid, cursor_abs_line);
+						let max_visual = max_visual_line_index(&registry, rid, total);
+						cursor_abs_line = doc_line_for_visual_index(
+							&registry,
+							rid,
+							current_visual
+								.saturating_add(page_motion_step(viewport_lines))
+								.min(max_visual),
+							total,
+						);
+						place_cursor_at_line_col(
+							&registry,
+							rid,
+							cursor_abs_line,
+							cursor_abs_col,
+							false,
 							&mut cursor_node,
 							&mut cursor_offset,
+							&mut cursor_abs_line,
 							&mut cursor_abs_col,
 						);
 						needs_render = true;
@@ -2345,16 +3252,22 @@ impl Engine {
 				EditorCommand::Scroll(delta) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						let new_line = (cursor_abs_line.get() as i64 + delta as i64)
-							.max(0)
-							.min(total as i64) as u32;
-						cursor_abs_line = DocLine::new(new_line);
-						let target =
-							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						apply_cursor_target(
-							target,
+						let current_visual =
+							visual_line_index_for_doc_line(&registry, rid, cursor_abs_line);
+						let max_visual = max_visual_line_index(&registry, rid, total);
+						let target_visual = (current_visual as i64 + delta as i64)
+							.clamp(0, max_visual as i64) as u32;
+						cursor_abs_line =
+							doc_line_for_visual_index(&registry, rid, target_visual, total);
+						place_cursor_at_line_col(
+							&registry,
+							rid,
+							cursor_abs_line,
+							cursor_abs_col,
+							false,
 							&mut cursor_node,
 							&mut cursor_offset,
+							&mut cursor_abs_line,
 							&mut cursor_abs_col,
 						);
 					}
@@ -2363,27 +3276,86 @@ impl Engine {
 				EditorCommand::ScrollViewport(delta) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						scroll_y = scroll_viewport(scroll_y, delta, total, viewport_lines);
+						scroll_y =
+							scroll_viewport(&registry, rid, scroll_y, delta, total, viewport_lines);
 						let clamped_cursor_line = clamp_cursor_line_to_viewport(
+							&registry,
+							rid,
 							cursor_abs_line,
 							scroll_y,
 							total,
 							viewport_lines,
 						);
 						if clamped_cursor_line != cursor_abs_line {
-							cursor_abs_line = clamped_cursor_line;
-							let target = registry.find_node_at_line_col(
+							place_cursor_at_line_col(
+								&registry,
 								rid,
-								cursor_abs_line,
+								clamped_cursor_line,
 								cursor_abs_col,
-							);
-							apply_cursor_target(
-								target,
+								false,
 								&mut cursor_node,
 								&mut cursor_offset,
+								&mut cursor_abs_line,
 								&mut cursor_abs_col,
 							);
 						}
+					}
+					needs_render = true;
+				}
+				fold_cmd @ (EditorCommand::ToggleFold
+				| EditorCommand::CloseFold
+				| EditorCommand::OpenFold
+				| EditorCommand::CloseAllFolds
+				| EditorCommand::OpenAllFolds) => {
+					if let Some(rid) = root_id {
+						match fold_cmd {
+							EditorCommand::ToggleFold
+							| EditorCommand::CloseFold
+							| EditorCommand::OpenFold => {
+								let target_node = resolve_fold_boundary_at_cursor(
+									&registry,
+									rid,
+									cursor_node,
+									cursor_abs_line,
+									cursor_abs_col,
+									!matches!(fold_cmd, EditorCommand::OpenFold),
+								);
+
+								if let Some(node) = target_node {
+									let new_state = match fold_cmd {
+										EditorCommand::ToggleFold => !registry.is_folded
+											[node.index()]
+										.load(Ordering::Acquire),
+										EditorCommand::CloseFold => true,
+										EditorCommand::OpenFold => false,
+										_ => unreachable!(),
+									};
+									registry.is_folded[node.index()]
+										.store(new_state, Ordering::Release);
+								}
+							}
+							EditorCommand::CloseAllFolds => {
+								set_subtree_fold_state(&registry, rid, true);
+							}
+							EditorCommand::OpenAllFolds => {
+								set_subtree_fold_state(&registry, rid, false);
+							}
+							_ => unreachable!(),
+						}
+
+						cursor_abs_line =
+							snap_line_to_visible_boundary(&registry, rid, cursor_abs_line);
+						place_cursor_at_line_col(
+							&registry,
+							rid,
+							cursor_abs_line,
+							cursor_abs_col,
+							false,
+							&mut cursor_node,
+							&mut cursor_offset,
+							&mut cursor_abs_line,
+							&mut cursor_abs_col,
+						);
 					}
 					needs_render = true;
 				}
@@ -2392,12 +3364,15 @@ impl Engine {
 						let total = registry.get_total_newlines(rid);
 						cursor_abs_line = DocLine::new(target_pos.line.get().min(total));
 						cursor_abs_col = target_pos.col;
-						let target =
-							registry.find_node_at_line_col(rid, cursor_abs_line, cursor_abs_col);
-						apply_cursor_target(
-							target,
+						place_cursor_at_line_col(
+							&registry,
+							rid,
+							cursor_abs_line,
+							cursor_abs_col,
+							true,
 							&mut cursor_node,
 							&mut cursor_offset,
+							&mut cursor_abs_line,
 							&mut cursor_abs_col,
 						);
 					}
@@ -2593,16 +3568,15 @@ impl Engine {
 											.unwrap_or(0);
 										search_match_index = Some(idx);
 										let current_match = matches[idx];
-										cursor_abs_line = current_match.line;
-										let target = registry.find_node_at_line_col(
+										place_cursor_at_line_col(
+											&registry,
 											rid,
 											current_match.line,
 											current_match.col,
-										);
-										apply_cursor_target(
-											target,
+											true,
 											&mut cursor_node,
 											&mut cursor_offset,
+											&mut cursor_abs_line,
 											&mut cursor_abs_col,
 										);
 										cursor_abs_col = current_match.col;
@@ -2643,16 +3617,15 @@ impl Engine {
 								search_match_index.is_some_and(|i| i + 1 >= search_matches.len());
 							search_match_index = Some(idx);
 							let current_match = search_matches[idx];
-							cursor_abs_line = current_match.line;
-							let target = registry.find_node_at_line_col(
+							place_cursor_at_line_col(
+								&registry,
 								rid,
 								current_match.line,
 								current_match.col,
-							);
-							apply_cursor_target(
-								target,
+								true,
 								&mut cursor_node,
 								&mut cursor_offset,
+								&mut cursor_abs_line,
 								&mut cursor_abs_col,
 							);
 							cursor_abs_col = current_match.col;
@@ -2678,16 +3651,15 @@ impl Engine {
 							let wrapped = search_match_index.is_some_and(|i| i == 0);
 							search_match_index = Some(idx);
 							let current_match = search_matches[idx];
-							cursor_abs_line = current_match.line;
-							let target = registry.find_node_at_line_col(
+							place_cursor_at_line_col(
+								&registry,
 								rid,
 								current_match.line,
 								current_match.col,
-							);
-							apply_cursor_target(
-								target,
+								true,
 								&mut cursor_node,
 								&mut cursor_offset,
+								&mut cursor_abs_line,
 								&mut cursor_abs_col,
 							);
 							cursor_abs_col = current_match.col;
@@ -2804,16 +3776,15 @@ impl Engine {
 											range,
 										});
 										let current_match = search_matches[0];
-										cursor_abs_line = current_match.line;
-										let target = registry.find_node_at_line_col(
+										place_cursor_at_line_col(
+											&registry,
 											rid,
 											current_match.line,
 											current_match.col,
-										);
-										apply_cursor_target(
-											target,
+											true,
 											&mut cursor_node,
 											&mut cursor_offset,
+											&mut cursor_abs_line,
 											&mut cursor_abs_col,
 										);
 										cursor_abs_col = current_match.col;
@@ -2937,16 +3908,15 @@ impl Engine {
 											if let Some(ni) = next_idx {
 												search_match_index = Some(ni);
 												let current_match = search_matches[ni];
-												cursor_abs_line = current_match.line;
-												let target = registry.find_node_at_line_col(
+												place_cursor_at_line_col(
+													&registry,
 													new_rid,
 													current_match.line,
 													current_match.col,
-												);
-												apply_cursor_target(
-													target,
+													true,
 													&mut cursor_node,
 													&mut cursor_offset,
+													&mut cursor_abs_line,
 													&mut cursor_abs_col,
 												);
 												cursor_abs_col = current_match.col;
@@ -2962,15 +3932,15 @@ impl Engine {
 												));
 												mode_override = Some(EditorMode::Normal);
 												confirm_state = None;
-												let target = registry.find_node_at_line_col(
+												place_cursor_at_line_col(
+													&registry,
 													new_rid,
 													cursor_abs_line,
 													cursor_abs_col,
-												);
-												apply_cursor_target(
-													target,
+													false,
 													&mut cursor_node,
 													&mut cursor_offset,
+													&mut cursor_abs_line,
 													&mut cursor_abs_col,
 												);
 											}
@@ -2983,16 +3953,15 @@ impl Engine {
 								if idx + 1 < search_matches.len() {
 									search_match_index = Some(idx + 1);
 									let current_match = search_matches[idx + 1];
-									cursor_abs_line = current_match.line;
-									let target = registry.find_node_at_line_col(
+									place_cursor_at_line_col(
+										&registry,
 										rid,
 										current_match.line,
 										current_match.col,
-									);
-									apply_cursor_target(
-										target,
+										true,
 										&mut cursor_node,
 										&mut cursor_offset,
+										&mut cursor_abs_line,
 										&mut cursor_abs_col,
 									);
 									cursor_abs_col = current_match.col;
@@ -3145,17 +4114,16 @@ impl Engine {
 										status_message = Some(msg);
 									} else if let Some(new_root) = root_id {
 										// Place cursor on the first line of pasted text.
-										cursor_abs_line = target_cursor_line;
 										cursor_abs_col = VisualCol::ZERO;
-										let target = registry.find_node_at_line_col(
+										place_cursor_at_line_col(
+											&registry,
 											new_root,
-											cursor_abs_line,
+											target_cursor_line,
 											cursor_abs_col,
-										);
-										apply_cursor_target(
-											target,
+											true,
 											&mut cursor_node,
 											&mut cursor_offset,
+											&mut cursor_abs_line,
 											&mut cursor_abs_col,
 										);
 									}
@@ -3232,6 +4200,8 @@ impl Engine {
 				let (virtual_tokens, tokens, total_lines) = if let Some(rid) = root_id {
 					let total_lines = registry.get_total_newlines(rid);
 					scroll_y = pan_scroll_y_to_keep_cursor_visible(
+						&registry,
+						rid,
 						scroll_y,
 						cursor_abs_line,
 						total_lines,
@@ -3391,7 +4361,27 @@ impl Engine {
 					}
 					_ => Vec::new(),
 				};
-				let viewport_start_line = DocLine::new(scroll_y);
+				let viewport_start_line = tokens
+					.first()
+					.map(|token| token.absolute_start_line)
+					.unwrap_or(DocLine::new(scroll_y));
+				scroll_y = viewport_start_line.get();
+				let visible_line_starts = collect_visible_line_starts(&tokens);
+				let viewport_end_line = visible_line_starts
+					.last()
+					.copied()
+					.unwrap_or(viewport_start_line)
+					.saturating_add(1);
+				let cursor_visual_row = if let Some(rid) = root_id {
+					let cursor_line =
+						snap_line_to_visible_boundary(&registry, rid, cursor_abs_line);
+					let viewport_top_visual =
+						visual_line_index_for_doc_line(&registry, rid, viewport_start_line);
+					let cursor_visual = visual_line_index_for_doc_line(&registry, rid, cursor_line);
+					cursor_visual.saturating_sub(viewport_top_visual)
+				} else {
+					0
+				};
 				let minimap = if let Some(rid) = root_id {
 					let path_changed = last_minimap_path.as_deref() != file_path.as_deref();
 					let state_changed = last_minimap_state != Some(ledger.current_state_id);
@@ -3439,6 +4429,7 @@ impl Engine {
 							total_lines,
 						);
 						snapshot.viewport_start_line = viewport_start_line;
+						snapshot.viewport_end_line = viewport_end_line;
 						snapshot.viewport_line_count = viewport_lines;
 						snapshot.cursor_line = cursor_abs_line;
 						snapshot.search_bands = search_bands;
@@ -3458,6 +4449,7 @@ impl Engine {
 					scroll_y,
 					viewport_start_line,
 					viewport_line_count: viewport_lines,
+					cursor_visual_row,
 					cursor_abs_pos: CursorPosition::new(cursor_abs_line, cursor_abs_col),
 					cursor_abs_byte,
 					cursor_line_start_byte,
@@ -3478,6 +4470,7 @@ impl Engine {
 					yank_flash,
 					minimap,
 					theme_colors: current_theme.syntax_colors.clone(),
+					visible_line_starts,
 				});
 
 				if pending_quit {
@@ -3528,16 +4521,19 @@ mod tests {
 		VisualKind, apply_deltas_to_document, apply_deltas_to_document_internal,
 		build_byte_fallback_minimap_snapshot, build_search_minimap_bands,
 		clamp_cursor_line_to_viewport, delete_char_delta_at_cursor, delete_to_line_end_delta,
-		document_rewrite_delta, first_non_whitespace_visual_col, line_col_from_doc_byte_sparse,
-		line_end_visual_col, linewise_put_insertion, next_word_end, next_word_start,
-		normalize_line_density, pan_scroll_y_to_keep_cursor_visible, prev_word_start,
-		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
-		resolve_visual_ranges, save_document_atomic, scroll_viewport, smart_home_visual_col,
-		step_left_visual_col, step_right_visual_col, word_object_delta_at_cursor,
+		doc_line_for_visual_index, document_rewrite_delta, first_non_whitespace_visual_col,
+		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion,
+		materialize_fold_boundary_at_cursor, nearest_foldable_boundary, next_word_end,
+		next_word_start, normalize_line_density, pan_scroll_y_to_keep_cursor_visible,
+		place_cursor_at_line_col, prev_word_start, rebase_semantic_highlights_after_delta,
+		rebind_document_spans_to_saved_file, resolve_fold_boundary_at_cursor,
+		resolve_visual_ranges, save_document_atomic, scroll_viewport, set_subtree_fold_state,
+		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
+		visual_line_index_for_doc_line, word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, NodeByteOffset, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
-	use crate::engine::undo::{TextDelta, UndoLedger};
+	use crate::engine::undo::{TextDelta, UndoLedger, byte_offset_from_line_col};
 	use crate::svp::SvpPointer;
 	use crate::svp::highlight::{HighlightSpan, TokenCategory};
 	use crate::uast::UastProjection;
@@ -3609,6 +4605,138 @@ mod tests {
 		}
 
 		(registry, root)
+	}
+
+	fn build_foldable_document() -> (UastRegistry, crate::ecs::NodeId, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(6).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 17,
+				newlines: 3,
+			},
+		);
+		let head = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 5,
+				newlines: 1,
+			},
+		);
+		let folded = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 8,
+				newlines: 2,
+			},
+		);
+		let folded_a = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 1,
+			},
+		);
+		let folded_b = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 1,
+			},
+		);
+		let tail = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, head);
+		chunk.append_local_child(root, folded);
+		chunk.append_local_child(root, tail);
+		chunk.append_local_child(folded, folded_a);
+		chunk.append_local_child(folded, folded_b);
+		unsafe {
+			*registry.virtual_data[head.index()].get() = Some(b"head\n".to_vec());
+			*registry.virtual_data[folded_a.index()].get() = Some(b"one\n".to_vec());
+			*registry.virtual_data[folded_b.index()].get() = Some(b"two\n".to_vec());
+			*registry.virtual_data[tail.index()].get() = Some(b"tail".to_vec());
+		}
+		(registry, root, folded)
+	}
+
+	fn build_root_with_rows() -> (
+		UastRegistry,
+		crate::ecs::NodeId,
+		crate::ecs::NodeId,
+		crate::ecs::NodeId,
+	) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(5).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 6,
+				newlines: 2,
+			},
+		);
+		let row_a = chunk.spawn_node(
+			SemanticKind::RelationalRow,
+			None,
+			SpanMetrics {
+				byte_length: 3,
+				newlines: 1,
+			},
+		);
+		let row_b = chunk.spawn_node(
+			SemanticKind::RelationalRow,
+			None,
+			SpanMetrics {
+				byte_length: 3,
+				newlines: 1,
+			},
+		);
+		let cell_a = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 3,
+				newlines: 1,
+			},
+		);
+		let cell_b = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 3,
+				newlines: 1,
+			},
+		);
+		chunk.append_local_child(root, row_a);
+		chunk.append_local_child(root, row_b);
+		chunk.append_local_child(row_a, cell_a);
+		chunk.append_local_child(row_b, cell_b);
+		unsafe {
+			*registry.virtual_data[cell_a.index()].get() = Some(b"a\n".to_vec());
+			*registry.virtual_data[cell_b.index()].get() = Some(b"b\n".to_vec());
+		}
+		(registry, root, row_a, row_b)
+	}
+
+	fn build_line_document(line_count: u32) -> (UastRegistry, crate::ecs::NodeId) {
+		let mut text = String::new();
+		for _ in 0..line_count {
+			text.push_str("x\n");
+		}
+		build_document(&text)
 	}
 
 	fn temp_test_path(name: &str) -> PathBuf {
@@ -4076,52 +5204,772 @@ mod tests {
 
 	#[test]
 	fn pan_scroll_y_keeps_visible_cursor_stationary() {
+		let (registry, root) = build_line_document(200);
 		assert_eq!(
-			pan_scroll_y_to_keep_cursor_visible(10, DocLine::new(20), 200, 50),
+			pan_scroll_y_to_keep_cursor_visible(&registry, root, 10, DocLine::new(20), 200, 50),
 			10
 		);
 	}
 
 	#[test]
 	fn pan_scroll_y_moves_up_when_cursor_above_view() {
+		let (registry, root) = build_line_document(200);
 		assert_eq!(
-			pan_scroll_y_to_keep_cursor_visible(30, DocLine::new(12), 200, 50),
+			pan_scroll_y_to_keep_cursor_visible(&registry, root, 30, DocLine::new(12), 200, 50),
 			12
 		);
 	}
 
 	#[test]
 	fn pan_scroll_y_moves_down_when_cursor_below_view() {
+		let (registry, root) = build_line_document(200);
 		assert_eq!(
-			pan_scroll_y_to_keep_cursor_visible(10, DocLine::new(65), 200, 20),
+			pan_scroll_y_to_keep_cursor_visible(&registry, root, 10, DocLine::new(65), 200, 20),
 			46
 		);
 	}
 
 	#[test]
 	fn pan_scroll_y_keeps_cursor_on_last_visible_line_stationary() {
+		let (registry, root) = build_line_document(200);
 		assert_eq!(
-			pan_scroll_y_to_keep_cursor_visible(10, DocLine::new(29), 200, 20),
+			pan_scroll_y_to_keep_cursor_visible(&registry, root, 10, DocLine::new(29), 200, 20),
 			10
 		);
 	}
 
 	#[test]
 	fn scroll_viewport_clamps_to_document_bounds() {
-		assert_eq!(scroll_viewport(0, -3, 99, 50), 0);
-		assert_eq!(scroll_viewport(45, 10, 99, 50), 50);
+		let (registry, root) = build_line_document(100);
+		assert_eq!(scroll_viewport(&registry, root, 0, -3, 99, 50), 0);
+		assert_eq!(scroll_viewport(&registry, root, 45, 10, 99, 50), 55);
 	}
 
 	#[test]
 	fn clamp_cursor_line_to_viewport_uses_visible_bounds() {
+		let (registry, root) = build_line_document(100);
 		assert_eq!(
-			clamp_cursor_line_to_viewport(DocLine::new(7), 10, 99, 20),
+			clamp_cursor_line_to_viewport(&registry, root, DocLine::new(7), 10, 99, 20),
 			DocLine::new(10),
 		);
 		assert_eq!(
-			clamp_cursor_line_to_viewport(DocLine::new(40), 10, 99, 20),
+			clamp_cursor_line_to_viewport(&registry, root, DocLine::new(40), 10, 99, 20),
 			DocLine::new(29),
 		);
+	}
+
+	#[test]
+	fn visual_line_helpers_collapse_folded_subtrees() {
+		let (registry, root, folded) = build_foldable_document();
+		registry.is_folded[folded.index()].store(true, Ordering::Release);
+
+		assert_eq!(
+			visual_line_index_for_doc_line(&registry, root, DocLine::ZERO),
+			0
+		);
+		assert_eq!(
+			visual_line_index_for_doc_line(&registry, root, DocLine::new(1)),
+			1
+		);
+		assert_eq!(
+			visual_line_index_for_doc_line(&registry, root, DocLine::new(2)),
+			1
+		);
+		assert_eq!(
+			visual_line_index_for_doc_line(&registry, root, DocLine::new(3)),
+			2
+		);
+
+		assert_eq!(
+			doc_line_for_visual_index(&registry, root, 2, registry.get_total_newlines(root)),
+			DocLine::new(3)
+		);
+	}
+
+	#[test]
+	fn pan_scroll_y_uses_folded_visual_rows() {
+		let (registry, root, folded) = build_foldable_document();
+		registry.is_folded[folded.index()].store(true, Ordering::Release);
+
+		assert_eq!(
+			pan_scroll_y_to_keep_cursor_visible(&registry, root, 0, DocLine::new(3), 3, 2),
+			1
+		);
+	}
+
+	#[test]
+	fn nearest_foldable_boundary_skips_root_node() {
+		let (registry, root) = build_document("alpha\nbeta\n");
+		let cursor = registry.find_node_at_line_col(root, DocLine::ZERO, VisualCol::ZERO);
+
+		assert_eq!(
+			nearest_foldable_boundary(&registry, root, cursor.node_id),
+			None
+		);
+	}
+
+	#[test]
+	fn close_all_folds_keeps_root_visible() {
+		let (registry, root, row_a, row_b) = build_root_with_rows();
+
+		set_subtree_fold_state(&registry, root, true);
+
+		assert!(!registry.is_folded[root.index()].load(Ordering::Acquire));
+		assert!(registry.is_folded[row_a.index()].load(Ordering::Acquire));
+		assert!(registry.is_folded[row_b.index()].load(Ordering::Acquire));
+	}
+
+	#[test]
+	fn materialize_fold_boundary_builds_nested_block_inside_single_leaf_document() {
+		let (registry, root) = build_document(
+			"fn main() {\n    if true {\n        alpha();\n        beta();\n    }\n    gamma();\n}\n",
+		);
+
+		let fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(2),
+			VisualCol::new(8),
+		)
+		.expect("nested block fold should materialize");
+
+		assert_ne!(fold, root);
+		registry.is_folded[fold.index()].store(true, Ordering::Release);
+
+		let tokens = registry.query_viewport(root, DocLine::ZERO, 10);
+		assert!(
+			tokens
+				.iter()
+				.any(|token| token.is_folded && token.node_id == fold)
+		);
+		assert!(tokens.len() > 1);
+	}
+
+	#[test]
+	fn collapsed_synthetic_fold_can_be_targeted_for_reopen() {
+		let (registry, root) = build_document(
+			"fn main() {\n    if true {\n        alpha();\n        beta();\n    }\n    gamma();\n}\n",
+		);
+		let fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(2),
+			VisualCol::new(8),
+		)
+		.expect("nested block fold should materialize");
+		registry.is_folded[fold.index()].store(true, Ordering::Release);
+
+		let target = registry.find_node_at_line_col(root, DocLine::new(1), VisualCol::ZERO);
+
+		assert_eq!(target.node_id, fold);
+		assert_eq!(
+			nearest_foldable_boundary(&registry, root, target.node_id),
+			Some(fold)
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_prefers_function_inside_impl_over_parent_impl() {
+		let (registry, root) = build_document(
+			"impl UastRegistry {\n    fn alpha(&self) {\n        first();\n    }\n\n    fn beta(&self) {\n        second();\n        third();\n    }\n\n    fn gamma(&self) {\n        fourth();\n    }\n}\n",
+		);
+
+		let fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(6),
+			VisualCol::new(8),
+		)
+		.expect("method fold should materialize");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+
+		assert_eq!(
+			std::str::from_utf8(&folded_text).expect("folded utf8"),
+			"    fn beta(&self) {\n        second();\n        third();\n    }\n",
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_prefers_function_inside_trait_impl_over_parent_impl() {
+		let (registry, root) = build_document(
+			"impl UastProjection for UastRegistry {\n    fn query_viewport(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        line_count: u32,\n    ) -> Vec<RenderToken> {\n        let mut current_global_byte = DocByte::ZERO;\n        current_global_byte = current_global_byte.saturating_add(line_count as u64);\n        Vec::new()\n    }\n\n    fn find_node_at_line_col(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        target_col: VisualCol,\n    ) -> NodeCursorTarget {\n        self.find_node_at_line_col_internal(root, target_line, target_col, true)\n    }\n}\n",
+		);
+
+		let fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(8),
+			VisualCol::new(8),
+		)
+		.expect("trait impl method fold should materialize");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+
+		assert_eq!(
+			std::str::from_utf8(&folded_text).expect("folded utf8"),
+			"    fn query_viewport(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        line_count: u32,\n    ) -> Vec<RenderToken> {\n        let mut current_global_byte = DocByte::ZERO;\n        current_global_byte = current_global_byte.saturating_add(line_count as u64);\n        Vec::new()\n    }\n",
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_on_function_signature_indent_still_picks_function() {
+		let (registry, root) = build_document(
+			"impl UastRegistry {\n    fn alpha(&self) {\n        first();\n    }\n\n    fn beta(&self) {\n        second();\n        third();\n    }\n\n    fn gamma(&self) {\n        fourth();\n    }\n}\n",
+		);
+
+		let fold =
+			materialize_fold_boundary_at_cursor(&registry, root, DocLine::new(5), VisualCol::ZERO)
+				.expect("method fold should materialize");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+
+		assert_eq!(
+			std::str::from_utf8(&folded_text).expect("folded utf8"),
+			"    fn beta(&self) {\n        second();\n        third();\n    }\n",
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_on_trait_impl_signature_indent_still_picks_function() {
+		let (registry, root) = build_document(
+			"impl UastProjection for UastRegistry {\n    fn query_viewport(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        line_count: u32,\n    ) -> Vec<RenderToken> {\n        let mut current_global_byte = DocByte::ZERO;\n        current_global_byte = current_global_byte.saturating_add(line_count as u64);\n        Vec::new()\n    }\n\n    fn find_node_at_line_col(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        target_col: VisualCol,\n    ) -> NodeCursorTarget {\n        self.find_node_at_line_col_internal(root, target_line, target_col, true)\n    }\n}\n",
+		);
+
+		let fold =
+			materialize_fold_boundary_at_cursor(&registry, root, DocLine::new(1), VisualCol::ZERO)
+				.expect("trait impl method fold should materialize from signature line");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+
+		assert_eq!(
+			std::str::from_utf8(&folded_text).expect("folded utf8"),
+			"    fn query_viewport(\n        &self,\n        root: NodeId,\n        target_line: DocLine,\n        line_count: u32,\n    ) -> Vec<RenderToken> {\n        let mut current_global_byte = DocByte::ZERO;\n        current_global_byte = current_global_byte.saturating_add(line_count as u64);\n        Vec::new()\n    }\n",
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_uses_real_projection_trait_impl_methods() {
+		fn doc_line_of(text: &str, needle: &str) -> DocLine {
+			DocLine::new(
+				text.lines()
+					.position(|line| line.contains(needle))
+					.expect("needle line should exist") as u32,
+			)
+		}
+
+		let text = include_str!("../uast/projection.rs");
+		let (registry, root) = build_document(text);
+		let samples = [
+			(
+				doc_line_of(text, "// PHASE 1: DESCENT (O(log N))"),
+				VisualCol::ZERO,
+				"\tfn query_viewport(",
+			),
+			(
+				doc_line_of(
+					text,
+					"if let Some(child) = (*self.edges[node.index()].get()).first_child {",
+				),
+				VisualCol::new(4),
+				"\tfn get_next_node_in_walk(",
+			),
+			(
+				doc_line_of(
+					text,
+					"self.find_node_at_line_col_internal(root, target_line, target_col, true)",
+				),
+				VisualCol::new(4),
+				"\tfn find_node_at_line_col(",
+			),
+			(
+				doc_line_of(
+					text,
+					"let mut result = Vec::with_capacity((end.saturating_sub(start)) as usize);",
+				),
+				VisualCol::new(4),
+				"\tfn read_loaded_slice(",
+			),
+			(
+				doc_line_of(
+					text,
+					"absolute = absolute.saturating_add(sibling_len as u64);",
+				),
+				VisualCol::new(4),
+				"\tfn doc_byte_for_node_offset(",
+			),
+		];
+
+		for (line, col, expected_start) in samples {
+			let fold = materialize_fold_boundary_at_cursor(&registry, root, line, col)
+				.expect("projection trait impl method fold should materialize");
+			let folded_leaf = registry
+				.get_first_child(fold)
+				.expect("synthetic fold should have one child");
+			let folded_text = registry
+				.read_node_bytes_sync(folded_leaf)
+				.expect("folded text should be readable");
+			let folded_text = std::str::from_utf8(&folded_text).expect("folded utf8");
+
+			assert!(
+				folded_text.starts_with(expected_start),
+				"expected fold to start with {expected_start:?}, got:\n{folded_text}"
+			);
+			assert!(
+				!folded_text.starts_with("impl UastProjection for UastRegistry"),
+				"method fold should not collapse the entire impl block"
+			);
+		}
+	}
+
+	#[test]
+	fn materialize_fold_boundary_in_projection_trait_impl_survives_prior_sibling_fold() {
+		fn doc_line_of(text: &str, needle: &str) -> DocLine {
+			DocLine::new(
+				text.lines()
+					.position(|line| line.contains(needle))
+					.expect("needle line should exist") as u32,
+			)
+		}
+
+		let text = include_str!("../uast/projection.rs");
+		let (registry, root) = build_document(text);
+
+		let helper_fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			doc_line_of(
+				text,
+				"if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {",
+			),
+			VisualCol::new(4),
+		)
+		.expect("helper method fold should materialize");
+		registry.is_folded[helper_fold.index()].store(true, Ordering::Release);
+
+		let trait_fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			doc_line_of(text, "// PHASE 1: DESCENT (O(log N))"),
+			VisualCol::ZERO,
+		)
+		.expect("trait impl method fold should still materialize");
+		let folded_leaf = registry
+			.get_first_child(trait_fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+		let folded_text = std::str::from_utf8(&folded_text).expect("folded utf8");
+
+		assert!(folded_text.starts_with("\tfn query_viewport("));
+		assert!(!folded_text.starts_with("impl UastProjection for UastRegistry"));
+	}
+
+	#[test]
+	fn resolve_fold_boundary_prefers_narrower_projection_method_over_existing_impl_fold() {
+		fn doc_line_of(text: &str, needle: &str) -> DocLine {
+			DocLine::new(
+				text.lines()
+					.position(|line| line.contains(needle))
+					.expect("needle line should exist") as u32,
+			)
+		}
+
+		let text = include_str!("../uast/projection.rs");
+		let (registry, root) = build_document(text);
+		let impl_fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			doc_line_of(text, "impl UastProjection for UastRegistry {"),
+			VisualCol::ZERO,
+		)
+		.expect("impl fold should materialize");
+		let impl_leaf = registry
+			.get_first_child(impl_fold)
+			.expect("impl fold should have one child");
+		let impl_text = registry
+			.read_node_bytes_sync(impl_leaf)
+			.expect("impl fold text should be readable");
+		assert!(
+			std::str::from_utf8(&impl_text)
+				.expect("impl fold utf8")
+				.starts_with("impl UastProjection for UastRegistry {")
+		);
+
+		let cursor_line = doc_line_of(text, "// PHASE 1: DESCENT (O(log N))");
+		let cursor = registry.find_node_at_line_col(root, cursor_line, VisualCol::ZERO);
+		let target = resolve_fold_boundary_at_cursor(
+			&registry,
+			root,
+			cursor.node_id,
+			cursor_line,
+			VisualCol::ZERO,
+			true,
+		)
+		.expect("narrower query_viewport fold should be selected");
+
+		assert_ne!(target, impl_fold);
+		let folded_leaf = registry
+			.get_first_child(target)
+			.expect("function fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("function fold text should be readable");
+		assert!(
+			std::str::from_utf8(&folded_text)
+				.expect("function fold utf8")
+				.starts_with("\tfn query_viewport(")
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_inside_multiline_macro_in_method_prefers_method() {
+		let (registry, root) = build_document(
+			"impl UastRegistry {\n    fn alloc_node_internal(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n\n    fn reserve_chunk(&self, size: u32) -> Option<RegistryChunk<'_>> {\n        let start_id = self.next_id.fetch_add(size, Ordering::Relaxed);\n        if start_id + size > self.capacity + 1 {\n            return None;\n        }\n        Some(RegistryChunk::new(self, start_id, size))\n    }\n}\n",
+		);
+
+		let fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(4),
+			VisualCol::new(12),
+		)
+		.expect("method fold should materialize");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+
+		assert_eq!(
+			std::str::from_utf8(&folded_text).expect("folded utf8"),
+			"    fn alloc_node_internal(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n",
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_inside_if_in_method_prefers_method() {
+		let (registry, root) = build_document(
+			"impl UastRegistry {\n    fn alloc_node_internal(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n\n    fn reserve_chunk(&self, size: u32) -> Option<RegistryChunk<'_>> {\n        let start_id = self.next_id.fetch_add(size, Ordering::Relaxed);\n        if start_id + size > self.capacity + 1 {\n            return None;\n        }\n        Some(RegistryChunk::new(self, start_id, size))\n    }\n}\n",
+		);
+
+		let fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(13),
+			VisualCol::new(8),
+		)
+		.expect("method fold should materialize");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+
+		assert_eq!(
+			std::str::from_utf8(&folded_text).expect("folded utf8"),
+			"    fn reserve_chunk(&self, size: u32) -> Option<RegistryChunk<'_>> {\n        let start_id = self.next_id.fetch_add(size, Ordering::Relaxed);\n        if start_id + size > self.capacity + 1 {\n            return None;\n        }\n        Some(RegistryChunk::new(self, start_id, size))\n    }\n",
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_on_method_closing_brace_still_picks_function() {
+		let (registry, root) = build_document(
+			"impl UastRegistry {\n    fn alpha(&self) {\n        first();\n    }\n\n    fn beta(&self) {\n        second();\n        third();\n    }\n\n    fn gamma(&self) {\n        fourth();\n    }\n}\n",
+		);
+
+		let fold =
+			materialize_fold_boundary_at_cursor(&registry, root, DocLine::new(8), VisualCol::ZERO)
+				.expect("method closing brace should still target beta");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+
+		assert_eq!(
+			std::str::from_utf8(&folded_text).expect("folded utf8"),
+			"    fn beta(&self) {\n        second();\n        third();\n    }\n",
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_on_blank_separator_after_method_prefers_previous_function() {
+		let (registry, root) = build_document(
+			"impl UastRegistry {\n    fn alpha(&self) {\n        first();\n    }\n\n    fn beta(&self) {\n        second();\n        third();\n    }\n\n    fn gamma(&self) {\n        fourth();\n    }\n}\n",
+		);
+
+		let fold =
+			materialize_fold_boundary_at_cursor(&registry, root, DocLine::new(9), VisualCol::ZERO)
+				.expect("blank separator should still target the previous method");
+		let folded_leaf = registry
+			.get_first_child(fold)
+			.expect("synthetic fold should have one child");
+		let folded_text = registry
+			.read_node_bytes_sync(folded_leaf)
+			.expect("folded text should be readable");
+
+		assert_eq!(
+			std::str::from_utf8(&folded_text).expect("folded utf8"),
+			"    fn beta(&self) {\n        second();\n        third();\n    }\n",
+		);
+	}
+
+	#[test]
+	fn materialize_fold_boundary_includes_outer_attributes_consistently() {
+		let (registry, root) = build_document(
+			"#[test]\nfn smoke() {\n    alpha();\n    beta();\n}\n\n#[derive(\n    Debug,\n    Clone,\n)]\nstruct Widget {\n    field: u32,\n}\n",
+		);
+
+		let fn_fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(2),
+			VisualCol::new(4),
+		)
+		.expect("function fold should materialize");
+		let fn_leaf = registry
+			.get_first_child(fn_fold)
+			.expect("synthetic function fold should have one child");
+		let fn_text = registry
+			.read_node_bytes_sync(fn_leaf)
+			.expect("function fold text should be readable");
+		assert_eq!(
+			std::str::from_utf8(&fn_text).expect("folded utf8"),
+			"#[test]\nfn smoke() {\n    alpha();\n    beta();\n}\n",
+		);
+
+		let derive_fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(10),
+			VisualCol::new(4),
+		)
+		.expect("struct fold should materialize");
+		let derive_leaf = registry
+			.get_first_child(derive_fold)
+			.expect("synthetic derive fold should have one child");
+		let derive_text = registry
+			.read_node_bytes_sync(derive_leaf)
+			.expect("derive fold text should be readable");
+		assert_eq!(
+			std::str::from_utf8(&derive_text).expect("folded utf8"),
+			"#[derive(\n    Debug,\n    Clone,\n)]\nstruct Widget {\n    field: u32,\n}\n",
+		);
+	}
+
+	#[test]
+	fn place_cursor_at_line_col_reveals_hidden_synthetic_fold_target() {
+		let (registry, root) = build_document(
+			"fn main() {\n    if true {\n        alpha();\n        beta();\n    }\n    gamma();\n}\n",
+		);
+		let fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(2),
+			VisualCol::new(8),
+		)
+		.expect("nested block fold should materialize");
+		registry.is_folded[fold.index()].store(true, Ordering::Release);
+
+		let mut cursor_node = registry
+			.find_node_at_line_col(root, DocLine::new(1), VisualCol::ZERO)
+			.node_id;
+		let mut cursor_offset = 0;
+		let mut cursor_abs_line = DocLine::ZERO;
+		let mut cursor_abs_col = VisualCol::ZERO;
+
+		place_cursor_at_line_col(
+			&registry,
+			root,
+			DocLine::new(3),
+			VisualCol::new(8),
+			true,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+		);
+
+		assert!(!registry.is_folded[fold.index()].load(Ordering::Acquire));
+		assert_eq!(cursor_abs_line, DocLine::new(3));
+		assert_ne!(cursor_node, fold);
+	}
+
+	#[test]
+	fn synthetic_fold_round_trips_edit_undo_redo_inside_hidden_range() {
+		let original = "fn main() {\n    if true {\n        alpha();\n        beta();\n    }\n    gamma();\n}\n";
+		let mutated = "fn main() {\n    if true {\n        alpha();\n        delta();\n        beta();\n    }\n    gamma();\n}\n";
+		let (registry, root) = build_document(original);
+		let mut root_id = Some(root);
+		let fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(2),
+			VisualCol::new(8),
+		)
+		.expect("nested block fold should materialize");
+		registry.is_folded[fold.index()].store(true, Ordering::Release);
+
+		let cursor_target = registry.find_node_at_line_col(root, DocLine::new(1), VisualCol::ZERO);
+		let mut cursor_node = cursor_target.node_id;
+		let mut cursor_offset = cursor_target.node_byte.get();
+		let mut cursor_abs_line = DocLine::new(1);
+		let mut cursor_abs_col = cursor_target.visual_col;
+		let mut ledger = UndoLedger::new();
+		let mut semantic_highlights = Vec::new();
+		let insert_offset =
+			byte_offset_from_line_col(original.as_bytes(), DocLine::new(3), VisualCol::ZERO);
+
+		apply_deltas_to_document(
+			&registry,
+			&mut root_id,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+			&mut ledger,
+			&mut semantic_highlights,
+			vec![TextDelta {
+				global_byte_offset: insert_offset,
+				deleted_text: String::new(),
+				inserted_text: "        delta();\n".to_string(),
+				state_before: StateId::ZERO,
+				state_after: StateId::ZERO,
+			}],
+		)
+		.expect("edit inside folded range should apply");
+
+		let root = root_id.expect("mutated root");
+		let bytes = registry
+			.read_loaded_slice(
+				root,
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(root)),
+			)
+			.expect("collect mutated bytes");
+		assert_eq!(String::from_utf8(bytes).expect("utf8"), mutated);
+		assert!(!registry.is_folded[fold.index()].load(Ordering::Acquire));
+
+		let (undo_group, undo_cursor_byte) = ledger.undo().expect("undo should exist");
+		apply_deltas_to_document_internal(
+			&registry,
+			&mut root_id,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+			&mut ledger,
+			&mut semantic_highlights,
+			undo_group,
+			false,
+			Some(undo_cursor_byte),
+		)
+		.expect("undo should apply");
+
+		let root = root_id.expect("restored root");
+		let restored = registry
+			.read_loaded_slice(
+				root,
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(root)),
+			)
+			.expect("collect restored bytes");
+		assert_eq!(String::from_utf8(restored).expect("utf8"), original);
+
+		let (redo_group, redo_cursor_byte) = ledger.redo().expect("redo should exist");
+		apply_deltas_to_document_internal(
+			&registry,
+			&mut root_id,
+			&mut cursor_node,
+			&mut cursor_offset,
+			&mut cursor_abs_line,
+			&mut cursor_abs_col,
+			&mut ledger,
+			&mut semantic_highlights,
+			redo_group,
+			false,
+			Some(redo_cursor_byte),
+		)
+		.expect("redo should apply");
+
+		let root = root_id.expect("redone root");
+		let redone = registry
+			.read_loaded_slice(
+				root,
+				DocByte::ZERO,
+				DocByte::new(registry.get_total_bytes(root)),
+			)
+			.expect("collect redone bytes");
+		assert_eq!(String::from_utf8(redone).expect("utf8"), mutated);
+	}
+
+	#[test]
+	fn nested_synthetic_parent_fold_keeps_function_tail_attached() {
+		let (registry, root) = build_document(
+			"fn main() {\n    alpha();\n    if true {\n        beta();\n        gamma();\n    }\n    delta();\n    epsilon();\n}\n\nfn outside() {\n    zeta();\n}\n",
+		);
+		let inner_fold = materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(3),
+			VisualCol::new(8),
+		)
+		.expect("inner if fold should materialize");
+		registry.is_folded[inner_fold.index()].store(true, Ordering::Release);
+
+		let outer_fold =
+			materialize_fold_boundary_at_cursor(&registry, root, DocLine::ZERO, VisualCol::ZERO)
+				.expect("outer function fold should materialize");
+		registry.is_folded[outer_fold.index()].store(true, Ordering::Release);
+
+		let tokens = registry.query_viewport(root, DocLine::ZERO, 20);
+		assert!(
+			tokens
+				.iter()
+				.any(|token| token.is_folded && token.node_id == outer_fold)
+		);
+		assert!(!tokens.iter().any(|token| {
+			String::from_utf8_lossy(&token.text).contains("delta()")
+				|| String::from_utf8_lossy(&token.text).contains("epsilon()")
+		}));
+		assert!(tokens.iter().any(|token| {
+			!token.is_folded && String::from_utf8_lossy(&token.text).contains("fn outside()")
+		}));
+
+		registry.is_folded[outer_fold.index()].store(false, Ordering::Release);
+		let reopened = registry.query_viewport(root, DocLine::ZERO, 20);
+		assert!(
+			reopened
+				.iter()
+				.any(|token| token.is_folded && token.node_id == inner_fold)
+		);
+		assert!(reopened.iter().any(|token| {
+			!token.is_folded && String::from_utf8_lossy(&token.text).contains("delta();")
+		}));
+		assert!(reopened.iter().any(|token| {
+			!token.is_folded && String::from_utf8_lossy(&token.text).contains("epsilon();")
+		}));
 	}
 
 	#[test]

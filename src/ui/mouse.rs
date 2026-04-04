@@ -29,8 +29,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 				if mouse.row >= render_line_count {
 					return;
 				}
-				let max_line_on_screen = view.scroll_y + viewport_line_count.saturating_sub(1);
-				let digits = max_line_on_screen.max(1).ilog10() + 1;
+				let digits = view.total_lines.max(1).ilog10() + 1;
 				let gutter_width = digits as u16 + 1;
 
 				let click_x = mouse.column;
@@ -39,13 +38,17 @@ impl<B: Backend + io::Write> Frontend<B> {
 					return;
 				}
 
-				let abs_line = view.scroll_y + click_y as u32;
+				let abs_line = view
+					.visible_line_starts
+					.get(click_y as usize)
+					.copied()
+					.unwrap_or_else(|| DocLine::new(view.scroll_y + click_y as u32));
 				let target_visual_col = u32::from(click_x - gutter_width);
 
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::ClickCursor(CursorPosition::new(
-						DocLine::new(abs_line),
+						abs_line,
 						VisualCol::new(target_visual_col),
 					)));
 				self.needs_redraw = true;

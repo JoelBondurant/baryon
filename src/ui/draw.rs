@@ -117,9 +117,6 @@ impl<B: Backend + io::Write> Frontend<B> {
 				{
 					let buf = f.buffer_mut();
 					if let Some(view) = current_viewport {
-						let scroll_y = view.scroll_y;
-						let viewport_line_count = view.viewport_line_count.max(1);
-						let max_line_on_screen = scroll_y + viewport_line_count.saturating_sub(1);
 						let minimap_width = if view.minimap.is_some() && max_width > 40 {
 							14u16.min(max_width.saturating_sub(24))
 						} else {
@@ -135,7 +132,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 							height: max_height.saturating_sub(1),
 						};
 
-						let digits = max_line_on_screen.max(1).ilog10() + 1;
+						let digits = view.total_lines.max(1).ilog10() + 1;
 						let gutter_width: u16 = digits as u16 + 1;
 						let gutter_style = Style::default().bg(GUTTER_BG).fg(GUTTER_FG);
 						let text_left = gutter_width as usize;
@@ -188,17 +185,80 @@ impl<B: Backend + io::Write> Frontend<B> {
 						let mut current_global_byte = view.global_start_byte;
 
 						for token in &view.tokens {
+							if x != text_left
+								&& token.absolute_start_line.get() > current_doc_line
+								&& y < render_height
+							{
+								y += 1;
+								x = text_left;
+							}
+							if x == text_left && token.absolute_start_line.get() != current_doc_line
+							{
+								current_doc_line = token.absolute_start_line.get();
+								if y < render_height {
+									draw_gutter_line_number(
+										buf,
+										gutter_width,
+										y,
+										current_doc_line,
+										view.total_lines,
+										gutter_style,
+									);
+								}
+							}
+
 							let base_style = match token.kind {
 								SemanticKind::Token => Style::default().fg(TEXT_FG),
 								_ => Style::default().fg(TEXT_FG),
 							};
 							let virtual_style = base_style;
-							let has_physical_bytes = !token.text.is_empty();
-							let text = if has_physical_bytes {
+							let has_physical_bytes = !token.text.is_empty() && !token.is_folded;
+							let text = if token.is_folded {
+								token.text.as_slice()
+							} else if has_physical_bytes {
 								token.text.as_slice()
 							} else {
 								b"[DMA PENDING...]"
 							};
+
+							if token.is_folded {
+								let mut style = virtual_style;
+								let folded_start = token.absolute_start_byte;
+								let folded_end = folded_start
+									.saturating_add(token.physical_byte_len as u64)
+									.saturating_sub(1);
+								let in_selection =
+									view.selection_ranges.iter().any(|(start, end)| {
+										*start <= folded_end && *end >= folded_start
+									});
+								if in_selection {
+									style = style.bg(SELECTION_BG);
+								}
+								if let Some((flash_start, flash_end)) = view.yank_flash {
+									if flash_start <= folded_end && flash_end >= folded_start {
+										style =
+											Style::default().bg(MODE_NORMAL_BG).fg(MODE_TEXT_FG);
+									}
+								}
+
+								let display = std::str::from_utf8(text).unwrap_or("[...]");
+								if !paint_wrapped_text(
+									buf,
+									&mut x,
+									&mut y,
+									text_left,
+									text_right,
+									render_height,
+									display,
+									style,
+								) {
+									y = render_height;
+								}
+								current_global_byte = token
+									.absolute_start_byte
+									.saturating_add(token.physical_byte_len as u64);
+								continue;
+							}
 
 							let highlight_style =
 								Style::default().bg(SEARCH_MATCH_BG).fg(SEARCH_MATCH_FG);
@@ -389,8 +449,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 							}
 						}
 
-						let visual_cursor_y =
-							view.cursor_abs_pos.line.saturating_sub(scroll_y).get() as u16;
+						let visual_cursor_y = view.cursor_visual_row as u16;
 						let visual_cursor_x = (view.cursor_abs_pos.col.get() as u16)
 							.checked_add(gutter_width)
 							.unwrap_or(text_right as u16);

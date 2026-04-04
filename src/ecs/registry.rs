@@ -41,6 +41,9 @@ pub struct UastRegistry {
 	/// Tracks nodes currently being resolved by the I/O thread.
 	pub dma_in_flight: Box<[AtomicBool]>,
 
+	/// Fold state for semantic boundaries.
+	pub is_folded: Box<[AtomicBool]>,
+
 	/// Tracks newline inflation in progress to avoid double-counting.
 	pub metric_inflating: Box<[AtomicBool]>,
 
@@ -91,6 +94,10 @@ impl UastRegistry {
 				.map(|_| AtomicBool::new(false))
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
+			is_folded: (0..cap)
+				.map(|_| AtomicBool::new(false))
+				.collect::<Vec<_>>()
+				.into_boxed_slice(),
 			metric_inflating: (0..cap)
 				.map(|_| AtomicBool::new(false))
 				.collect::<Vec<_>>()
@@ -110,7 +117,9 @@ impl UastRegistry {
 			id_val <= self.capacity,
 			"UastRegistry capacity exceeded during split"
 		);
-		NodeId::from_index(id_val as usize - 1)
+		let node = NodeId::from_index(id_val as usize - 1);
+		self.is_folded[node.index()].store(false, Ordering::Relaxed);
+		node
 	}
 
 	/// Atomically reserves a chunk of `NodeId`s for a single thread.

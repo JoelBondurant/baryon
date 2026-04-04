@@ -48,6 +48,7 @@ impl<'a> RegistryChunk<'a> {
 			*self.registry.metrics[idx].get() = metric;
 			// edges and child_tails are already zeroed out by default
 		}
+		self.registry.is_folded[idx].store(false, std::sync::atomic::Ordering::Relaxed);
 
 		id
 	}

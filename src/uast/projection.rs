@@ -10,10 +10,12 @@ pub struct RenderToken {
 	pub node_id: NodeId,
 	pub kind: SemanticKind,
 	pub text: Vec<u8>,
+	pub physical_byte_len: u32,
 	#[allow(dead_code)]
 	pub absolute_start_line: DocLine,
 	pub absolute_start_byte: DocByte,
 	pub is_virtual: bool,
+	pub is_folded: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +38,7 @@ pub struct Viewport {
 	pub scroll_y: u32,
 	pub viewport_start_line: DocLine,
 	pub viewport_line_count: u32,
+	pub cursor_visual_row: u32,
 	pub cursor_abs_pos: CursorPosition,
 	pub cursor_abs_byte: DocByte,
 	pub cursor_line_start_byte: DocByte,
@@ -56,6 +59,7 @@ pub struct Viewport {
 	pub yank_flash: Option<(DocByte, DocByte)>,
 	pub minimap: Option<MinimapSnapshot>,
 	pub theme_colors: [Option<Color>; CATEGORY_COUNT],
+	pub visible_line_starts: Vec<DocLine>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,9 +76,12 @@ pub struct MinimapSnapshot {
 	pub active_search_band: Option<usize>,
 	pub total_lines: u32,
 	pub viewport_start_line: DocLine,
+	pub viewport_end_line: DocLine,
 	pub viewport_line_count: u32,
 	pub cursor_line: DocLine,
 }
+
+const FOLDED_TOKEN_TEXT: &[u8] = b"[...]";
 
 fn advance_visual_col(col: &mut VisualCol, byte: u8) {
 	if byte == b'\t' {
@@ -100,6 +107,13 @@ fn line_start_offset(text: &[u8], target_line_in_node: DocLine) -> Option<usize>
 	}
 
 	None
+}
+
+fn line_starts_at_node_end(text: &[u8], target_line_in_node: DocLine) -> bool {
+	matches!(
+		line_start_offset(text, target_line_in_node),
+		Some(offset) if offset == text.len()
+	)
 }
 
 fn offset_for_visual_col(line_bytes: &[u8], target_col: VisualCol) -> (NodeByteOffset, VisualCol) {
@@ -155,6 +169,192 @@ pub trait UastProjection {
 }
 
 impl UastRegistry {
+	pub(crate) fn next_node_skipping_children(&self, node: NodeId) -> Option<NodeId> {
+		unsafe {
+			let mut curr = node;
+			loop {
+				if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {
+					return Some(sib);
+				}
+				if let Some(parent) = (*self.edges[curr.index()].get()).parent {
+					curr = parent;
+				} else {
+					return None;
+				}
+			}
+		}
+	}
+
+	fn find_node_at_line_col_internal(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		target_col: VisualCol,
+		respect_folds: bool,
+	) -> NodeCursorTarget {
+		let mut curr = Some(root);
+		let mut line_accumulator = DocLine::ZERO;
+		let mut last_effective_leaf: Option<NodeCursorTarget> = None;
+
+		while let Some(node) = curr {
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			let is_folded =
+				respect_folds && has_children && self.is_folded[idx].load(Ordering::Acquire);
+
+			if has_children && !is_folded {
+				curr = self.get_first_child(node);
+				continue;
+			}
+
+			if !has_children && !self.metrics_inflated[idx].load(Ordering::Acquire) {
+				self.ensure_metrics_inflated(node);
+			}
+
+			let metrics = unsafe { &*self.metrics[idx].get() };
+			let node_end_line = line_accumulator.saturating_add(metrics.newlines);
+			last_effective_leaf = Some(if is_folded {
+				NodeCursorTarget {
+					node_id: node,
+					node_byte: NodeByteOffset::ZERO,
+					visual_col: VisualCol::ZERO,
+				}
+			} else {
+				let bytes = self.read_node_bytes_sync(node).unwrap_or_default();
+				NodeCursorTarget {
+					node_id: node,
+					node_byte: NodeByteOffset::new(bytes.len() as u32),
+					visual_col: VisualCol::ZERO,
+				}
+			});
+
+			let contains_target_line = target_line < node_end_line
+				|| (target_line == node_end_line
+					&& (!is_folded || self.next_node_skipping_children(node).is_none()));
+			if contains_target_line {
+				if is_folded {
+					return NodeCursorTarget {
+						node_id: node,
+						node_byte: NodeByteOffset::ZERO,
+						visual_col: VisualCol::ZERO,
+					};
+				}
+
+				let bytes = self.read_node_bytes_sync(node).unwrap_or_default();
+				let target_line_in_node = target_line.saturating_sub(line_accumulator.get());
+				if line_starts_at_node_end(&bytes, target_line_in_node)
+					&& self.next_node_skipping_children(node).is_some()
+				{
+					line_accumulator = node_end_line;
+					curr = self.next_node_skipping_children(node);
+					continue;
+				}
+				if let Some(line_start) = line_start_offset(&bytes, target_line_in_node) {
+					let (line_offset, clamped_col) =
+						offset_for_visual_col(&bytes[line_start..], target_col);
+					return NodeCursorTarget {
+						node_id: node,
+						node_byte: NodeByteOffset::new(line_start as u32 + line_offset.get()),
+						visual_col: clamped_col,
+					};
+				}
+
+				return NodeCursorTarget {
+					node_id: node,
+					node_byte: NodeByteOffset::new(bytes.len() as u32),
+					visual_col: VisualCol::ZERO,
+				};
+			}
+
+			line_accumulator = node_end_line;
+			curr = self.next_node_skipping_children(node);
+		}
+
+		last_effective_leaf.unwrap_or(NodeCursorTarget {
+			node_id: root,
+			node_byte: NodeByteOffset::ZERO,
+			visual_col: VisualCol::ZERO,
+		})
+	}
+
+	fn find_node_at_doc_byte_internal(
+		&self,
+		root: NodeId,
+		target_byte: DocByte,
+		respect_folds: bool,
+	) -> NodeByteTarget {
+		let root_len = unsafe { (*self.metrics[root.index()].get()).byte_length as u64 };
+		let clamped_target = target_byte.get().min(root_len);
+		let mut curr = Some(root);
+		let mut byte_accumulator = DocByte::ZERO;
+		let mut last_effective_leaf: Option<NodeByteTarget> = None;
+
+		while let Some(node) = curr {
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			let is_folded =
+				respect_folds && has_children && self.is_folded[idx].load(Ordering::Acquire);
+			let metrics = unsafe { &*self.metrics[idx].get() };
+			let node_start = byte_accumulator;
+			let node_end = node_start.saturating_add(metrics.byte_length as u64);
+
+			if clamped_target < node_end.get()
+				|| (clamped_target == root_len && node_end.get() == root_len)
+			{
+				if has_children && !is_folded {
+					curr = self.get_first_child(node);
+					continue;
+				}
+
+				let local_offset = if is_folded {
+					0
+				} else {
+					clamped_target.saturating_sub(node_start.get()) as u32
+				};
+				return NodeByteTarget {
+					node_id: node,
+					node_start_byte: node_start,
+					node_end_byte: node_end,
+					node_byte: NodeByteOffset::new(local_offset.min(metrics.byte_length)),
+				};
+			}
+
+			last_effective_leaf = Some(NodeByteTarget {
+				node_id: node,
+				node_start_byte: node_start,
+				node_end_byte: node_end,
+				node_byte: NodeByteOffset::new(if is_folded { 0 } else { metrics.byte_length }),
+			});
+
+			byte_accumulator = node_end;
+			curr = self.next_node_skipping_children(node);
+		}
+
+		last_effective_leaf.unwrap_or(NodeByteTarget {
+			node_id: root,
+			node_start_byte: DocByte::ZERO,
+			node_end_byte: DocByte::ZERO,
+			node_byte: NodeByteOffset::ZERO,
+		})
+	}
+
+	pub(crate) fn find_node_at_line_col_raw(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		target_col: VisualCol,
+	) -> NodeCursorTarget {
+		self.find_node_at_line_col_internal(root, target_line, target_col, false)
+	}
+
+	pub(crate) fn find_node_at_doc_byte_raw(
+		&self,
+		root: NodeId,
+		target_byte: DocByte,
+	) -> NodeByteTarget {
+		self.find_node_at_doc_byte_internal(root, target_byte, false)
+	}
+
 	pub fn for_each_loaded_slice_fragment<F>(
 		&self,
 		root: NodeId,
@@ -172,7 +372,7 @@ impl UastRegistry {
 			return Ok(());
 		}
 
-		let start_target = self.find_node_at_doc_byte(root, DocByte::new(start));
+		let start_target = self.find_node_at_doc_byte_raw(root, DocByte::new(start));
 		let mut visit = Some(start_target.node_id);
 		let mut local_start = start_target.node_byte.get() as usize;
 		let mut absolute_start = start_target.node_start_byte;
@@ -232,17 +432,38 @@ impl UastProjection for UastRegistry {
 		let mut curr = Some(root);
 		let mut line_accumulator = DocLine::ZERO;
 		let mut byte_accumulator = DocByte::ZERO;
+		let line_count = line_count.max(1);
 
 		// PHASE 1: DESCENT (O(log N))
 		while let Some(node) = curr {
 			let idx = node.index();
 			let m = unsafe { &*self.metrics[idx].get() };
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			let is_folded = has_children && self.is_folded[idx].load(Ordering::Acquire);
+			let node_end_line = line_accumulator.saturating_add(m.newlines);
+			let contains_target_line = target_line < node_end_line
+				|| (target_line == node_end_line
+					&& (!is_folded || self.next_node_skipping_children(node).is_none()));
 
-			if line_accumulator + m.newlines >= target_line {
-				let first_child = unsafe { (*self.edges[idx].get()).first_child };
-				if let Some(child) = first_child {
-					curr = Some(child);
-					continue;
+			if contains_target_line {
+				if !has_children && !is_folded && target_line == node_end_line {
+					let text = self.resolve_physical_bytes(node);
+					let target_line_in_node = target_line.saturating_sub(line_accumulator.get());
+					if line_starts_at_node_end(&text, target_line_in_node)
+						&& self.next_node_skipping_children(node).is_some()
+					{
+						line_accumulator = node_end_line;
+						byte_accumulator = byte_accumulator.saturating_add(m.byte_length as u64);
+						curr = self.next_node_skipping_children(node);
+						continue;
+					}
+				}
+				if has_children && !is_folded {
+					let first_child = unsafe { (*self.edges[idx].get()).first_child };
+					if let Some(child) = first_child {
+						curr = Some(child);
+						continue;
+					}
 				} else {
 					break;
 				}
@@ -260,52 +481,90 @@ impl UastProjection for UastRegistry {
 
 		while let Some(node) = visit {
 			let idx = node.index();
-			let m = unsafe { &*self.metrics[idx].get() };
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			let is_folded = has_children && self.is_folded[idx].load(Ordering::Acquire);
 
-			if m.byte_length == 0 && m.newlines == 0 {
-				visit = self.get_next_node_in_walk(node);
+			if has_children && !is_folded {
+				visit = self.get_first_child(node);
 				continue;
 			}
 
-			let text = self.resolve_physical_bytes(node);
+			let m = unsafe { &*self.metrics[idx].get() };
+			let node_end_line = line_accumulator.saturating_add(m.newlines);
 
-			let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
+			if m.byte_length == 0 && m.newlines == 0 {
+				visit = self.next_node_skipping_children(node);
+				continue;
+			}
+
+			let text = if is_folded {
+				FOLDED_TOKEN_TEXT.to_vec()
+			} else {
+				self.resolve_physical_bytes(node)
+			};
+
+			let is_virtual = is_folded || unsafe { (*self.spans[idx].get()).is_none() };
 			let kind = unsafe { *self.kinds[idx].get() };
 
 			let mut display_text = text.clone();
+			let mut token_start_line = line_accumulator;
 			let mut token_start_byte = byte_accumulator;
 
-			if line_accumulator < target_line {
-				if line_accumulator + m.newlines < target_line {
-					line_accumulator = line_accumulator.saturating_add(m.newlines);
+			if is_folded && line_accumulator < target_line {
+				let skip_fold = node_end_line < target_line
+					|| (node_end_line == target_line
+						&& self.next_node_skipping_children(node).is_some());
+				if skip_fold {
+					line_accumulator = node_end_line;
 					byte_accumulator = byte_accumulator.saturating_add(m.byte_length as u64);
-					visit = self.get_next_node_in_walk(node);
+					visit = self.next_node_skipping_children(node);
+					continue;
+				}
+			}
+
+			if !is_folded && line_accumulator < target_line {
+				if line_accumulator + m.newlines < target_line {
+					line_accumulator = node_end_line;
+					byte_accumulator = byte_accumulator.saturating_add(m.byte_length as u64);
+					visit = self.next_node_skipping_children(node);
 					continue;
 				}
 
 				if !text.is_empty() {
 					let to_skip = target_line.saturating_sub(line_accumulator.get());
 					let byte_offset = line_start_offset(&text, to_skip).unwrap_or(text.len());
+					if byte_offset == text.len() && self.next_node_skipping_children(node).is_some() {
+						line_accumulator = node_end_line;
+						byte_accumulator = byte_accumulator.saturating_add(m.byte_length as u64);
+						visit = self.next_node_skipping_children(node);
+						continue;
+					}
 					display_text = text.get(byte_offset..).unwrap_or(&[]).to_vec();
 					token_start_byte = token_start_byte.saturating_add(byte_offset as u64);
 				}
 				line_accumulator = target_line;
+				token_start_line = target_line;
 			}
 
 			tokens.push(RenderToken {
 				node_id: node,
 				kind,
 				text: display_text,
-				absolute_start_line: line_accumulator,
+				physical_byte_len: m.byte_length,
+				absolute_start_line: token_start_line,
 				absolute_start_byte: token_start_byte,
 				is_virtual,
+				is_folded,
 			});
 
 			if tokens.len() > 200 {
 				break;
 			}
 
-			if text.is_empty() {
+			if is_folded {
+				line_accumulator = line_accumulator.saturating_add(m.newlines);
+				collected_lines += 1;
+			} else if text.is_empty() {
 				line_accumulator = line_accumulator.saturating_add(m.newlines);
 				collected_lines += m.newlines;
 			} else {
@@ -326,7 +585,7 @@ impl UastProjection for UastRegistry {
 				break;
 			}
 
-			visit = self.get_next_node_in_walk(node);
+			visit = self.next_node_skipping_children(node);
 		}
 
 		tokens
@@ -358,63 +617,7 @@ impl UastProjection for UastRegistry {
 		target_line: DocLine,
 		target_col: VisualCol,
 	) -> NodeCursorTarget {
-		let mut curr = Some(root);
-		let mut line_accumulator = DocLine::ZERO;
-		let mut last_leaf = None;
-
-		while let Some(node) = curr {
-			let idx = node.index();
-			if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
-				curr = Some(child);
-				continue;
-			}
-
-			if !self.metrics_inflated[idx].load(Ordering::Acquire) {
-				self.ensure_metrics_inflated(node);
-			}
-
-			let metrics = unsafe { &*self.metrics[idx].get() };
-			let node_end_line = line_accumulator.saturating_add(metrics.newlines);
-			last_leaf = Some(node);
-
-			if target_line <= node_end_line {
-				let bytes = self.read_node_bytes_sync(node).unwrap_or_default();
-				let target_line_in_node = target_line.saturating_sub(line_accumulator.get());
-				if let Some(line_start) = line_start_offset(&bytes, target_line_in_node) {
-					let (line_offset, clamped_col) =
-						offset_for_visual_col(&bytes[line_start..], target_col);
-					return NodeCursorTarget {
-						node_id: node,
-						node_byte: NodeByteOffset::new(line_start as u32 + line_offset.get()),
-						visual_col: clamped_col,
-					};
-				}
-
-				return NodeCursorTarget {
-					node_id: node,
-					node_byte: NodeByteOffset::new(bytes.len() as u32),
-					visual_col: VisualCol::ZERO,
-				};
-			}
-
-			line_accumulator = node_end_line;
-			curr = self.get_next_node_in_walk(node);
-		}
-
-		if let Some(node) = last_leaf {
-			let bytes = self.read_node_bytes_sync(node).unwrap_or_default();
-			return NodeCursorTarget {
-				node_id: node,
-				node_byte: NodeByteOffset::new(bytes.len() as u32),
-				visual_col: VisualCol::ZERO,
-			};
-		}
-
-		NodeCursorTarget {
-			node_id: root,
-			node_byte: NodeByteOffset::ZERO,
-			visual_col: VisualCol::ZERO,
-		}
+		self.find_node_at_line_col_internal(root, target_line, target_col, true)
 	}
 
 	fn doc_byte_for_node_offset(
@@ -470,54 +673,7 @@ impl UastProjection for UastRegistry {
 	}
 
 	fn find_node_at_doc_byte(&self, root: NodeId, target_byte: DocByte) -> NodeByteTarget {
-		let root_len = unsafe { (*self.metrics[root.index()].get()).byte_length as u64 };
-		let clamped_target = target_byte.get().min(root_len);
-		let mut curr = Some(root);
-		let mut byte_accumulator = DocByte::ZERO;
-		let mut last_leaf: Option<NodeByteTarget> = None;
-
-		while let Some(node) = curr {
-			let idx = node.index();
-			let m = unsafe { &*self.metrics[idx].get() };
-			let node_start = byte_accumulator;
-			let node_end = node_start.saturating_add(m.byte_length as u64);
-
-			if clamped_target < node_end.get()
-				|| (clamped_target == root_len && node_end.get() == root_len)
-			{
-				if let Some(child) = unsafe { (*self.edges[idx].get()).first_child } {
-					curr = Some(child);
-					continue;
-				}
-
-				let local_offset = clamped_target.saturating_sub(node_start.get()) as u32;
-				return NodeByteTarget {
-					node_id: node,
-					node_start_byte: node_start,
-					node_end_byte: node_end,
-					node_byte: NodeByteOffset::new(local_offset.min(m.byte_length)),
-				};
-			}
-
-			if unsafe { (*self.edges[idx].get()).first_child.is_none() } {
-				last_leaf = Some(NodeByteTarget {
-					node_id: node,
-					node_start_byte: node_start,
-					node_end_byte: node_end,
-					node_byte: NodeByteOffset::new(m.byte_length),
-				});
-			}
-
-			byte_accumulator = node_end;
-			curr = unsafe { (*self.edges[idx].get()).next_sibling };
-		}
-
-		last_leaf.unwrap_or(NodeByteTarget {
-			node_id: root,
-			node_start_byte: DocByte::ZERO,
-			node_end_byte: DocByte::ZERO,
-			node_byte: NodeByteOffset::ZERO,
-		})
+		self.find_node_at_doc_byte_internal(root, target_byte, true)
 	}
 }
 
@@ -617,6 +773,71 @@ mod tests {
 			}
 		}
 		(registry, root)
+	}
+
+	fn build_foldable_document() -> (UastRegistry, crate::ecs::NodeId, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(6).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 17,
+				newlines: 3,
+			},
+		);
+		let head = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 5,
+				newlines: 1,
+			},
+		);
+		let folded = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 8,
+				newlines: 2,
+			},
+		);
+		let folded_a = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 1,
+			},
+		);
+		let folded_b = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 1,
+			},
+		);
+		let tail = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, head);
+		chunk.append_local_child(root, folded);
+		chunk.append_local_child(root, tail);
+		chunk.append_local_child(folded, folded_a);
+		chunk.append_local_child(folded, folded_b);
+		unsafe {
+			*registry.virtual_data[head.index()].get() = Some(b"head\n".to_vec());
+			*registry.virtual_data[folded_a.index()].get() = Some(b"one\n".to_vec());
+			*registry.virtual_data[folded_b.index()].get() = Some(b"two\n".to_vec());
+			*registry.virtual_data[tail.index()].get() = Some(b"tail".to_vec());
+		}
+		(registry, root, folded)
 	}
 
 	fn temp_test_path(name: &str) -> std::path::PathBuf {
@@ -779,6 +1000,29 @@ mod tests {
 	}
 
 	#[test]
+	fn find_node_at_line_col_prefers_next_leaf_at_trailing_newline_boundary() {
+		let (registry, root) = build_document_with_leaves(&["head\n", "tail"]);
+		let second = registry.get_next_sibling(registry.get_first_child(root).unwrap()).unwrap();
+
+		let target = registry.find_node_at_line_col(root, DocLine::new(1), VisualCol::ZERO);
+
+		assert_eq!(target.node_id, second);
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::ZERO);
+	}
+
+	#[test]
+	fn query_viewport_starts_with_next_leaf_after_trailing_newline_boundary() {
+		let (registry, root) = build_document_with_leaves(&["head\n", "tail"]);
+		let second = registry.get_next_sibling(registry.get_first_child(root).unwrap()).unwrap();
+
+		let tokens = registry.query_viewport(root, DocLine::new(1), 1);
+
+		assert_eq!(tokens.len(), 1);
+		assert_eq!(tokens[0].node_id, second);
+		assert_eq!(tokens[0].text, b"tail".to_vec());
+	}
+
+	#[test]
 	fn for_each_loaded_slice_fragment_yields_disjoint_leaf_slices_in_order() {
 		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
 		let mut fragments = Vec::new();
@@ -813,6 +1057,80 @@ mod tests {
 		assert_eq!(tokens.len(), 1);
 		assert_eq!(tokens[0].absolute_start_byte, DocByte::new(3));
 		assert_eq!(tokens[0].text, b"\xffbb\ncc".to_vec());
+	}
+
+	#[test]
+	fn query_viewport_emits_fold_placeholder_and_skips_descendants() {
+		let (registry, root, folded) = build_foldable_document();
+		registry.is_folded[folded.index()].store(true, Ordering::Release);
+
+		let tokens = registry.query_viewport(root, DocLine::ZERO, 4);
+
+		assert_eq!(tokens.len(), 3);
+		assert_eq!(tokens[0].text, b"head\n".to_vec());
+		assert!(tokens[1].is_folded);
+		assert_eq!(tokens[1].node_id, folded);
+		assert_eq!(tokens[1].text, b"[...]".to_vec());
+		assert_eq!(tokens[1].absolute_start_line, DocLine::new(1));
+		assert_eq!(tokens[1].absolute_start_byte, DocByte::new(5));
+		assert_eq!(tokens[1].physical_byte_len, 8);
+		assert_eq!(tokens[2].text, b"tail".to_vec());
+		assert_eq!(tokens[2].absolute_start_line, DocLine::new(3));
+		assert_eq!(tokens[2].absolute_start_byte, DocByte::new(13));
+	}
+
+	#[test]
+	fn query_viewport_starts_on_fold_placeholder_when_target_line_is_hidden() {
+		let (registry, root, folded) = build_foldable_document();
+		registry.is_folded[folded.index()].store(true, Ordering::Release);
+
+		let tokens = registry.query_viewport(root, DocLine::new(2), 2);
+
+		assert_eq!(tokens.len(), 2);
+		assert_eq!(tokens[0].node_id, folded);
+		assert!(tokens[0].is_folded);
+		assert_eq!(tokens[0].absolute_start_line, DocLine::new(1));
+		assert_eq!(tokens[1].text, b"tail".to_vec());
+	}
+
+	#[test]
+	fn find_node_at_line_col_can_reach_the_line_after_a_folded_block() {
+		let (registry, root, folded) = build_foldable_document();
+		registry.is_folded[folded.index()].store(true, Ordering::Release);
+
+		let target = registry.find_node_at_line_col(root, DocLine::new(3), VisualCol::ZERO);
+
+		assert_ne!(target.node_id, folded);
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::ZERO);
+	}
+
+	#[test]
+	fn find_node_at_line_col_returns_fold_boundary_for_hidden_lines() {
+		let (registry, root, folded) = build_foldable_document();
+		registry.is_folded[folded.index()].store(true, Ordering::Release);
+
+		let target = registry.find_node_at_line_col(root, DocLine::new(2), VisualCol::new(3));
+		let raw = registry.find_node_at_line_col_raw(root, DocLine::new(2), VisualCol::new(3));
+
+		assert_eq!(target.node_id, folded);
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::ZERO);
+		assert_eq!(target.visual_col, VisualCol::ZERO);
+		assert_ne!(raw.node_id, folded);
+	}
+
+	#[test]
+	fn find_node_at_doc_byte_returns_fold_boundary_for_hidden_bytes() {
+		let (registry, root, folded) = build_foldable_document();
+		registry.is_folded[folded.index()].store(true, Ordering::Release);
+
+		let target = registry.find_node_at_doc_byte(root, DocByte::new(8));
+		let raw = registry.find_node_at_doc_byte_raw(root, DocByte::new(8));
+
+		assert_eq!(target.node_id, folded);
+		assert_eq!(target.node_start_byte, DocByte::new(5));
+		assert_eq!(target.node_end_byte, DocByte::new(13));
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::ZERO);
+		assert_ne!(raw.node_id, folded);
 	}
 
 	#[test]

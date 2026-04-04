@@ -24,6 +24,7 @@ pub struct Frontend<B: Backend + io::Write> {
 	pub(super) command_buffer: String,
 	pub(super) g_prefix: bool,
 	pub(super) y_prefix: bool,
+	pub(super) z_prefix: bool,
 	pub(super) pending_operator: Option<PendingOperator>,
 	pub(super) awaiting_inner_word: bool,
 	pub(super) pending_register: Option<char>,
@@ -52,6 +53,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			command_buffer: String::new(),
 			g_prefix: false,
 			y_prefix: false,
+			z_prefix: false,
 			pending_operator: None,
 			awaiting_inner_word: false,
 			pending_register: None,
@@ -194,6 +196,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 	pub(super) fn clear_prefixes(&mut self) {
 		self.g_prefix = false;
 		self.y_prefix = false;
+		self.z_prefix = false;
 		self.pending_operator = None;
 		self.awaiting_inner_word = false;
 		self.pending_register = None;

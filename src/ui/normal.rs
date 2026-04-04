@@ -42,6 +42,29 @@ impl<B: Backend + io::Write> Frontend<B> {
 			}
 		}
 
+		if self.z_prefix {
+			match code {
+				KeyCode::Char('a') => {
+					let _ = self.tx_cmd.send(EditorCommand::ToggleFold);
+				}
+				KeyCode::Char('c') => {
+					let _ = self.tx_cmd.send(EditorCommand::CloseFold);
+				}
+				KeyCode::Char('o') => {
+					let _ = self.tx_cmd.send(EditorCommand::OpenFold);
+				}
+				KeyCode::Char('M') => {
+					let _ = self.tx_cmd.send(EditorCommand::CloseAllFolds);
+				}
+				KeyCode::Char('R') => {
+					let _ = self.tx_cmd.send(EditorCommand::OpenAllFolds);
+				}
+				_ => {}
+			}
+			self.clear_prefixes();
+			return false;
+		}
+
 		let register = self.pending_register.unwrap_or('"');
 
 		match code {
@@ -122,6 +145,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 				} else {
 					self.g_prefix = true;
 					self.y_prefix = false;
+					self.z_prefix = false;
 					self.pending_register = None;
 				}
 			}
@@ -186,7 +210,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 				} else {
 					self.y_prefix = true;
 					self.g_prefix = false;
+					self.z_prefix = false;
 				}
+			}
+			KeyCode::Char('z') => {
+				self.clear_prefixes();
+				self.z_prefix = true;
 			}
 			KeyCode::Char('p') => {
 				let _ = self.tx_cmd.send(EditorCommand::Put { register });
