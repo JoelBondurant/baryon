@@ -97,6 +97,9 @@ pub enum EditorCommand {
 	InsertChar(char),
 	Backspace,
 	Delete,
+	DeleteLine {
+		register: char,
+	},
 	Resize(u16, u16),
 	Scroll(i32),
 	ScrollViewport(i32),
@@ -106,6 +109,7 @@ pub enum EditorCommand {
 	CloseAllFolds,
 	OpenAllFolds,
 	MoveCursor(MoveDirection),
+	MatchDelimiter,
 	ClickCursor(CursorPosition),
 	GotoLine(DocLine),
 	LineStart,
@@ -1432,6 +1436,121 @@ fn delete_char_delta_at_cursor(
 	}))
 }
 
+fn delete_line_delta_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	cursor_line: DocLine,
+) -> Result<Option<(TextDelta, String)>, String> {
+	let line_start = line_start_byte_sparse(registry, root, cursor_line);
+	let mut delete_start = line_start;
+	let mut deleted_bytes = read_line_bytes_sparse(registry, root, cursor_line, true)?;
+	let register_text = if deleted_bytes.is_empty() {
+		if line_start == DocByte::ZERO {
+			return Ok(None);
+		}
+		"\n".to_string()
+	} else {
+		String::from_utf8_lossy(&deleted_bytes).into_owned()
+	};
+
+	if deleted_bytes.is_empty() {
+		let prev_start = line_start.saturating_sub(1);
+		let prev_byte = registry
+			.read_loaded_slice(root, prev_start, line_start)
+			.map_err(|msg| msg.to_string())?;
+		if prev_byte.first().copied() != Some(b'\n') {
+			return Ok(None);
+		}
+		delete_start = prev_start;
+		deleted_bytes = prev_byte;
+	} else if !deleted_bytes.ends_with(b"\n") && line_start > DocByte::ZERO {
+		let prev_start = line_start.saturating_sub(1);
+		let prev_byte = registry
+			.read_loaded_slice(root, prev_start, line_start)
+			.map_err(|msg| msg.to_string())?;
+		if prev_byte.first().copied() == Some(b'\n') {
+			let mut prefixed = prev_byte;
+			prefixed.extend_from_slice(&deleted_bytes);
+			deleted_bytes = prefixed;
+			delete_start = prev_start;
+		}
+	}
+
+	Ok(Some((
+		TextDelta {
+			global_byte_offset: delete_start,
+			deleted_text: String::from_utf8_lossy(&deleted_bytes).into_owned(),
+			inserted_text: String::new(),
+			state_before: StateId::ZERO,
+			state_after: StateId::ZERO,
+		},
+		register_text,
+	)))
+}
+
+fn is_matching_delimiter(kind: SyntaxKind) -> bool {
+	matches!(
+		kind,
+		SyntaxKind::L_CURLY
+			| SyntaxKind::R_CURLY
+			| SyntaxKind::L_PAREN
+			| SyntaxKind::R_PAREN
+			| SyntaxKind::L_BRACK
+			| SyntaxKind::R_BRACK
+	)
+}
+
+fn matching_delimiter_target(kind: SyntaxKind) -> Option<(SyntaxKind, Direction)> {
+	match kind {
+		SyntaxKind::L_CURLY => Some((SyntaxKind::R_CURLY, Direction::Next)),
+		SyntaxKind::R_CURLY => Some((SyntaxKind::L_CURLY, Direction::Prev)),
+		SyntaxKind::L_PAREN => Some((SyntaxKind::R_PAREN, Direction::Next)),
+		SyntaxKind::R_PAREN => Some((SyntaxKind::L_PAREN, Direction::Prev)),
+		SyntaxKind::L_BRACK => Some((SyntaxKind::R_BRACK, Direction::Next)),
+		SyntaxKind::R_BRACK => Some((SyntaxKind::L_BRACK, Direction::Prev)),
+		_ => None,
+	}
+}
+
+fn select_delimiter_token_at_offset(
+	syntax: &ra_ap_syntax::SyntaxNode,
+	offset: TextSize,
+) -> Option<SyntaxToken> {
+	let right = syntax.token_at_offset(offset).right_biased();
+	let left = syntax.token_at_offset(offset).left_biased();
+
+	right
+		.filter(|token| is_matching_delimiter(token.kind()))
+		.or_else(|| left.filter(|token| is_matching_delimiter(token.kind())))
+}
+
+fn find_matching_delimiter_byte(doc: &str, cursor_byte: usize) -> Option<usize> {
+	let parse = SourceFile::parse(doc, Edition::Edition2024);
+	let syntax = parse.tree().syntax().clone();
+	let offset = TextSize::from(cursor_byte as u32);
+	let token = select_delimiter_token_at_offset(&syntax, offset)?;
+	let (target_kind, direction) = matching_delimiter_target(token.kind())?;
+	let source_kind = token.kind();
+	let mut depth = 1u32;
+	let mut current = token;
+
+	loop {
+		current = match direction {
+			Direction::Next => current.next_token()?,
+			Direction::Prev => current.prev_token()?,
+		};
+
+		if current.kind() == source_kind {
+			depth += 1;
+		} else if current.kind() == target_kind {
+			depth = depth.saturating_sub(1);
+			if depth == 0 {
+				return Some(u32::from(current.text_range().start()) as usize);
+			}
+		}
+	}
+}
+
 fn word_object_delta_at_cursor(
 	registry: &UastRegistry,
 	root: NodeId,
@@ -2359,6 +2478,39 @@ impl Engine {
 						}
 					}
 				}
+				EditorCommand::DeleteLine { register } => {
+					if let Some(rid) = root_id {
+						match delete_line_delta_sparse(&registry, rid, cursor_abs_line) {
+							Ok(Some((delta, register_text))) => {
+								registers.insert('"', register_text.clone());
+								if register == '+' {
+									clipboard.set_text(&register_text);
+								} else if register != '"' {
+									registers.insert(register, register_text);
+								}
+								if let Err(msg) = apply_deltas_to_document(
+									&registry,
+									&mut root_id,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_line,
+									&mut cursor_abs_col,
+									&mut ledger,
+									&mut semantic_highlights,
+									&mut diagnostic_spans,
+									vec![delta],
+								) {
+									status_message = Some(msg);
+								}
+							}
+							Ok(None) => {
+								status_message = Some("Nothing to delete".to_string());
+							}
+							Err(msg) => status_message = Some(msg),
+						}
+						needs_render = true;
+					}
+				}
 				EditorCommand::InsertChar(c) => {
 					if let Some(rid) = root_id {
 						let global_offset = registry.doc_byte_for_node_offset(
@@ -2481,6 +2633,53 @@ impl Engine {
 								}
 							}
 							Ok(None) => {}
+							Err(msg) => status_message = Some(msg),
+						}
+						needs_render = true;
+					}
+				}
+				EditorCommand::MatchDelimiter => {
+					if let Some(rid) = root_id {
+						let cursor_abs_byte = registry.doc_byte_for_node_offset(
+							rid,
+							cursor_node,
+							NodeByteOffset::new(cursor_offset),
+						);
+						match read_loaded_document(&registry, rid) {
+							Ok(bytes) => match std::str::from_utf8(&bytes) {
+								Ok(doc) => {
+									let cursor_byte = cursor_abs_byte.get() as usize;
+									match find_matching_delimiter_byte(doc, cursor_byte) {
+										Some(target_byte) => {
+											let (target_line, target_col) =
+												line_col_from_byte_offset(
+													&bytes,
+													DocByte::new(target_byte as u64),
+												);
+											place_cursor_at_line_col(
+												&registry,
+												rid,
+												target_line,
+												target_col,
+												true,
+												&mut cursor_node,
+												&mut cursor_offset,
+												&mut cursor_abs_line,
+												&mut cursor_abs_col,
+											);
+										}
+										None => {
+											status_message =
+												Some("No matching delimiter at cursor".to_string());
+										}
+									}
+								}
+								Err(_) => {
+									status_message = Some(
+										"Matching delimiter requires valid UTF-8 text".to_string(),
+									);
+								}
+							},
 							Err(msg) => status_message = Some(msg),
 						}
 						needs_render = true;
@@ -3775,8 +3974,9 @@ mod tests {
 		BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP, FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch,
 		VisualKind, apply_deltas_to_document, apply_deltas_to_document_internal,
 		build_byte_fallback_minimap_snapshot, build_search_minimap_bands,
-		clamp_cursor_line_to_viewport, delete_char_delta_at_cursor, delete_to_line_end_delta,
-		doc_line_for_visual_index, document_rewrite_delta, first_non_whitespace_visual_col,
+		clamp_cursor_line_to_viewport, delete_char_delta_at_cursor, delete_line_delta_sparse,
+		delete_to_line_end_delta, doc_line_for_visual_index, document_rewrite_delta,
+		find_matching_delimiter_byte, first_non_whitespace_visual_col,
 		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion,
 		materialize_fold_boundary_at_cursor, nearest_foldable_boundary, next_word_end,
 		next_word_start, normalize_line_density, pan_scroll_y_to_keep_cursor_visible,
@@ -4239,6 +4439,40 @@ mod tests {
 		assert_eq!(delta.global_byte_offset, DocByte::new(6));
 		assert_eq!(delta.deleted_text, "beta");
 		assert_eq!(delta.inserted_text, "");
+	}
+
+	#[test]
+	fn delete_line_delta_sparse_removes_middle_line_with_newline() {
+		let (registry, root) = build_document("alpha\nbeta\ngamma\n");
+		let (delta, register_text) = delete_line_delta_sparse(&registry, root, DocLine::new(1))
+			.expect("delete line should succeed")
+			.expect("middle line should be deletable");
+
+		assert_eq!(delta.global_byte_offset, DocByte::new(6));
+		assert_eq!(delta.deleted_text, "beta\n");
+		assert_eq!(register_text, "beta\n");
+	}
+
+	#[test]
+	fn delete_line_delta_sparse_absorbs_preceding_newline_for_eof_line() {
+		let (registry, root) = build_document("alpha\nbeta");
+		let (delta, register_text) = delete_line_delta_sparse(&registry, root, DocLine::new(1))
+			.expect("delete line should succeed")
+			.expect("last line should be deletable");
+
+		assert_eq!(delta.global_byte_offset, DocByte::new(5));
+		assert_eq!(delta.deleted_text, "\nbeta");
+		assert_eq!(register_text, "beta");
+	}
+
+	#[test]
+	fn find_matching_delimiter_byte_handles_nested_pairs_and_strings() {
+		let doc = "fn main() { let text = \"}\"; if ready { call(); } }\n";
+		let open = doc.find('{').expect("outer opening brace");
+		let close = doc.rfind('}').expect("outer closing brace");
+
+		assert_eq!(find_matching_delimiter_byte(doc, open), Some(close));
+		assert_eq!(find_matching_delimiter_byte(doc, close), Some(open));
 	}
 
 	#[test]

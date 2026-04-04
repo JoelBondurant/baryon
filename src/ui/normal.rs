@@ -34,6 +34,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 				}
 
 				self.clear_operator_pending();
+			} else if let KeyCode::Char('d') = code {
+				if matches!(operator, PendingOperator::Delete) {
+					let register = self.pending_register.unwrap_or('"');
+					let _ = self.tx_cmd.send(EditorCommand::DeleteLine { register });
+					self.clear_prefixes();
+					return false;
+				}
+				self.clear_operator_pending();
 			} else if let KeyCode::Char('i') = code {
 				self.awaiting_inner_word = true;
 				return false;
@@ -134,6 +142,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 			}
 			KeyCode::Char('$') => {
 				let _ = self.tx_cmd.send(EditorCommand::LineEnd);
+				self.clear_prefixes();
+			}
+			KeyCode::Char('%') => {
+				let _ = self.tx_cmd.send(EditorCommand::MatchDelimiter);
 				self.clear_prefixes();
 			}
 			KeyCode::Char('g') => {
@@ -303,5 +315,65 @@ impl<B: Backend + io::Write> Frontend<B> {
 			}
 		}
 		false
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::Frontend;
+	use crate::engine::{EditorCommand, EditorMode};
+	use crossterm::event::{KeyCode, KeyModifiers};
+	use ratatui::{Terminal, backend::CrosstermBackend};
+	use std::sync::mpsc;
+
+	fn build_frontend() -> (
+		Frontend<CrosstermBackend<Vec<u8>>>,
+		mpsc::Receiver<EditorCommand>,
+	) {
+		let terminal = Terminal::new(CrosstermBackend::new(Vec::new())).expect("terminal");
+		let (tx_cmd, rx_cmd) = mpsc::channel();
+		let (_tx_view, rx_view) = mpsc::channel();
+		(Frontend::new(terminal, tx_cmd, rx_view), rx_cmd)
+	}
+
+	#[test]
+	fn double_d_dispatches_delete_line() {
+		let (mut frontend, rx_cmd) = build_frontend();
+		let mut should_quit = false;
+
+		frontend.current_mode = EditorMode::Normal;
+		assert!(!frontend.handle_normal_key(
+			KeyCode::Char('d'),
+			KeyModifiers::NONE,
+			&mut should_quit
+		));
+		assert!(!frontend.handle_normal_key(
+			KeyCode::Char('d'),
+			KeyModifiers::NONE,
+			&mut should_quit
+		));
+
+		assert!(matches!(
+			rx_cmd.try_recv().expect("dd should send a command"),
+			EditorCommand::DeleteLine { register: '"' }
+		));
+	}
+
+	#[test]
+	fn percent_dispatches_match_delimiter() {
+		let (mut frontend, rx_cmd) = build_frontend();
+		let mut should_quit = false;
+
+		frontend.current_mode = EditorMode::Normal;
+		assert!(!frontend.handle_normal_key(
+			KeyCode::Char('%'),
+			KeyModifiers::NONE,
+			&mut should_quit
+		));
+
+		assert!(matches!(
+			rx_cmd.try_recv().expect("% should send a command"),
+			EditorCommand::MatchDelimiter
+		));
 	}
 }
