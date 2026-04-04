@@ -431,11 +431,7 @@ fn render_overview_overlay(
 	let viewport_content_bg = blend_colors(base_color, viewport_bg, 2, 3);
 	let frame_bg = MINIMAP_VIEWPORT_FRAME;
 	let frame_side_bg = MINIMAP_VIEWPORT_FRAME;
-	let cursor_bg = Color::Rgb(
-		MINIMAP_RGBA_CURSOR[0],
-		MINIMAP_RGBA_CURSOR[1],
-		MINIMAP_RGBA_CURSOR[2],
-	);
+	let cursor_bg = MINIMAP_CURSOR_LINE;
 	let frame_right = area.x + content_width.saturating_sub(1);
 
 	for row in viewport_top.min(area.height.saturating_sub(1))..viewport_bottom {
@@ -458,7 +454,7 @@ fn render_overview_overlay(
 		set_minimap_cell(buf, frame_right, area.y + row, frame_side_bg);
 	}
 
-	for col in 0..area.width {
+	for col in 0..content_width {
 		set_minimap_cell(
 			buf,
 			area.x + col,
@@ -488,16 +484,7 @@ fn render_preview_overlay(
 		4,
 	);
 	let frame_side_bg = frame_bg;
-	let cursor_bg = blend_colors(
-		Color::Rgb(MINIMAP_RGBA_BG[0], MINIMAP_RGBA_BG[1], MINIMAP_RGBA_BG[2]),
-		Color::Rgb(
-			MINIMAP_RGBA_CURSOR[0],
-			MINIMAP_RGBA_CURSOR[1],
-			MINIMAP_RGBA_CURSOR[2],
-		),
-		1,
-		5,
-	);
+	let cursor_bg = MINIMAP_CURSOR_LINE;
 	let frame_right = area.x + content_width.saturating_sub(1);
 	let frame_top = viewport_top.min(content_height.saturating_sub(1));
 	let frame_bottom = viewport_bottom
@@ -534,9 +521,8 @@ fn render_preview_overlay_image(
 	if content_width_px == 0 || content_height_px == 0 {
 		return;
 	}
-	let base_bg = rgba(MINIMAP_RGBA_BG);
 	let frame_bg = rgba(MINIMAP_RGBA_VIEWPORT_FRAME);
-	let cursor_bg = blend_rgba(base_bg, rgba(MINIMAP_RGBA_CURSOR), 1, 5);
+	let cursor_bg = rgba(MINIMAP_RGBA_CURSOR_LINE);
 	let total_lines = overlay.total_lines.max(1);
 	let viewport_start = overlay.viewport_start_line.get().min(total_lines - 1);
 	let viewport_end = overlay
@@ -557,17 +543,15 @@ fn render_preview_overlay_image(
 	let cursor_bottom_px = cursor_bottom_px.max(cursor_top_px.saturating_add(1));
 	let horizontal_thickness = if content_height_px >= 180 { 2 } else { 1 };
 	let vertical_thickness = if content_width_px >= 80 { 2 } else { 1 };
-
-	tint_image_rect(
-		image,
-		0,
-		cursor_top_px,
-		content_width_px,
-		cursor_bottom_px.min(content_height_px),
-		cursor_bg,
-		1,
-		2,
-	);
+	let cursor_line_top = cursor_top_px
+		.saturating_add(
+			cursor_bottom_px
+				.saturating_sub(cursor_top_px)
+				.saturating_sub(horizontal_thickness)
+				/ 2,
+		)
+		.min(content_height_px.saturating_sub(horizontal_thickness));
+	let cursor_line_bottom = (cursor_line_top + horizontal_thickness).min(content_height_px);
 	tint_image_rect(
 		image,
 		0,
@@ -609,6 +593,14 @@ fn render_preview_overlay_image(
 		frame_bg,
 		1,
 		1,
+	);
+	fill_image_rect(
+		image,
+		0,
+		cursor_line_top,
+		content_width_px,
+		cursor_line_bottom,
+		cursor_bg,
 	);
 }
 
@@ -1351,6 +1343,59 @@ mod tests {
 
 		assert_eq!(
 			image[(0, frame_y.min(image.height().saturating_sub(1)))],
+			expected
+		);
+	}
+
+	#[test]
+	fn preview_image_uses_neon_green_cursor_line() {
+		let area = Rect::new(0, 0, 12, 10);
+		let snapshot = PreviewSnapshot {
+			overlay: MinimapOverlay {
+				total_lines: 20,
+				viewport_start_line: DocLine::new(4),
+				viewport_end_line: DocLine::new(10),
+				viewport_line_count: 6,
+				cursor_line: DocLine::new(7),
+				search_bands: vec![0; 256],
+				active_search_band: None,
+			},
+			max_columns: 8,
+			rows: (0..20)
+				.map(|_| PreviewRow {
+					logical_width: 8,
+					bins: vec![TokenCategory::Keyword as u8; PREVIEW_BIN_COLUMNS]
+						.into_boxed_slice(),
+				})
+				.collect(),
+		};
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::Keyword as usize] = Some(Color::Rgb(255, 0, 0));
+
+		let image = render_preview_image(&snapshot, area, &theme_colors, (10, 20)).to_rgba8();
+		let expected = image::Rgba(crate::ui::MINIMAP_RGBA_CURSOR_LINE);
+		let sparse_line_px = if snapshot.rows.len() <= 64 { 2 } else { 1 };
+		let used_height_px = snapshot.rows.len() as u32 * sparse_line_px;
+		let cursor_top = ((snapshot.overlay.cursor_line.get() as u64) * used_height_px as u64
+			/ snapshot.overlay.total_lines.max(1) as u64) as u32;
+		let cursor_bottom = (((snapshot.overlay.cursor_line.get() as u64 + 1)
+			* used_height_px as u64)
+			/ snapshot.overlay.total_lines.max(1) as u64) as u32;
+		let horizontal_thickness = if image.height() >= 180 { 2 } else { 1 };
+		let cursor_y = cursor_top
+			.saturating_add(
+				cursor_bottom
+					.saturating_sub(cursor_top)
+					.saturating_sub(horizontal_thickness)
+					/ 2,
+			)
+			.min(image.height().saturating_sub(horizontal_thickness));
+
+		assert_eq!(
+			image[(
+				image.width() / 2,
+				cursor_y.min(image.height().saturating_sub(1))
+			)],
 			expected
 		);
 	}
