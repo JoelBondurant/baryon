@@ -21,3 +21,29 @@ impl SvpPipeline {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::SvpPipeline;
+	use crate::core::DocByte;
+	use crate::svp::highlight::TokenCategory;
+
+	#[test]
+	fn process_viewport_keeps_leading_import_block_colored() {
+		let highlights = SvpPipeline::process_viewport(
+			DocByte::ZERO,
+			b"use std::io;\nuse std::fs;\n\nfn main() {}\n",
+		);
+
+		assert!(highlights.iter().any(|span| {
+			span.category == TokenCategory::Keyword
+				&& span.start == DocByte::ZERO
+				&& span.end == DocByte::new(3)
+		}));
+		assert!(
+			highlights
+				.iter()
+				.any(|span| { span.category == TokenCategory::Keyword && span.start.get() > 20 })
+		);
+	}
+}

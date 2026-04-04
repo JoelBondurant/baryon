@@ -1,5 +1,4 @@
 use crate::core::DocByte;
-use memchr::memmem;
 
 pub struct ViewportChunk {
 	pub global_offset: DocByte,
@@ -7,8 +6,7 @@ pub struct ViewportChunk {
 }
 
 pub fn find_safe_parse_boundaries(buffer: &[u8]) -> Option<(usize, usize)> {
-	let first_opt = memmem::find(buffer, b"\n\n");
-	let start = first_opt.map(|f| f + 2).unwrap_or(0);
+	let start = 0;
 	let mut end = buffer.len();
 
 	// UTF-8 Safety: An io_uring chunk might slice a multi-byte character exactly in half
