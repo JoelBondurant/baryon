@@ -15,8 +15,7 @@ use crate::svp::highlight::HighlightSpan;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest};
 use crate::svp::{RequestPriority, SvpPointer, SvpResolver, ingest_svp_file};
 use crate::uast::{
-	MinimapMode, MinimapSnapshot, NodeByteTarget, NodeCursorTarget, RootChildLineIndex,
-	UastMutation, UastProjection, Viewport,
+	NodeByteTarget, NodeCursorTarget, RootChildLineIndex, UastMutation, UastProjection, Viewport,
 };
 use crate::ui::{Theme, settings::persist_theme_name};
 use ra_ap_syntax::{AstNode, Direction, Edition, SourceFile, SyntaxKind, SyntaxToken, TextSize};
@@ -40,6 +39,12 @@ use super::layout::{
 	ViewportAnchor, clamp_cursor_to_viewport_anchor, collect_visible_rows, cursor_view_metrics,
 	pan_viewport_anchor_to_keep_cursor_visible, scroll_viewport_anchor, viewport_geometry,
 };
+#[cfg(test)]
+use super::minimap::MINIMAP_BANDS;
+use super::minimap::{
+	MinimapOverlay, MinimapSnapshot, build_byte_fallback_minimap_snapshot,
+	build_search_minimap_bands, build_text_minimap_snapshot, next_registry_topology_revision,
+};
 use super::support::{
 	first_non_whitespace_visual_col, line_byte_range, line_content_slice, line_end_byte_sparse,
 	line_end_visual_col, line_start_byte_sparse, read_line_bytes_sparse, resolve_loaded_node_text,
@@ -49,7 +54,6 @@ use super::support::{
 const FILE_DEVICE_ID: u16 = 0x42;
 const MAX_SEMANTIC_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_MINIMAP_TEXT_BYTES: u64 = 16 * 1024 * 1024;
-const MINIMAP_BANDS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorMode {
@@ -192,10 +196,10 @@ struct ConfirmState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SearchMatch {
-	line: DocLine,
-	col: VisualCol,
-	byte_len: usize,
+pub(super) struct SearchMatch {
+	pub(super) line: DocLine,
+	pub(super) col: VisualCol,
+	pub(super) byte_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -865,7 +869,7 @@ struct CachedRootChildLineIndex {
 	state_id: StateId,
 	total_lines: u32,
 	total_bytes: u64,
-	next_id: u32,
+	topology_revision: u32,
 	index: RootChildLineIndex,
 }
 
@@ -877,14 +881,14 @@ fn root_child_line_index<'a>(
 ) -> &'a RootChildLineIndex {
 	let total_lines = registry.get_total_newlines(root);
 	let total_bytes = registry.get_total_bytes(root);
-	let next_id = registry.next_id.load(Ordering::Acquire);
+	let topology_revision = next_registry_topology_revision(registry);
 	let needs_rebuild = match cache {
 		Some(cached) => {
 			cached.root != root
 				|| cached.state_id != state_id
 				|| cached.total_lines != total_lines
 				|| cached.total_bytes != total_bytes
-				|| cached.next_id != next_id
+				|| cached.topology_revision != topology_revision
 		}
 		None => true,
 	};
@@ -895,156 +899,12 @@ fn root_child_line_index<'a>(
 			state_id,
 			total_lines,
 			total_bytes,
-			next_id,
+			topology_revision,
 			index: registry.build_root_child_line_index(root),
 		});
 	}
 
 	&cache.as_ref().expect("line index must be cached").index
-}
-
-fn normalize_line_density(byte_len: usize) -> u8 {
-	let capped = byte_len.min(160) as u32;
-	((capped * 255) / 160) as u8
-}
-
-const BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP: usize = 80;
-
-fn build_text_minimap_snapshot(
-	bytes: &[u8],
-	viewport_start_line: DocLine,
-	viewport_line_count: u32,
-	cursor_line: DocLine,
-) -> MinimapSnapshot {
-	let doc_lines = memchr::memchr_iter(b'\n', bytes).count() as u32 + 1;
-	let mut sums = vec![0u32; MINIMAP_BANDS];
-	let mut counts = vec![0u32; MINIMAP_BANDS];
-	let mut total_lines = 0u32;
-	let mut current_len = 0usize;
-
-	for &b in bytes {
-		if b == b'\n' {
-			let band = ((total_lines as usize) * MINIMAP_BANDS) / doc_lines.max(1) as usize;
-			sums[band.min(MINIMAP_BANDS - 1)] += normalize_line_density(current_len) as u32;
-			counts[band.min(MINIMAP_BANDS - 1)] += 1;
-			total_lines += 1;
-			current_len = 0;
-		} else {
-			current_len += 1;
-		}
-	}
-
-	let final_band = ((total_lines as usize) * MINIMAP_BANDS) / doc_lines as usize;
-	sums[final_band.min(MINIMAP_BANDS - 1)] += normalize_line_density(current_len) as u32;
-	counts[final_band.min(MINIMAP_BANDS - 1)] += 1;
-
-	let bands = sums
-		.into_iter()
-		.zip(counts)
-		.map(
-			|(sum, count)| {
-				if count == 0 { 0 } else { (sum / count) as u8 }
-			},
-		)
-		.collect();
-
-	MinimapSnapshot {
-		mode: MinimapMode::TextDensity,
-		bands,
-		search_bands: vec![0; MINIMAP_BANDS],
-		active_search_band: None,
-		total_lines: doc_lines,
-		viewport_start_line,
-		viewport_end_line: viewport_start_line
-			.saturating_add(viewport_line_count.saturating_sub(1))
-			.saturating_add(1),
-		viewport_line_count,
-		cursor_line,
-	}
-}
-
-fn build_byte_fallback_minimap_snapshot(
-	registry: &UastRegistry,
-	root: NodeId,
-	viewport_start_line: DocLine,
-	viewport_line_count: u32,
-	cursor_line: DocLine,
-) -> MinimapSnapshot {
-	let file_size = registry.get_total_bytes(root).max(1);
-	let doc_lines = registry.get_total_newlines(root).saturating_add(1).max(1);
-	let mut bands = vec![0u8; MINIMAP_BANDS];
-	let mut visit = registry.get_first_child(root);
-	let mut cumulative_bytes = 0u64;
-	let fallback_density = normalize_line_density(BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP).max(24);
-
-	while let Some(node) = visit {
-		let idx = node.index();
-		let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
-		if has_children {
-			visit = registry.get_first_child(node);
-			continue;
-		}
-
-		let metrics = unsafe { &*registry.metrics[idx].get() };
-		let start_band = ((cumulative_bytes as usize) * MINIMAP_BANDS) / file_size as usize;
-		let end_byte = cumulative_bytes.saturating_add(metrics.byte_length as u64);
-		let mut end_band = ((end_byte as usize) * MINIMAP_BANDS) / file_size as usize;
-		if end_band <= start_band {
-			end_band = start_band + 1;
-		}
-		for band in start_band.min(MINIMAP_BANDS - 1)..end_band.min(MINIMAP_BANDS) {
-			bands[band] = bands[band].max(fallback_density);
-		}
-
-		cumulative_bytes = end_byte;
-		visit = registry.get_next_node_in_walk(node);
-	}
-
-	MinimapSnapshot {
-		mode: MinimapMode::ByteFallback,
-		bands,
-		search_bands: vec![0; MINIMAP_BANDS],
-		active_search_band: None,
-		total_lines: doc_lines,
-		viewport_start_line,
-		viewport_end_line: viewport_start_line
-			.saturating_add(viewport_line_count.saturating_sub(1))
-			.saturating_add(1),
-		viewport_line_count,
-		cursor_line,
-	}
-}
-
-fn build_search_minimap_bands(
-	search_matches: &[SearchMatch],
-	active_match_index: Option<usize>,
-	total_lines: u32,
-) -> (Vec<u8>, Option<usize>) {
-	let total_lines = total_lines.max(1);
-	let mut bands = vec![0u8; MINIMAP_BANDS];
-	if search_matches.is_empty() {
-		return (bands, None);
-	}
-
-	let stride = (search_matches.len() / 8192).max(1);
-	for (idx, m) in search_matches.iter().enumerate().step_by(stride) {
-		let band = ((m.line.get() as usize) * MINIMAP_BANDS) / total_lines as usize;
-		let band = band.min(MINIMAP_BANDS - 1);
-		let intensity = if Some(idx) == active_match_index {
-			255
-		} else {
-			196
-		};
-		bands[band] = bands[band].max(intensity);
-	}
-
-	let active_search_band = active_match_index
-		.and_then(|idx| search_matches.get(idx))
-		.map(|m| {
-			(((m.line.get() as usize) * MINIMAP_BANDS) / total_lines as usize)
-				.min(MINIMAP_BANDS - 1)
-		});
-	(bands, active_search_band)
 }
 
 fn insert_text_sparse(
@@ -3023,6 +2883,10 @@ impl Engine {
 					match Theme::try_new(&name) {
 						Ok(theme) => {
 							current_theme = theme;
+							cached_minimap = None;
+							last_minimap_state = None;
+							last_minimap_total_lines = u32::MAX;
+							last_minimap_path = None;
 							match persist_theme_name(settings_path.as_deref(), &name) {
 								Ok(()) => {
 									status_message = Some(format!("Theme set to {}", name));
@@ -3879,6 +3743,10 @@ impl Engine {
 						semantic_highlights = response.highlights;
 						diagnostic_spans = response.diagnostics;
 						pending_semantic_request_id = None;
+						cached_minimap = None;
+						last_minimap_state = None;
+						last_minimap_total_lines = u32::MAX;
+						last_minimap_path = None;
 					}
 				}
 
@@ -3961,6 +3829,8 @@ impl Engine {
 					(0, VisualCol::ZERO)
 				};
 				let minimap = if let Some(rid) = root_id {
+					let overlay =
+						MinimapOverlay::new(viewport_start_line, viewport_lines, cursor_abs_line);
 					let path_changed = last_minimap_path.as_deref() != file_path.as_deref();
 					let state_changed = last_minimap_state != Some(ledger.current_state_id);
 					let total_lines_changed = last_minimap_total_lines != total_lines;
@@ -3977,26 +3847,15 @@ impl Engine {
 								) {
 									Ok(bytes) => build_text_minimap_snapshot(
 										&bytes,
-										viewport_start_line,
-										viewport_lines,
-										cursor_abs_line,
+										&semantic_highlights,
+										overlay,
 									),
 									Err(_) => build_byte_fallback_minimap_snapshot(
-										&registry,
-										rid,
-										viewport_start_line,
-										viewport_lines,
-										cursor_abs_line,
+										&registry, rid, overlay,
 									),
 								}
 							} else {
-								build_byte_fallback_minimap_snapshot(
-									&registry,
-									rid,
-									viewport_start_line,
-									viewport_lines,
-									cursor_abs_line,
-								)
+								build_byte_fallback_minimap_snapshot(&registry, rid, overlay)
 							});
 						last_minimap_state = Some(ledger.current_state_id);
 						last_minimap_total_lines = total_lines;
@@ -4010,12 +3869,13 @@ impl Engine {
 							search_match_index,
 							total_lines,
 						);
-						snapshot.viewport_start_line = viewport_start_line;
-						snapshot.viewport_end_line = viewport_end_line;
-						snapshot.viewport_line_count = viewport_lines;
-						snapshot.cursor_line = cursor_abs_line;
-						snapshot.search_bands = search_bands;
-						snapshot.active_search_band = active_search_band;
+						let overlay = snapshot.overlay_mut();
+						overlay.viewport_start_line = viewport_start_line;
+						overlay.viewport_end_line = viewport_end_line;
+						overlay.viewport_line_count = viewport_lines;
+						overlay.cursor_line = cursor_abs_line;
+						overlay.search_bands = search_bands;
+						overlay.active_search_band = active_search_band;
 						snapshot
 					})
 				} else {
@@ -4105,21 +3965,20 @@ fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Ve
 #[cfg(test)]
 mod tests {
 	use super::{
-		BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP, FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch,
-		VisualKind, apply_deltas_to_document, apply_deltas_to_document_internal,
-		build_byte_fallback_minimap_snapshot, build_search_minimap_bands,
+		FILE_DEVICE_ID, MINIMAP_BANDS, SearchMatch, VisualKind, apply_deltas_to_document,
+		apply_deltas_to_document_internal, build_search_minimap_bands,
 		clamp_cursor_line_to_viewport, delete_char_delta_at_cursor, delete_line_delta_sparse,
 		delete_to_line_end_delta, doc_line_for_visual_index, document_rewrite_delta,
 		find_matching_delimiter_byte, first_non_whitespace_visual_col,
 		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion,
 		materialize_fold_boundary_at_cursor, nearest_foldable_boundary, next_word_end,
-		next_word_start, normalize_line_density, pan_scroll_y_to_keep_cursor_visible,
-		place_cursor_at_line_col, prev_word_start, read_document_snapshot,
-		rebase_diagnostics_after_delta, rebase_semantic_highlights_after_delta,
-		rebind_document_spans_to_saved_file, resolve_fold_boundary_at_cursor,
-		resolve_visual_ranges, root_child_line_index, save_document_atomic, scroll_viewport,
-		set_subtree_fold_state, smart_home_visual_col, step_left_visual_col, step_right_visual_col,
-		visual_line_index_for_doc_line, word_object_delta_at_cursor,
+		next_word_start, pan_scroll_y_to_keep_cursor_visible, place_cursor_at_line_col,
+		prev_word_start, read_document_snapshot, rebase_diagnostics_after_delta,
+		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
+		resolve_fold_boundary_at_cursor, resolve_visual_ranges, root_child_line_index,
+		save_document_atomic, scroll_viewport, set_subtree_fold_state, smart_home_visual_col,
+		step_left_visual_col, step_right_visual_col, visual_line_index_for_doc_line,
+		word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, NodeByteOffset, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
@@ -4737,96 +4596,6 @@ mod tests {
 
 		assert!(bands.iter().any(|&band| band > 0));
 		assert_eq!(active, Some((90usize * MINIMAP_BANDS) / 100usize));
-	}
-
-	#[test]
-	fn byte_fallback_minimap_caps_dense_binary_leaf_without_notches() {
-		let registry = UastRegistry::new(4);
-		let mut chunk = registry.reserve_chunk(2).expect("OOM");
-		let root = chunk.spawn_node(
-			SemanticKind::RelationalTable,
-			None,
-			SpanMetrics {
-				byte_length: 4096,
-				newlines: 0,
-			},
-		);
-		let leaf = chunk.spawn_node(
-			SemanticKind::Token,
-			None,
-			SpanMetrics {
-				byte_length: 4096,
-				newlines: 0,
-			},
-		);
-		chunk.append_local_child(root, leaf);
-
-		let snapshot =
-			build_byte_fallback_minimap_snapshot(&registry, root, DocLine::ZERO, 40, DocLine::ZERO);
-		let expected = normalize_line_density(BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP).max(24);
-
-		assert!(expected < 255);
-		assert!(snapshot.bands.iter().all(|&band| band == expected));
-	}
-
-	#[test]
-	fn byte_fallback_minimap_tiny_binary_leaf_stays_visibly_dense() {
-		let registry = UastRegistry::new(4);
-		let mut chunk = registry.reserve_chunk(2).expect("OOM");
-		let root = chunk.spawn_node(
-			SemanticKind::RelationalTable,
-			None,
-			SpanMetrics {
-				byte_length: 10,
-				newlines: 0,
-			},
-		);
-		let leaf = chunk.spawn_node(
-			SemanticKind::Token,
-			None,
-			SpanMetrics {
-				byte_length: 10,
-				newlines: 0,
-			},
-		);
-		chunk.append_local_child(root, leaf);
-
-		let snapshot =
-			build_byte_fallback_minimap_snapshot(&registry, root, DocLine::ZERO, 40, DocLine::ZERO);
-		let expected = normalize_line_density(BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP).max(24);
-
-		assert!(expected >= 40);
-		assert!(snapshot.bands.iter().all(|&band| band == expected));
-	}
-
-	#[test]
-	fn byte_fallback_minimap_inflated_leaf_does_not_expand_past_baseline() {
-		let registry = UastRegistry::new(4);
-		let mut chunk = registry.reserve_chunk(2).expect("OOM");
-		let root = chunk.spawn_node(
-			SemanticKind::RelationalTable,
-			None,
-			SpanMetrics {
-				byte_length: 65_536,
-				newlines: 256,
-			},
-		);
-		let leaf = chunk.spawn_node(
-			SemanticKind::Token,
-			None,
-			SpanMetrics {
-				byte_length: 65_536,
-				newlines: 256,
-			},
-		);
-		chunk.append_local_child(root, leaf);
-
-		let snapshot =
-			build_byte_fallback_minimap_snapshot(&registry, root, DocLine::ZERO, 40, DocLine::ZERO);
-		let expected = normalize_line_density(BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP).max(24);
-
-		assert!(expected < 255);
-		assert!(snapshot.bands.iter().all(|&band| band == expected));
 	}
 
 	#[test]
@@ -5620,7 +5389,7 @@ mod tests {
 		let mut cache = None;
 		let initial_index =
 			root_child_line_index(&mut cache, &registry, root, StateId::ZERO).clone();
-		let initial_next_id = cache.as_ref().expect("cached index").next_id;
+		let initial_topology_revision = cache.as_ref().expect("cached index").topology_revision;
 
 		let fold =
 			materialize_fold_boundary_at_cursor(&registry, root, DocLine::ZERO, VisualCol::ZERO)
@@ -5629,8 +5398,11 @@ mod tests {
 
 		let rebuilt_index =
 			root_child_line_index(&mut cache, &registry, root, StateId::ZERO).clone();
-		let rebuilt_next_id = cache.as_ref().expect("rebuilt cached index").next_id;
-		assert!(rebuilt_next_id > initial_next_id);
+		let rebuilt_topology_revision = cache
+			.as_ref()
+			.expect("rebuilt cached index")
+			.topology_revision;
+		assert!(rebuilt_topology_revision > initial_topology_revision);
 
 		let initial_tokens = registry.query_viewport_with_root_line_index(
 			root,

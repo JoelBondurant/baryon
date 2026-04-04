@@ -1,10 +1,9 @@
 use super::Frontend;
-use super::minimap::render_byte_fallback_snapshot;
+use super::minimap::render_minimap_snapshot;
 use crate::core::TAB_SIZE;
-use crate::engine::{EditorMode, VisualKind, viewport_geometry};
+use crate::engine::{EditorMode, MinimapSnapshot, VisualKind, viewport_geometry};
 use crate::svp::diagnostic::DiagnosticSeverity;
 use crate::svp::projector::{DiagnosticProjector, HighlightProjector};
-use crate::uast::MinimapMode;
 use crate::uast::kind::SemanticKind;
 use crate::ui::*;
 use ratatui::{
@@ -171,7 +170,6 @@ impl<B: Backend + io::Write> Frontend<B> {
 		let command_buffer = &self.command_buffer;
 		let search_buffer = &self.search_buffer;
 		let g_prefix = self.g_prefix;
-		self.minimap.poll();
 		let minimap = &mut self.minimap;
 
 		{
@@ -588,13 +586,28 @@ impl<B: Backend + io::Write> Frontend<B> {
 						.as_ref()
 						.and_then(|view| view.minimap.as_ref()),
 				) {
-					let _ = view;
-					if snapshot.mode == MinimapMode::ByteFallback {
-						let buf = f.buffer_mut();
-						render_byte_fallback_snapshot(buf, minimap_area, snapshot);
-					} else {
-						minimap.request(snapshot, minimap_area);
-						minimap.render(f, minimap_area);
+					match snapshot {
+						MinimapSnapshot::Preview(preview) => {
+							minimap.request_preview(preview, minimap_area, view.theme_colors);
+							if !minimap.render(f, minimap_area) {
+								let buf = f.buffer_mut();
+								render_minimap_snapshot(
+									buf,
+									minimap_area,
+									snapshot,
+									&view.theme_colors,
+								);
+							}
+						}
+						_ => {
+							let buf = f.buffer_mut();
+							render_minimap_snapshot(
+								buf,
+								minimap_area,
+								snapshot,
+								&view.theme_colors,
+							);
+						}
 					}
 				}
 

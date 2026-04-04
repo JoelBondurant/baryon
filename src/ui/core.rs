@@ -85,6 +85,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			let mut got_new_view = initial_draw;
 			initial_draw = false;
 			let mut should_quit = false;
+			got_new_view |= self.minimap.poll();
 
 			while let Ok(view) = self.rx_view.try_recv() {
 				if view.should_quit {

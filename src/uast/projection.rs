@@ -1,6 +1,6 @@
 use crate::core::{CursorPosition, DocByte, DocLine, NodeByteOffset, TAB_SIZE, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
-use crate::engine::VisibleRow;
+use crate::engine::{MinimapSnapshot, VisibleRow};
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::highlight::{CATEGORY_COUNT, HighlightSpan};
 use crate::uast::kind::SemanticKind;
@@ -81,25 +81,6 @@ pub struct Viewport {
 	pub theme_colors: [Option<Color>; CATEGORY_COUNT],
 	pub visible_rows: Vec<VisibleRow>,
 	pub visible_line_starts: Vec<DocLine>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MinimapMode {
-	TextDensity,
-	ByteFallback,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MinimapSnapshot {
-	pub mode: MinimapMode,
-	pub bands: Vec<u8>,
-	pub search_bands: Vec<u8>,
-	pub active_search_band: Option<usize>,
-	pub total_lines: u32,
-	pub viewport_start_line: DocLine,
-	pub viewport_end_line: DocLine,
-	pub viewport_line_count: u32,
-	pub cursor_line: DocLine,
 }
 
 const FOLDED_TOKEN_TEXT: &str = "❯❯❯";
