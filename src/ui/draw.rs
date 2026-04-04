@@ -1,7 +1,7 @@
 use super::Frontend;
 use super::minimap::render_byte_fallback_snapshot;
 use crate::core::TAB_SIZE;
-use crate::engine::{EditorMode, VisualKind};
+use crate::engine::{EditorMode, VisualKind, viewport_geometry};
 use crate::svp::diagnostic::DiagnosticSeverity;
 use crate::svp::projector::{DiagnosticProjector, HighlightProjector};
 use crate::uast::MinimapMode;
@@ -42,35 +42,47 @@ fn draw_gutter_line_number(
 	}
 }
 
-fn paint_wrapped_text(
+fn paint_text_segment(
 	buf: &mut Buffer,
 	x: &mut usize,
-	y: &mut usize,
+	visual_y: &mut usize,
 	text_left: usize,
 	text_right: usize,
 	render_height: usize,
+	skip_rows: usize,
 	text: &str,
 	style: Style,
+	wrap_enabled: bool,
 ) -> bool {
 	if text_right <= text_left {
-		return *y < render_height;
+		return *visual_y < skip_rows.saturating_add(render_height);
 	}
 
 	for c in text.chars() {
-		if *x >= text_right {
-			*y += 1;
+		if wrap_enabled && *x >= text_right {
+			*visual_y += 1;
 			*x = text_left;
 		}
-		if *y >= render_height {
+		if *visual_y >= skip_rows.saturating_add(render_height) {
 			return false;
 		}
-		if let Some(cell) = buf.cell_mut((*x as u16, *y as u16)) {
-			cell.set_char(c).set_style(style);
+		if !wrap_enabled && *x >= text_right {
+			*x += 1;
+			continue;
+		}
+		if *visual_y >= skip_rows {
+			let screen_y = *visual_y - skip_rows;
+			if screen_y >= render_height {
+				return false;
+			}
+			if let Some(cell) = buf.cell_mut((*x as u16, screen_y as u16)) {
+				cell.set_char(c).set_style(style);
+			}
 		}
 		*x += 1;
 	}
 
-	*y < render_height
+	*visual_y < skip_rows.saturating_add(render_height)
 }
 
 fn next_utf8_chunk(bytes: &[u8]) -> Option<(char, usize)> {
@@ -130,6 +142,27 @@ fn gutter_line_number_style(line_index: u32, cursor_lines: &[crate::core::DocLin
 	}
 }
 
+fn status_right_text(
+	search_info: Option<&str>,
+	wrap_enabled: bool,
+	file_size: u64,
+	cursor_line: u32,
+	cursor_col: u32,
+) -> String {
+	let size_str = format_file_size(file_size);
+	let wrap_label = if wrap_enabled { "WRAP" } else { "NOWRAP" };
+	match search_info {
+		Some(info) => format!(
+			"{} | {} | {} | UTF-8 | {}:{} ",
+			info, wrap_label, size_str, cursor_line, cursor_col
+		),
+		None => format!(
+			"{} | {} | UTF-8 | {}:{} ",
+			wrap_label, size_str, cursor_line, cursor_col
+		),
+	}
+}
+
 impl<B: Backend + io::Write> Frontend<B> {
 	pub(super) fn draw(&mut self) -> Result<(), B::Error> {
 		let current_viewport = &self.current_viewport;
@@ -158,14 +191,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 				{
 					let buf = f.buffer_mut();
 					if let Some(view) = current_viewport {
-						let minimap_width = if view.minimap.is_some() && max_width > 40 {
-							14u16.min(max_width.saturating_sub(24))
-						} else {
-							0
-						};
-						let separator_width = if minimap_width > 0 { 1 } else { 0 };
-						let text_right =
-							max_width.saturating_sub(minimap_width + separator_width) as usize;
+						let geometry =
+							viewport_geometry(view.total_lines, max_width, view.minimap.is_some());
+						let minimap_width = geometry.minimap_width;
+						let separator_width = geometry.separator_width;
+						let gutter_width = geometry.gutter_width;
+						let text_left = gutter_width as usize;
+						let text_right = text_left + geometry.text_width as usize;
 						let minimap_area = Rect {
 							x: max_width.saturating_sub(minimap_width),
 							y: 0,
@@ -173,11 +205,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 							height: max_height.saturating_sub(1),
 						};
 
-						let digits = view.total_lines.max(1).ilog10() + 1;
-						let gutter_width: u16 = digits as u16 + 1;
 						let gutter_style = gutter_fill_style();
-						let text_left = gutter_width as usize;
 						let render_height = (max_height as usize).saturating_sub(1);
+						let skip_rows = if view.wrap_enabled {
+							view.viewport_row_offset as usize
+						} else {
+							0
+						};
+						let max_visual_rows = skip_rows.saturating_add(render_height);
 
 						for gy in 0..render_height as u16 {
 							for gx in 0..gutter_width {
@@ -205,13 +240,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 						}
 
 						let mut x = text_left;
-						let mut y: usize = 0;
+						let mut visual_y: usize = 0;
 						let mut current_doc_line = view.viewport_start_line.get();
-						if render_height > 0 {
+						if render_height > 0 && skip_rows == 0 {
 							draw_gutter_line_number(
 								buf,
 								gutter_width,
-								y,
+								0,
 								current_doc_line,
 								view.total_lines,
 								gutter_line_number_style(current_doc_line, &view.cursor_lines),
@@ -230,19 +265,21 @@ impl<B: Backend + io::Write> Frontend<B> {
 						for token in &view.tokens {
 							if x != text_left
 								&& token.absolute_start_line.get() > current_doc_line
-								&& y < render_height
+								&& visual_y < max_visual_rows
 							{
-								y += 1;
+								visual_y += 1;
 								x = text_left;
 							}
 							if x == text_left && token.absolute_start_line.get() != current_doc_line
 							{
 								current_doc_line = token.absolute_start_line.get();
-								if y < render_height {
+								if visual_y >= skip_rows
+									&& visual_y.saturating_sub(skip_rows) < render_height
+								{
 									draw_gutter_line_number(
 										buf,
 										gutter_width,
-										y,
+										visual_y - skip_rows,
 										current_doc_line,
 										view.total_lines,
 										gutter_line_number_style(
@@ -293,17 +330,19 @@ impl<B: Backend + io::Write> Frontend<B> {
 								);
 
 								let display = std::str::from_utf8(text).unwrap_or("❯❯❯");
-								if !paint_wrapped_text(
+								if !paint_text_segment(
 									buf,
 									&mut x,
-									&mut y,
+									&mut visual_y,
 									text_left,
 									text_right,
 									render_height,
+									skip_rows,
 									display,
 									style,
+									view.wrap_enabled,
 								) {
-									y = render_height;
+									visual_y = max_visual_rows;
 								}
 								current_global_byte = token
 									.absolute_start_byte
@@ -328,7 +367,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 							let mut byte_idx = 0usize;
 							while byte_idx < text.len() {
-								if y >= render_height {
+								if visual_y >= max_visual_rows {
 									break;
 								}
 
@@ -401,14 +440,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 											current_global_byte =
 												current_global_byte.saturating_add(1);
 										}
-										y += 1;
+										visual_y += 1;
 										x = text_left;
 										current_doc_line = current_doc_line.saturating_add(1);
-										if y < render_height {
+										if visual_y >= skip_rows
+											&& visual_y.saturating_sub(skip_rows) < render_height
+										{
 											draw_gutter_line_number(
 												buf,
 												gutter_width,
-												y,
+												visual_y - skip_rows,
 												current_doc_line,
 												view.total_lines,
 												gutter_line_number_style(
@@ -423,30 +464,34 @@ impl<B: Backend + io::Write> Frontend<B> {
 										let spaces_to_add =
 											TAB_SIZE as usize - (col % TAB_SIZE as usize);
 										let ws_style = style.fg(SYNTAX_WHITESPACE);
-										if !paint_wrapped_text(
+										if !paint_text_segment(
 											buf,
 											&mut x,
-											&mut y,
+											&mut visual_y,
 											text_left,
 											text_right,
 											render_height,
+											skip_rows,
 											"\u{25B8}",
 											ws_style,
+											view.wrap_enabled,
 										) {
-											y = render_height;
+											visual_y = max_visual_rows;
 										}
 										for _ in 1..spaces_to_add {
-											if !paint_wrapped_text(
+											if !paint_text_segment(
 												buf,
 												&mut x,
-												&mut y,
+												&mut visual_y,
 												text_left,
 												text_right,
 												render_height,
+												skip_rows,
 												" ",
 												ws_style,
+												view.wrap_enabled,
 											) {
-												y = render_height;
+												visual_y = max_visual_rows;
 												break;
 											}
 										}
@@ -460,17 +505,19 @@ impl<B: Backend + io::Write> Frontend<B> {
 										let ws_style = style.fg(SYNTAX_WHITESPACE);
 										for &byte in &remaining[..chunk_len] {
 											let hex = format!("<{:02X}>", byte);
-											if !paint_wrapped_text(
+											if !paint_text_segment(
 												buf,
 												&mut x,
-												&mut y,
+												&mut visual_y,
 												text_left,
 												text_right,
 												render_height,
+												skip_rows,
 												&hex,
 												ws_style,
+												view.wrap_enabled,
 											) {
-												y = render_height;
+												visual_y = max_visual_rows;
 												break;
 											}
 										}
@@ -485,17 +532,19 @@ impl<B: Backend + io::Write> Frontend<B> {
 											.expect("printable chunk must decode");
 										let mut encoded = [0u8; 4];
 										let display = ch.encode_utf8(&mut encoded);
-										if !paint_wrapped_text(
+										if !paint_text_segment(
 											buf,
 											&mut x,
-											&mut y,
+											&mut visual_y,
 											text_left,
 											text_right,
 											render_height,
+											skip_rows,
 											display,
 											style,
+											view.wrap_enabled,
 										) {
-											y = render_height;
+											visual_y = max_visual_rows;
 										}
 										byte_idx += ch_len;
 										if has_physical_bytes {
@@ -505,13 +554,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 									}
 								}
 							}
-							if y >= render_height {
+							if visual_y >= max_visual_rows {
 								break;
 							}
 						}
 
 						let visual_cursor_y = view.cursor_visual_row as u16;
-						let visual_cursor_x = (view.cursor_abs_pos.col.get() as u16)
+						let visual_cursor_x = (view.cursor_screen_col.get() as u16)
 							.checked_add(gutter_width)
 							.unwrap_or(text_right as u16);
 						if max_height > 1 && text_right > text_left {
@@ -706,14 +755,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 					let search_info = current_viewport
 						.as_ref()
 						.and_then(|v| v.search_match_info.as_deref());
-					let size_str = format_file_size(file_sz);
-					let right_text = match search_info {
-						Some(info) => format!(
-							"{} | {} | UTF-8 | {}:{} ",
-							info, size_str, cursor_line, cursor_col
-						),
-						None => format!("{} | UTF-8 | {}:{} ", size_str, cursor_line, cursor_col),
-					};
+					let right_text = status_right_text(
+						search_info,
+						current_viewport
+							.as_ref()
+							.map(|v| v.wrap_enabled)
+							.unwrap_or(true),
+						file_sz,
+						cursor_line,
+						cursor_col,
+					);
 
 					let right_start = w.saturating_sub(right_text.len());
 					if right_start > x {
@@ -764,7 +815,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 mod tests {
 	use super::{
 		apply_diagnostic_style, cursor_gutter_line_number_style, folded_placeholder_style,
-		gutter_fill_style, gutter_line_number_style,
+		gutter_fill_style, gutter_line_number_style, status_right_text,
 	};
 	use crate::core::DocLine;
 	use crate::svp::diagnostic::DiagnosticSeverity;
@@ -806,6 +857,18 @@ mod tests {
 		assert_eq!(inactive_style.fg, Some(GUTTER_FG));
 		assert_eq!(inactive_style.bg, Some(GUTTER_BG));
 		assert_eq!(inactive_style, gutter_fill_style());
+	}
+
+	#[test]
+	fn status_bar_reports_wrap_state_before_file_size() {
+		assert_eq!(
+			status_right_text(None, true, 1024, 4, 8),
+			"WRAP | 1.0 KB | UTF-8 | 4:8 "
+		);
+		assert_eq!(
+			status_right_text(Some("3/9"), false, 1024, 4, 8),
+			"3/9 | NOWRAP | 1.0 KB | UTF-8 | 4:8 "
+		);
 	}
 }
 

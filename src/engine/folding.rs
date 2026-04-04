@@ -1,4 +1,4 @@
-use super::core::{
+use super::support::{
 	first_non_whitespace_visual_col, line_byte_range, line_content_slice,
 	select_structural_token_at_offset,
 };
@@ -8,7 +8,7 @@ use crate::engine::undo::line_col_from_byte_offset;
 use crate::uast::kind::SemanticKind;
 use crate::uast::metrics::SpanMetrics;
 use crate::uast::topology::TreeEdges;
-use crate::uast::{NodeCursorTarget, RenderToken, UastProjection};
+use crate::uast::{NodeCursorTarget, UastProjection};
 use ra_ap_syntax::{AstNode, Edition, SourceFile, SyntaxKind, TextSize};
 use std::sync::atomic::Ordering;
 
@@ -232,29 +232,6 @@ pub(crate) fn reveal_line_col_target(
 	let raw_target = registry.find_node_at_line_col_raw(root, target_line, target_col);
 	unfold_ancestor_chain(registry, raw_target.node_id);
 	registry.find_node_at_line_col(root, target_line, target_col)
-}
-
-pub(crate) fn collect_visible_line_starts(tokens: &[RenderToken]) -> Vec<DocLine> {
-	let mut lines = Vec::new();
-	for token in tokens {
-		if lines.last().copied() != Some(token.absolute_start_line) {
-			lines.push(token.absolute_start_line);
-		}
-		if token.is_folded {
-			continue;
-		}
-
-		let mut line = token.absolute_start_line;
-		for &byte in &token.text {
-			if byte == b'\n' {
-				line = line.saturating_add(1);
-				if lines.last().copied() != Some(line) {
-					lines.push(line);
-				}
-			}
-		}
-	}
-	lines
 }
 
 fn count_newlines(bytes: &[u8]) -> u32 {

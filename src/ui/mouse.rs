@@ -38,18 +38,22 @@ impl<B: Backend + io::Write> Frontend<B> {
 					return;
 				}
 
-				let abs_line = view
-					.visible_line_starts
+				let row = view
+					.visible_rows
 					.get(click_y as usize)
 					.copied()
-					.unwrap_or_else(|| DocLine::new(view.scroll_y + click_y as u32));
-				let target_visual_col = u32::from(click_x - gutter_width);
+					.unwrap_or_else(|| crate::engine::VisibleRow {
+						line: DocLine::new(view.scroll_y + click_y as u32),
+						start_col: VisualCol::ZERO,
+					});
+				let target_visual_col =
+					row.start_col + u32::from(click_x.saturating_sub(gutter_width));
 
 				let _ = self
 					.tx_cmd
 					.send(EditorCommand::ClickCursor(CursorPosition::new(
-						abs_line,
-						VisualCol::new(target_visual_col),
+						row.line,
+						target_visual_col,
 					)));
 				self.needs_redraw = true;
 			}

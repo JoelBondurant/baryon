@@ -1,5 +1,6 @@
 use crate::core::{CursorPosition, DocByte, DocLine, NodeByteOffset, TAB_SIZE, VisualCol};
 use crate::ecs::{NodeId, UastRegistry};
+use crate::engine::VisibleRow;
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::highlight::{CATEGORY_COUNT, HighlightSpan};
 use crate::uast::kind::SemanticKind;
@@ -38,10 +39,13 @@ pub struct Viewport {
 	pub tokens: Vec<RenderToken>,
 	pub scroll_y: u32,
 	pub viewport_start_line: DocLine,
+	pub viewport_row_offset: u32,
 	pub viewport_line_count: u32,
+	pub wrap_enabled: bool,
 	pub cursor_lines: Vec<DocLine>,
 	pub cursor_visual_row: u32,
 	pub cursor_abs_pos: CursorPosition,
+	pub cursor_screen_col: VisualCol,
 	pub cursor_abs_byte: DocByte,
 	pub cursor_line_start_byte: DocByte,
 	pub total_lines: u32,
@@ -62,6 +66,7 @@ pub struct Viewport {
 	pub yank_flash: Option<(DocByte, DocByte)>,
 	pub minimap: Option<MinimapSnapshot>,
 	pub theme_colors: [Option<Color>; CATEGORY_COUNT],
+	pub visible_rows: Vec<VisibleRow>,
 	pub visible_line_starts: Vec<DocLine>,
 }
 

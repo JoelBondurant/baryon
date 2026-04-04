@@ -31,15 +31,24 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 use super::folding::{
-	clamp_cursor_line_to_viewport, collect_visible_line_starts, doc_line_for_visual_index,
-	max_visual_line_index, pan_scroll_y_to_keep_cursor_visible, resolve_fold_boundary_at_cursor,
-	reveal_line_col_target, scroll_viewport, set_subtree_fold_state, snap_line_to_visible_boundary,
-	unfold_ancestor_chain, visual_line_index_for_doc_line,
+	clamp_cursor_line_to_viewport, doc_line_for_visual_index, max_visual_line_index,
+	pan_scroll_y_to_keep_cursor_visible, resolve_fold_boundary_at_cursor, reveal_line_col_target,
+	scroll_viewport, set_subtree_fold_state, snap_line_to_visible_boundary, unfold_ancestor_chain,
+	visual_line_index_for_doc_line,
+};
+use super::layout::{
+	ViewportAnchor, clamp_cursor_to_viewport_anchor, collect_visible_rows, cursor_view_metrics,
+	pan_viewport_anchor_to_keep_cursor_visible, scroll_viewport_anchor, viewport_geometry,
+};
+use super::support::{
+	first_non_whitespace_visual_col, line_byte_range, line_content_slice, line_end_byte_sparse,
+	line_end_visual_col, line_start_byte_sparse, read_line_bytes_sparse, resolve_loaded_node_text,
+	select_structural_token_at_offset,
 };
 
 const FILE_DEVICE_ID: u16 = 0x42;
-const MAX_SEMANTIC_BYTES: u64 = 1_048_576;
-const MAX_MINIMAP_TEXT_BYTES: u64 = 1_048_576;
+const MAX_SEMANTIC_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_MINIMAP_TEXT_BYTES: u64 = 16 * 1024 * 1024;
 const MINIMAP_BANDS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +117,8 @@ pub enum EditorCommand {
 	OpenFold,
 	CloseAllFolds,
 	OpenAllFolds,
+	ToggleWrap,
+	SetWrap(bool),
 	MoveCursor(MoveDirection),
 	MatchDelimiter,
 	ClickCursor(CursorPosition),
@@ -340,40 +351,12 @@ fn next_word_end(doc: &str, current_byte: usize) -> usize {
 	last
 }
 
-pub(crate) fn line_byte_range(
-	doc: &[u8],
-	start_line: DocLine,
-	end_line: DocLine,
-) -> (usize, usize) {
-	let mut current_line = DocLine::ZERO;
-	let mut byte_start = 0usize;
-	let mut found_start = start_line == DocLine::ZERO;
-
-	for (i, &b) in doc.iter().enumerate() {
-		if b == b'\n' {
-			current_line += 1;
-			if !found_start && current_line == start_line {
-				byte_start = i + 1;
-				found_start = true;
-			}
-			if current_line > end_line {
-				return (byte_start, i + 1);
-			}
-		}
-	}
-	if !found_start {
-		byte_start = doc.len();
-	}
-	(byte_start, doc.len())
-}
-
-pub(crate) fn line_content_slice(doc: &[u8], target_line: DocLine) -> &[u8] {
-	let (start, end) = line_byte_range(doc, target_line, target_line);
-	let line = &doc[start..end];
-	if line.ends_with(b"\n") {
-		&line[..line.len().saturating_sub(1)]
+fn smart_home_visual_col(doc: &[u8], target_line: DocLine, current_col: VisualCol) -> VisualCol {
+	let first_non_whitespace = first_non_whitespace_visual_col(doc, target_line);
+	if current_col == first_non_whitespace {
+		VisualCol::ZERO
 	} else {
-		line
+		first_non_whitespace
 	}
 }
 
@@ -382,35 +365,6 @@ fn advance_visual_col_only(col: &mut VisualCol, b: u8) {
 		*col += TAB_SIZE - (col.get() % TAB_SIZE);
 	} else if b != b'\n' {
 		*col += 1;
-	}
-}
-
-fn line_end_visual_col(doc: &[u8], target_line: DocLine) -> VisualCol {
-	let mut col = VisualCol::ZERO;
-	for &b in line_content_slice(doc, target_line) {
-		advance_visual_col_only(&mut col, b);
-	}
-	col
-}
-
-pub(crate) fn first_non_whitespace_visual_col(doc: &[u8], target_line: DocLine) -> VisualCol {
-	let mut col = VisualCol::ZERO;
-	for &b in line_content_slice(doc, target_line) {
-		match b {
-			b' ' | b'\t' => advance_visual_col_only(&mut col, b),
-			_ => return col,
-		}
-	}
-
-	VisualCol::ZERO
-}
-
-fn smart_home_visual_col(doc: &[u8], target_line: DocLine, current_col: VisualCol) -> VisualCol {
-	let first_non_whitespace = first_non_whitespace_visual_col(doc, target_line);
-	if current_col == first_non_whitespace {
-		VisualCol::ZERO
-	} else {
-		first_non_whitespace
 	}
 }
 
@@ -887,6 +841,24 @@ fn read_loaded_document(registry: &UastRegistry, root: NodeId) -> Result<Vec<u8>
 		.map_err(|msg| msg.to_string())
 }
 
+fn read_document_snapshot(
+	registry: &UastRegistry,
+	root: NodeId,
+	source_path: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+	if let Ok(bytes) = read_loaded_document(registry, root) {
+		return Ok(bytes);
+	}
+
+	let Some(source_path) = source_path else {
+		return Err("Document is not fully loaded".to_string());
+	};
+
+	let mut bytes = Vec::with_capacity(registry.get_total_bytes(root) as usize);
+	stream_document_to_writer(registry, root, Some(source_path), &mut bytes)?;
+	Ok(bytes)
+}
+
 fn normalize_line_density(byte_len: usize) -> u8 {
 	let capped = byte_len.min(160) as u32;
 	((capped * 255) / 160) as u8
@@ -1097,65 +1069,6 @@ fn delete_text_sparse(
 	Ok((target.node_id, target.node_byte.get()))
 }
 
-fn line_start_byte_sparse(registry: &UastRegistry, root: NodeId, target_line: DocLine) -> DocByte {
-	let target = registry.find_node_at_line_col_raw(root, target_line, VisualCol::ZERO);
-	registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte)
-}
-
-fn line_end_byte_sparse(
-	registry: &UastRegistry,
-	root: NodeId,
-	target_line: DocLine,
-	include_newline: bool,
-) -> Result<DocByte, String> {
-	let line_start_target = registry.find_node_at_line_col_raw(root, target_line, VisualCol::ZERO);
-	let mut node = line_start_target.node_id;
-	let mut node_offset = line_start_target.node_byte.get() as usize;
-	let mut absolute = registry.doc_byte_for_node_offset(
-		root,
-		line_start_target.node_id,
-		line_start_target.node_byte,
-	);
-	let file_size = registry.get_total_bytes(root);
-
-	loop {
-		let text = resolve_loaded_node_text(registry, node)?;
-		for &b in &text.as_bytes()[node_offset..] {
-			if b == b'\n' {
-				return Ok(if include_newline {
-					absolute.saturating_add(1)
-				} else {
-					absolute
-				});
-			}
-			absolute = absolute.saturating_add(1);
-		}
-
-		if absolute.get() >= file_size {
-			return Ok(DocByte::new(file_size));
-		}
-
-		let Some(next) = registry.get_next_sibling(node) else {
-			return Ok(DocByte::new(file_size));
-		};
-		node = next;
-		node_offset = 0;
-	}
-}
-
-fn read_line_bytes_sparse(
-	registry: &UastRegistry,
-	root: NodeId,
-	target_line: DocLine,
-	include_newline: bool,
-) -> Result<Vec<u8>, String> {
-	let start = line_start_byte_sparse(registry, root, target_line);
-	let end = line_end_byte_sparse(registry, root, target_line, include_newline)?;
-	registry
-		.read_loaded_slice(root, start, end)
-		.map_err(|msg| msg.to_string())
-}
-
 fn linewise_put_insertion_sparse(
 	registry: &UastRegistry,
 	root: NodeId,
@@ -1287,88 +1200,6 @@ struct ParseWindow {
 	text: String,
 	global_start_byte: DocByte,
 	cursor_local_byte: u32,
-}
-
-fn is_structural_word_token(kind: SyntaxKind) -> bool {
-	kind == SyntaxKind::IDENT || kind.is_keyword(Edition::Edition2024) || kind.is_literal()
-}
-
-fn seek_structural_token(mut token: SyntaxToken, direction: Direction) -> Option<SyntaxToken> {
-	loop {
-		if is_structural_word_token(token.kind()) {
-			return Some(token);
-		}
-
-		if token.kind() == SyntaxKind::WHITESPACE || token.kind().is_punct() {
-			token = match direction {
-				Direction::Next => token.next_token()?,
-				Direction::Prev => token.prev_token()?,
-			};
-			continue;
-		}
-
-		return None;
-	}
-}
-
-pub(crate) fn select_structural_token_at_offset(
-	syntax: &ra_ap_syntax::SyntaxNode,
-	offset: TextSize,
-) -> Option<SyntaxToken> {
-	let left = syntax.token_at_offset(offset).left_biased();
-	let right = syntax.token_at_offset(offset).right_biased();
-
-	match (left, right) {
-		(None, None) => None,
-		(Some(token), None) | (None, Some(token)) => {
-			if is_structural_word_token(token.kind()) {
-				Some(token)
-			} else {
-				seek_structural_token(token.clone(), Direction::Next)
-					.or_else(|| seek_structural_token(token, Direction::Prev))
-			}
-		}
-		(Some(left), Some(right)) if left == right => {
-			if is_structural_word_token(left.kind()) {
-				Some(left)
-			} else {
-				seek_structural_token(left.clone(), Direction::Next)
-					.or_else(|| seek_structural_token(left, Direction::Prev))
-			}
-		}
-		(Some(left), Some(right)) => {
-			if is_structural_word_token(right.kind()) {
-				return Some(right);
-			}
-
-			if right.kind() == SyntaxKind::WHITESPACE {
-				if let Some(found) = seek_structural_token(right.clone(), Direction::Next) {
-					return Some(found);
-				}
-			}
-
-			if is_structural_word_token(left.kind()) {
-				return Some(left);
-			}
-
-			if right.kind().is_punct() {
-				if let Some(found) = seek_structural_token(right, Direction::Next) {
-					return Some(found);
-				}
-			}
-
-			seek_structural_token(left, Direction::Prev)
-		}
-	}
-}
-
-fn resolve_loaded_node_text(registry: &UastRegistry, node: NodeId) -> Result<String, String> {
-	let text = registry.resolve_physical_bytes(node);
-	let byte_len = unsafe { (*registry.metrics[node.index()].get()).byte_length as usize };
-	if text.is_empty() && byte_len > 0 {
-		return Err("File still loading, cannot resolve structural token".to_string());
-	}
-	String::from_utf8(text).map_err(|_| "Loaded node is not valid UTF-8".to_string())
 }
 
 fn build_parse_window_around_leaf(
@@ -1974,7 +1805,10 @@ impl Engine {
 		let mut cursor_abs_line = DocLine::ZERO;
 		let mut cursor_abs_col = VisualCol::ZERO;
 		let mut scroll_y = 0u32;
+		let mut scroll_row_offset = 0u32;
+		let mut viewport_width = 80u16;
 		let mut viewport_lines = 50;
+		let mut wrap_enabled = true;
 		let mut current_theme =
 			Theme::try_new("onedark").unwrap_or_else(|_| Theme::try_new("viridis").unwrap());
 		let mut root_id: Option<NodeId> = None;
@@ -2685,7 +2519,8 @@ impl Engine {
 						needs_render = true;
 					}
 				}
-				EditorCommand::Resize(_w, h) => {
+				EditorCommand::Resize(w, h) => {
+					viewport_width = w;
 					viewport_lines = h.saturating_sub(1) as u32;
 					needs_render = true;
 				}
@@ -2716,28 +2551,79 @@ impl Engine {
 				EditorCommand::ScrollViewport(delta) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
-						scroll_y =
-							scroll_viewport(&registry, rid, scroll_y, delta, total, viewport_lines);
-						let clamped_cursor_line = clamp_cursor_line_to_viewport(
-							&registry,
-							rid,
-							cursor_abs_line,
-							scroll_y,
-							total,
-							viewport_lines,
-						);
-						if clamped_cursor_line != cursor_abs_line {
-							place_cursor_at_line_col(
+						if wrap_enabled {
+							let geometry = viewport_geometry(total, viewport_width, true);
+							let anchor = scroll_viewport_anchor(
 								&registry,
 								rid,
-								clamped_cursor_line,
-								cursor_abs_col,
-								false,
-								&mut cursor_node,
-								&mut cursor_offset,
-								&mut cursor_abs_line,
-								&mut cursor_abs_col,
+								ViewportAnchor {
+									line: DocLine::new(scroll_y),
+									row_offset: scroll_row_offset,
+								},
+								delta,
+								total,
+								true,
+								geometry.text_width,
 							);
+							scroll_y = anchor.line.get();
+							scroll_row_offset = anchor.row_offset;
+							let (clamped_cursor_line, clamped_cursor_col) =
+								clamp_cursor_to_viewport_anchor(
+									&registry,
+									rid,
+									anchor,
+									cursor_abs_line,
+									cursor_abs_col,
+									total,
+									viewport_lines,
+									true,
+									geometry.text_width,
+								);
+							if clamped_cursor_line != cursor_abs_line
+								|| clamped_cursor_col != cursor_abs_col
+							{
+								place_cursor_at_line_col(
+									&registry,
+									rid,
+									clamped_cursor_line,
+									clamped_cursor_col,
+									false,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_line,
+									&mut cursor_abs_col,
+								);
+							}
+						} else {
+							scroll_y = scroll_viewport(
+								&registry,
+								rid,
+								scroll_y,
+								delta,
+								total,
+								viewport_lines,
+							);
+							let clamped_cursor_line = clamp_cursor_line_to_viewport(
+								&registry,
+								rid,
+								cursor_abs_line,
+								scroll_y,
+								total,
+								viewport_lines,
+							);
+							if clamped_cursor_line != cursor_abs_line {
+								place_cursor_at_line_col(
+									&registry,
+									rid,
+									clamped_cursor_line,
+									cursor_abs_col,
+									false,
+									&mut cursor_node,
+									&mut cursor_offset,
+									&mut cursor_abs_line,
+									&mut cursor_abs_col,
+								);
+							}
 						}
 					}
 					needs_render = true;
@@ -2799,6 +2685,30 @@ impl Engine {
 					}
 					needs_render = true;
 				}
+				EditorCommand::ToggleWrap => {
+					wrap_enabled = !wrap_enabled;
+					if !wrap_enabled {
+						scroll_row_offset = 0;
+					}
+					status_message = Some(if wrap_enabled {
+						"Wrap enabled".to_string()
+					} else {
+						"Wrap disabled".to_string()
+					});
+					needs_render = true;
+				}
+				EditorCommand::SetWrap(enabled) => {
+					wrap_enabled = enabled;
+					if !wrap_enabled {
+						scroll_row_offset = 0;
+					}
+					status_message = Some(if wrap_enabled {
+						"Wrap enabled".to_string()
+					} else {
+						"Wrap disabled".to_string()
+					});
+					needs_render = true;
+				}
 				EditorCommand::ClickCursor(target_pos) => {
 					if let Some(rid) = root_id {
 						let total = registry.get_total_newlines(rid);
@@ -2835,6 +2745,7 @@ impl Engine {
 						cursor_abs_line = DocLine::ZERO;
 						cursor_abs_col = VisualCol::ZERO;
 						scroll_y = 0;
+						scroll_row_offset = 0;
 						ledger.clear();
 						active_visual = None;
 						semantic_highlights.clear();
@@ -2881,6 +2792,7 @@ impl Engine {
 						cursor_abs_line = DocLine::ZERO;
 						cursor_abs_col = VisualCol::ZERO;
 						scroll_y = 0;
+						scroll_row_offset = 0;
 						ledger.clear();
 						active_visual = None;
 						semantic_highlights.clear();
@@ -3645,17 +3557,41 @@ impl Engine {
 			}
 
 			if needs_render {
-				let (virtual_tokens, tokens, total_lines) = if let Some(rid) = root_id {
+				let (virtual_tokens, tokens, total_lines, viewport_anchor) = if let Some(rid) =
+					root_id
+				{
 					let total_lines = registry.get_total_newlines(rid);
-					scroll_y = pan_scroll_y_to_keep_cursor_visible(
-						&registry,
-						rid,
-						scroll_y,
-						cursor_abs_line,
-						total_lines,
-						viewport_lines,
-					);
-					let scroll_line = DocLine::new(scroll_y);
+					let geometry = viewport_geometry(total_lines, viewport_width, true);
+					let viewport_anchor = if wrap_enabled {
+						pan_viewport_anchor_to_keep_cursor_visible(
+							&registry,
+							rid,
+							ViewportAnchor {
+								line: DocLine::new(scroll_y),
+								row_offset: scroll_row_offset,
+							},
+							cursor_abs_line,
+							cursor_abs_col,
+							total_lines,
+							viewport_lines,
+							true,
+							geometry.text_width,
+						)
+					} else {
+						ViewportAnchor {
+							line: DocLine::new(pan_scroll_y_to_keep_cursor_visible(
+								&registry,
+								rid,
+								scroll_y,
+								cursor_abs_line,
+								total_lines,
+								viewport_lines,
+							)),
+							row_offset: 0,
+						}
+					};
+					scroll_row_offset = viewport_anchor.row_offset;
+					let scroll_line = viewport_anchor.line;
 
 					// 1. Virtual Query (Look-behind 60 lines, Look-ahead 120 lines total)
 					let virtual_start_line = scroll_line.saturating_sub(60);
@@ -3677,10 +3613,18 @@ impl Engine {
 						}
 					}
 
-					(virtual_tokens, visible_tokens, total_lines)
+					(virtual_tokens, visible_tokens, total_lines, viewport_anchor)
 				} else {
-					scroll_y = 0;
-					(Vec::new(), Vec::new(), 0)
+					scroll_row_offset = 0;
+					(
+						Vec::new(),
+						Vec::new(),
+						0,
+						ViewportAnchor {
+							line: DocLine::ZERO,
+							row_offset: 0,
+						},
+					)
 				};
 
 				let confirm_prompt = confirm_state
@@ -3719,9 +3663,11 @@ impl Engine {
 										last_semantic_len = live_len;
 										last_semantic_path = Some(path.clone());
 										pending_semantic_request_id = None;
-									} else if let Ok(live_bytes) =
-										read_loaded_document(&registry, rid)
-									{
+									} else if let Ok(live_bytes) = read_document_snapshot(
+										&registry,
+										rid,
+										file_path.as_deref().map(Path::new),
+									) {
 										let text =
 											String::from_utf8_lossy(&live_bytes).into_owned();
 										let request_id = next_semantic_request_id;
@@ -3814,26 +3760,46 @@ impl Engine {
 					}
 					_ => Vec::new(),
 				};
-				let viewport_start_line = tokens
-					.first()
-					.map(|token| token.absolute_start_line)
-					.unwrap_or(DocLine::new(scroll_y));
+				let viewport_start_line = viewport_anchor.line;
 				scroll_y = viewport_start_line.get();
-				let visible_line_starts = collect_visible_line_starts(&tokens);
-				let viewport_end_line = visible_line_starts
+				let geometry = viewport_geometry(total_lines, viewport_width, root_id.is_some());
+				let visible_rows = if let Some(rid) = root_id {
+					collect_visible_rows(
+						&registry,
+						rid,
+						viewport_anchor,
+						total_lines,
+						viewport_lines,
+						wrap_enabled,
+						geometry.text_width,
+					)
+				} else {
+					Vec::new()
+				};
+				let mut visible_line_starts = Vec::new();
+				for row in &visible_rows {
+					if visible_line_starts.last().copied() != Some(row.line) {
+						visible_line_starts.push(row.line);
+					}
+				}
+				let viewport_end_line = visible_rows
 					.last()
-					.copied()
+					.map(|row| row.line)
 					.unwrap_or(viewport_start_line)
 					.saturating_add(1);
-				let cursor_visual_row = if let Some(rid) = root_id {
-					let cursor_line =
-						snap_line_to_visible_boundary(&registry, rid, cursor_abs_line);
-					let viewport_top_visual =
-						visual_line_index_for_doc_line(&registry, rid, viewport_start_line);
-					let cursor_visual = visual_line_index_for_doc_line(&registry, rid, cursor_line);
-					cursor_visual.saturating_sub(viewport_top_visual)
+				let (cursor_visual_row, cursor_screen_col) = if let Some(rid) = root_id {
+					cursor_view_metrics(
+						&registry,
+						rid,
+						viewport_anchor,
+						cursor_abs_line,
+						cursor_abs_col,
+						total_lines,
+						wrap_enabled,
+						geometry.text_width,
+					)
 				} else {
-					0
+					(0, VisualCol::ZERO)
 				};
 				let minimap = if let Some(rid) = root_id {
 					let path_changed = last_minimap_path.as_deref() != file_path.as_deref();
@@ -3845,7 +3811,11 @@ impl Engine {
 					{
 						cached_minimap =
 							Some(if file_size > 0 && file_size <= MAX_MINIMAP_TEXT_BYTES {
-								match read_loaded_document(&registry, rid) {
+								match read_document_snapshot(
+									&registry,
+									rid,
+									file_path.as_deref().map(Path::new),
+								) {
 									Ok(bytes) => build_text_minimap_snapshot(
 										&bytes,
 										viewport_start_line,
@@ -3901,10 +3871,13 @@ impl Engine {
 					tokens,
 					scroll_y,
 					viewport_start_line,
+					viewport_row_offset: viewport_anchor.row_offset,
 					viewport_line_count: viewport_lines,
+					wrap_enabled,
 					cursor_lines: vec![cursor_abs_line],
 					cursor_visual_row,
 					cursor_abs_pos: CursorPosition::new(cursor_abs_line, cursor_abs_col),
+					cursor_screen_col,
 					cursor_abs_byte,
 					cursor_line_start_byte,
 					total_lines,
@@ -3925,6 +3898,7 @@ impl Engine {
 					yank_flash,
 					minimap,
 					theme_colors: current_theme.syntax_colors.clone(),
+					visible_rows,
 					visible_line_starts,
 				});
 
@@ -3981,11 +3955,12 @@ mod tests {
 		line_col_from_doc_byte_sparse, line_end_visual_col, linewise_put_insertion,
 		materialize_fold_boundary_at_cursor, nearest_foldable_boundary, next_word_end,
 		next_word_start, normalize_line_density, pan_scroll_y_to_keep_cursor_visible,
-		place_cursor_at_line_col, prev_word_start, rebase_diagnostics_after_delta,
-		rebase_semantic_highlights_after_delta, rebind_document_spans_to_saved_file,
-		resolve_fold_boundary_at_cursor, resolve_visual_ranges, save_document_atomic,
-		scroll_viewport, set_subtree_fold_state, smart_home_visual_col, step_left_visual_col,
-		step_right_visual_col, visual_line_index_for_doc_line, word_object_delta_at_cursor,
+		place_cursor_at_line_col, prev_word_start, read_document_snapshot,
+		rebase_diagnostics_after_delta, rebase_semantic_highlights_after_delta,
+		rebind_document_spans_to_saved_file, resolve_fold_boundary_at_cursor,
+		resolve_visual_ranges, save_document_atomic, scroll_viewport, set_subtree_fold_state,
+		smart_home_visual_col, step_left_visual_col, step_right_visual_col,
+		visual_line_index_for_doc_line, word_object_delta_at_cursor,
 	};
 	use crate::core::{DocByte, DocLine, NodeByteOffset, StateId, VisualCol};
 	use crate::ecs::UastRegistry;
@@ -5611,6 +5586,19 @@ mod tests {
 
 		let _ = std::fs::remove_file(source_path);
 		let _ = std::fs::remove_file(target_path);
+	}
+
+	#[test]
+	fn read_document_snapshot_streams_unloaded_source_backed_documents() {
+		let source_path = temp_test_path("snapshot-source");
+		std::fs::write(&source_path, b"alphagamma").expect("write source");
+
+		let (registry, root) = build_mixed_save_document();
+		let snapshot =
+			read_document_snapshot(&registry, root, Some(&source_path)).expect("snapshot bytes");
+		assert_eq!(&snapshot, b"alphaZZgamma");
+
+		let _ = std::fs::remove_file(source_path);
 	}
 
 	#[test]

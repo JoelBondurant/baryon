@@ -38,6 +38,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 				} else if self.command_buffer.starts_with("theme ") {
 					let name = self.command_buffer[6..].trim().to_string();
 					let _ = self.tx_cmd.send(EditorCommand::SetTheme(name));
+				} else if self.command_buffer == "wrap" {
+					let _ = self.tx_cmd.send(EditorCommand::ToggleWrap);
+				} else if self.command_buffer == "nowrap" {
+					let _ = self.tx_cmd.send(EditorCommand::SetWrap(false));
 				} else if let Ok(line_num) = self.command_buffer.parse::<u32>() {
 					let _ = self.tx_cmd.send(EditorCommand::GotoLine(DocLine::new(
 						line_num.saturating_sub(1),
@@ -214,22 +218,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 	}
 }
 
-fn push_history_entry(
-	buffer: &str,
-	history: &mut Vec<String>,
-	history_index: &mut Option<usize>,
-) {
+fn push_history_entry(buffer: &str, history: &mut Vec<String>, history_index: &mut Option<usize>) {
 	if !buffer.is_empty() && history.last().is_none_or(|last| last != buffer) {
 		history.push(buffer.to_string());
 	}
 	*history_index = None;
 }
 
-fn recall_history_up(
-	buffer: &mut String,
-	history: &[String],
-	history_index: &mut Option<usize>,
-) {
+fn recall_history_up(buffer: &mut String, history: &[String], history_index: &mut Option<usize>) {
 	if history.is_empty() {
 		return;
 	}
@@ -242,11 +238,7 @@ fn recall_history_up(
 	*buffer = history[new_index].clone();
 }
 
-fn recall_history_down(
-	buffer: &mut String,
-	history: &[String],
-	history_index: &mut Option<usize>,
-) {
+fn recall_history_down(buffer: &mut String, history: &[String], history_index: &mut Option<usize>) {
 	if let Some(idx) = *history_index {
 		if idx + 1 < history.len() {
 			let new_index = idx + 1;
@@ -307,4 +299,53 @@ fn parse_substitute(
 	}
 
 	Some((pattern, replacement, flags, range))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::Frontend;
+	use crate::engine::{EditorCommand, EditorMode};
+	use crossterm::event::{KeyCode, KeyModifiers};
+	use ratatui::{Terminal, backend::CrosstermBackend};
+	use std::sync::mpsc;
+
+	fn build_frontend() -> (
+		Frontend<CrosstermBackend<Vec<u8>>>,
+		mpsc::Receiver<EditorCommand>,
+	) {
+		let terminal = Terminal::new(CrosstermBackend::new(Vec::new())).expect("terminal");
+		let (tx_cmd, rx_cmd) = mpsc::channel();
+		let (_tx_view, rx_view) = mpsc::channel();
+		(Frontend::new(terminal, tx_cmd, rx_view), rx_cmd)
+	}
+
+	#[test]
+	fn wrap_command_toggles_wrap() {
+		let (mut frontend, rx_cmd) = build_frontend();
+		let mut should_quit = false;
+		frontend.current_mode = EditorMode::Command;
+		frontend.command_buffer = "wrap".to_string();
+
+		assert!(!frontend.handle_command_key(KeyCode::Enter, KeyModifiers::NONE, &mut should_quit));
+
+		assert!(matches!(
+			rx_cmd.try_recv().expect(":wrap should send a command"),
+			EditorCommand::ToggleWrap
+		));
+	}
+
+	#[test]
+	fn nowrap_command_forces_wrap_off() {
+		let (mut frontend, rx_cmd) = build_frontend();
+		let mut should_quit = false;
+		frontend.current_mode = EditorMode::Command;
+		frontend.command_buffer = "nowrap".to_string();
+
+		assert!(!frontend.handle_command_key(KeyCode::Enter, KeyModifiers::NONE, &mut should_quit));
+
+		assert!(matches!(
+			rx_cmd.try_recv().expect(":nowrap should send a command"),
+			EditorCommand::SetWrap(false)
+		));
+	}
 }

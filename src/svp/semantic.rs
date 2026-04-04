@@ -121,21 +121,8 @@ impl SemanticReactor {
 
 			let analysis = h.analysis();
 
-			let config = HighlightConfig {
-				strings: true,
-				comments: true,
-				punctuation: true,
-				specialize_punctuation: false,
-				operator: true,
-				specialize_operator: false,
-				inject_doc_comment: false,
-				macro_bang: true,
-				syntactic_name_ref_highlighting: true,
-				minicore: MiniCore::default(),
-			};
-
 			match (
-				analysis.highlight(config, active_file_id),
+				analysis.highlight(highlight_config(), active_file_id),
 				collect_error_diagnostics(
 					&analysis,
 					active_file_id,
@@ -183,6 +170,21 @@ fn diagnostics_config() -> DiagnosticsConfig {
 	config.proc_macros_enabled = true;
 	config.proc_attr_macros_enabled = true;
 	config
+}
+
+fn highlight_config() -> HighlightConfig<'static> {
+	HighlightConfig {
+		strings: true,
+		comments: true,
+		punctuation: true,
+		specialize_punctuation: false,
+		operator: true,
+		specialize_operator: false,
+		inject_doc_comment: false,
+		macro_bang: true,
+		syntactic_name_ref_highlighting: true,
+		minicore: MiniCore::default(),
+	}
 }
 
 fn collect_error_diagnostics(
@@ -245,24 +247,37 @@ fn normalize_diagnostic_range(content: &str, start: usize, end: usize) -> Option
 /// Load a full Cargo workspace so rust-analyzer can resolve std, deps, etc.
 /// Blocks for 1-3s on first call (runs `cargo metadata`).
 fn init_workspace(file_path: &str) -> Option<(AnalysisHost, FileId)> {
-	let canonical = PathBuf::from(file_path).canonicalize().ok()?;
-	let utf8 = Utf8PathBuf::try_from(canonical).ok()?;
+	try_init_workspace(file_path).ok()
+}
+
+fn try_init_workspace(file_path: &str) -> Result<(AnalysisHost, FileId), String> {
+	let canonical = PathBuf::from(file_path)
+		.canonicalize()
+		.map_err(|e| format!("canonicalize failed: {e}"))?;
+	let utf8 = Utf8PathBuf::try_from(canonical).map_err(|_| "non-utf8 path".to_string())?;
 	let abs_file = AbsPathBuf::assert(utf8);
+	let manifest = if let Ok(manifest) = ProjectManifest::discover_single(abs_file.as_ref()) {
+		manifest
+	} else if let Some(parent) = abs_file.parent() {
+		ProjectManifest::discover_single(parent)
+			.map_err(|e| format!("manifest discovery failed: {e}"))?
+	} else {
+		return Err("manifest discovery failed: path has no parent".to_string());
+	};
 
-	// Discover the nearest Cargo.toml.
-	let manifest = ProjectManifest::discover_single(abs_file.parent()?).ok()?;
-
-	// Load workspace with sysroot for std/core resolution.
-	let cargo_config = CargoConfig {
+	let load_workspace = |cargo_config: &CargoConfig| {
+		ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {}).ok()
+	};
+	let discover_sysroot = CargoConfig {
 		sysroot: Some(RustLibSource::Discover),
 		..CargoConfig::default()
 	};
-	let ws = ProjectWorkspace::load(manifest, &cargo_config, &|_| {}).ok()?;
+	let ws = load_workspace(&discover_sysroot)
+		.or_else(|| load_workspace(&CargoConfig::default()))
+		.ok_or_else(|| "workspace load failed".to_string())?;
 
-	// Build the crate graph. The file loader reads each source file into the VFS.
 	let mut vfs = Vfs::default();
 	let extra_env: FxHashMap<String, Option<String>> = FxHashMap::default();
-
 	let (crate_graph, _proc_macros) = ws.to_crate_graph(
 		&mut |path: &AbsPath| {
 			let contents = std::fs::read(path).ok();
@@ -274,10 +289,12 @@ fn init_workspace(file_path: &str) -> Option<(AnalysisHost, FileId)> {
 		&extra_env,
 	);
 
-	// Determine the project root directory for source root partitioning.
-	let project_root = abs_file.parent()?.to_path_buf();
+	let active_vfs_path = VfsPath::from(abs_file.clone());
+	if vfs.file_id(&active_vfs_path).is_none() {
+		vfs.set_file_contents(active_vfs_path.clone(), std::fs::read(&abs_file).ok());
+	}
 
-	// Build source roots: local (project files) vs library (sysroot/deps).
+	let project_root = manifest.manifest_path().parent().to_path_buf();
 	let mut local_file_set = FileSet::default();
 	let mut lib_file_set = FileSet::default();
 
@@ -293,11 +310,6 @@ fn init_workspace(file_path: &str) -> Option<(AnalysisHost, FileId)> {
 		}
 	}
 
-	let mut roots = Vec::new();
-	roots.push(SourceRoot::new_local(local_file_set));
-	roots.push(SourceRoot::new_library(lib_file_set));
-
-	// Drain VFS changes into the initial ChangeWithProcMacros.
 	let mut change = ChangeWithProcMacros::default();
 	for (_, changed) in vfs.take_changes() {
 		match changed.change {
@@ -310,17 +322,20 @@ fn init_workspace(file_path: &str) -> Option<(AnalysisHost, FileId)> {
 		}
 	}
 
-	change.set_roots(roots);
+	change.set_roots(vec![
+		SourceRoot::new_local(local_file_set),
+		SourceRoot::new_library(lib_file_set),
+	]);
 	change.set_crate_graph(crate_graph);
 
 	let mut host = AnalysisHost::new(None);
 	host.apply_change(change);
 
-	// Resolve the active file's FileId.
-	let vfs_path = VfsPath::from(abs_file);
-	let (file_id, _) = vfs.file_id(&vfs_path)?;
+	let (file_id, _) = vfs
+		.file_id(&active_vfs_path)
+		.ok_or_else(|| "active file missing from workspace vfs".to_string())?;
 
-	Some((host, file_id))
+	Ok((host, file_id))
 }
 
 /// Fallback: single-file universe with no dependency resolution.
@@ -442,10 +457,13 @@ fn map_hl_tag(highlight: Highlight) -> TokenCategory {
 #[cfg(test)]
 mod tests {
 	use super::{
-		DiagnosticCollectionMode, collect_error_diagnostics, diagnostics_config, init_single_file,
-		normalize_diagnostic_range,
+		ChangeWithProcMacros, DiagnosticCollectionMode, TokenCategory, collect_error_diagnostics,
+		diagnostics_config, highlight_config, init_single_file, map_hl_tag,
+		normalize_diagnostic_range, try_init_workspace,
 	};
 	use crate::core::DocByte;
+	use std::fs;
+	use std::path::PathBuf;
 
 	#[test]
 	fn invalid_rust_produces_visible_error_diagnostic_spans() {
@@ -490,5 +508,71 @@ mod tests {
 		assert_eq!(normalize_diagnostic_range("abc", 3, 3), Some((2, 3)));
 		assert_eq!(normalize_diagnostic_range("abc", 1, 1), Some((1, 2)));
 		assert_eq!(normalize_diagnostic_range("", 0, 0), None);
+	}
+
+	#[test]
+	fn workspace_semantics_resolve_engine_helper_imports() {
+		let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/engine/core.rs");
+		let source = fs::read_to_string(&path).expect("core.rs should be readable");
+		let path_str = path.to_string_lossy().into_owned();
+		let (mut host, file_id) =
+			try_init_workspace(&path_str).expect("workspace mode should load baryon");
+		let mut change = ChangeWithProcMacros::default();
+		change.change_file(file_id, Some(source.clone()));
+		host.apply_change(change);
+		let analysis = host.analysis();
+
+		let diagnostics = collect_error_diagnostics(
+			&analysis,
+			file_id,
+			&source,
+			DocByte::ZERO,
+			&diagnostics_config(),
+			DiagnosticCollectionMode::Full,
+		)
+		.expect("workspace diagnostics should resolve");
+		assert!(
+			diagnostics.is_empty(),
+			"workspace diagnostics should not flag engine helper imports: {diagnostics:?}"
+		);
+
+		let folding_import_start = source
+			.find("use super::folding::{")
+			.expect("folding import should exist");
+		let folding_name_offset = folding_import_start
+			+ source[folding_import_start..]
+				.find("resolve_fold_boundary_at_cursor")
+				.expect("folding helper import should exist");
+
+		let layout_import_start = source
+			.find("use super::layout::{")
+			.expect("layout import should exist");
+		let layout_name_offset = layout_import_start
+			+ source[layout_import_start..]
+				.find("viewport_geometry")
+				.expect("layout helper import should exist");
+
+		let highlights = analysis
+			.highlight(highlight_config(), file_id)
+			.expect("workspace highlights should resolve");
+		let category_for = |offset: usize| {
+			highlights
+				.iter()
+				.find(|hl| {
+					let start = u32::from(hl.range.start()) as usize;
+					let end = u32::from(hl.range.end()) as usize;
+					start <= offset && offset < end
+				})
+				.map(|hl| map_hl_tag(hl.highlight))
+		};
+
+		assert!(matches!(
+			category_for(folding_name_offset),
+			Some(TokenCategory::Function | TokenCategory::Module)
+		));
+		assert!(matches!(
+			category_for(layout_name_offset),
+			Some(TokenCategory::Function | TokenCategory::Module)
+		));
 	}
 }
