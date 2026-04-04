@@ -23,7 +23,7 @@ fn draw_gutter_line_number(
 	y: usize,
 	line_index: u32,
 	total_newlines: u32,
-	gutter_style: Style,
+	number_style: Style,
 ) {
 	if y > u16::MAX as usize || line_index > total_newlines {
 		return;
@@ -37,7 +37,7 @@ fn draw_gutter_line_number(
 	let start_x = (gutter_width - 1).saturating_sub(line_str.len() as u16);
 	for (i, c) in line_str.chars().enumerate() {
 		if let Some(cell) = buf.cell_mut((start_x + i as u16, y as u16)) {
-			cell.set_char(c).set_style(gutter_style);
+			cell.set_char(c).set_style(number_style);
 		}
 	}
 }
@@ -111,6 +111,25 @@ fn folded_placeholder_style() -> Style {
 		.add_modifier(Modifier::BOLD)
 }
 
+fn gutter_fill_style() -> Style {
+	Style::default().bg(GUTTER_BG).fg(GUTTER_FG)
+}
+
+fn cursor_gutter_line_number_style() -> Style {
+	Style::default()
+		.bg(GUTTER_BG)
+		.fg(CURSOR_LINE_NUMBER)
+		.add_modifier(Modifier::BOLD)
+}
+
+fn gutter_line_number_style(line_index: u32, cursor_lines: &[crate::core::DocLine]) -> Style {
+	if cursor_lines.iter().any(|line| line.get() == line_index) {
+		cursor_gutter_line_number_style()
+	} else {
+		gutter_fill_style()
+	}
+}
+
 impl<B: Backend + io::Write> Frontend<B> {
 	pub(super) fn draw(&mut self) -> Result<(), B::Error> {
 		let current_viewport = &self.current_viewport;
@@ -156,7 +175,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 						let digits = view.total_lines.max(1).ilog10() + 1;
 						let gutter_width: u16 = digits as u16 + 1;
-						let gutter_style = Style::default().bg(GUTTER_BG).fg(GUTTER_FG);
+						let gutter_style = gutter_fill_style();
 						let text_left = gutter_width as usize;
 						let render_height = (max_height as usize).saturating_sub(1);
 
@@ -195,7 +214,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 								y,
 								current_doc_line,
 								view.total_lines,
-								gutter_style,
+								gutter_line_number_style(current_doc_line, &view.cursor_lines),
 							);
 						}
 
@@ -226,7 +245,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 										y,
 										current_doc_line,
 										view.total_lines,
-										gutter_style,
+										gutter_line_number_style(
+											current_doc_line,
+											&view.cursor_lines,
+										),
 									);
 								}
 							}
@@ -389,7 +411,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 												y,
 												current_doc_line,
 												view.total_lines,
-												gutter_style,
+												gutter_line_number_style(
+													current_doc_line,
+													&view.cursor_lines,
+												),
 											);
 										}
 									}
@@ -737,9 +762,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 #[cfg(test)]
 mod tests {
-	use super::{apply_diagnostic_style, folded_placeholder_style};
+	use super::{
+		apply_diagnostic_style, cursor_gutter_line_number_style, folded_placeholder_style,
+		gutter_fill_style, gutter_line_number_style,
+	};
+	use crate::core::DocLine;
 	use crate::svp::diagnostic::DiagnosticSeverity;
-	use crate::ui::{DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG, FOLDED_PLACEHOLDER_FG};
+	use crate::ui::{
+		CURSOR_LINE_NUMBER, DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG,
+		FOLDED_PLACEHOLDER_FG, GUTTER_BG, GUTTER_FG,
+	};
 	use ratatui::style::{Modifier, Style};
 
 	#[test]
@@ -755,6 +787,25 @@ mod tests {
 		assert_eq!(style.fg, Some(FOLDED_PLACEHOLDER_FG));
 		assert_eq!(style.bg, Some(FOLDED_PLACEHOLDER_BG));
 		assert!(style.add_modifier.contains(Modifier::BOLD));
+	}
+
+	#[test]
+	fn cursor_gutter_line_numbers_use_dedicated_palette() {
+		let style = cursor_gutter_line_number_style();
+		assert_eq!(style.fg, Some(CURSOR_LINE_NUMBER));
+		assert_eq!(style.bg, Some(GUTTER_BG));
+		assert!(style.add_modifier.contains(Modifier::BOLD));
+	}
+
+	#[test]
+	fn gutter_line_number_style_highlights_all_cursor_lines() {
+		let active_style = gutter_line_number_style(12, &[DocLine::new(12), DocLine::new(42)]);
+		let inactive_style = gutter_line_number_style(11, &[DocLine::new(12), DocLine::new(42)]);
+
+		assert_eq!(active_style.fg, Some(CURSOR_LINE_NUMBER));
+		assert_eq!(inactive_style.fg, Some(GUTTER_FG));
+		assert_eq!(inactive_style.bg, Some(GUTTER_BG));
+		assert_eq!(inactive_style, gutter_fill_style());
 	}
 }
 

@@ -3902,6 +3902,7 @@ impl Engine {
 					scroll_y,
 					viewport_start_line,
 					viewport_line_count: viewport_lines,
+					cursor_lines: vec![cursor_abs_line],
 					cursor_visual_row,
 					cursor_abs_pos: CursorPosition::new(cursor_abs_line, cursor_abs_col),
 					cursor_abs_byte,

@@ -39,6 +39,7 @@ pub struct Viewport {
 	pub scroll_y: u32,
 	pub viewport_start_line: DocLine,
 	pub viewport_line_count: u32,
+	pub cursor_lines: Vec<DocLine>,
 	pub cursor_visual_row: u32,
 	pub cursor_abs_pos: CursorPosition,
 	pub cursor_abs_byte: DocByte,

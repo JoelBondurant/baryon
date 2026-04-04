@@ -28,6 +28,7 @@ pub const SEARCH_MATCH_FG: Color = Color::Black;
 pub const DIAGNOSTIC_ERROR_UNDERLINE: Color = Color::Rgb(255, 92, 92);
 pub const FOLDED_PLACEHOLDER_BG: Color = Color::Rgb(4, 2, 8);
 pub const FOLDED_PLACEHOLDER_FG: Color = Color::Rgb(76, 255, 0);
+pub const CURSOR_LINE_NUMBER: Color = FOLDED_PLACEHOLDER_FG;
 
 pub const CURSOR_LINE_BG: Color = Color::Rgb(32, 32, 32);
 
